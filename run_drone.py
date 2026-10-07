@@ -62,7 +62,7 @@ settings = DroneTrainSettings(
     rotate_aug=True,
 
     # ---- stage 1: aero (contact-free windows) ----
-    aero_epochs=200, aero_lr=3e-4,
+    aero_epochs=100, aero_lr=3e-4,
     w_aero_anchor=0.1,              # each aero node toward its drag law (shapes the network)
     w_aero_coeff_fit=0.01,          # only used with drag_coeff_fit="gradient"
     w_aero_smooth=0.01,             # aero force smooth in time
@@ -70,10 +70,10 @@ settings = DroneTrainSettings(
     w_prior=1e-3,                   # k_f, k_m toward thrust-stand values
     coeff_lr=1e-3,                  # learning rate for k's (stage 1) and mu (stage 2)
     coeff_warmup_epochs=10,         # k's and mu held fixed for the first 10 epochs of their stage (capped at half)
-    lr_schedule="cosine",           # network lr decays to 0 over each stage (None = constant)
+    lr_schedule=None,           # network lr decays to 0 over each stage (None = constant)
 
     # ---- stage 2: contact (near-wall windows, aero frozen) ----
-    contact_epochs=300, contact_lr=1e-4,
+    contact_epochs=400, contact_lr=1e-4,
     w_fric_dir=1.0, w_fric_mag=1.0, w_fric_cone=1.0,
     mu_init=0.3, learn_mu=True,
 
