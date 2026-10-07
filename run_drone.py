@@ -1,5 +1,5 @@
 """Experiment settings for the drone force model (two-stage training).
-Generate data first:  python mujoco_drone_generator.py --out data/mj_drone --n 300
+Generate data first:  python mujoco_drone_generator.py --out data/mj_drone --n 500
 Then:                 python run_drone.py
 """
 
@@ -12,14 +12,20 @@ from drone_config import DroneConfig
 from drone_data import build_drone_dataset
 from train_drone_gns import DroneTrainSettings, train_drone_force_model
 from drone_run_report import collect_drone_metrics, true_values_from_meta, save_drone_run_report
+from plot_training_history import plot_loss_history
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------- data ----------------
 trajectory_folder = os.path.join(script_dir, "data/mj_drone")
-train_range = range(0, 200)
-val_range = range(200, 250)
-test_range = range(250, 300)
+# Fixed split of 500 trajectories: 0-299 training pool, 300-399 validation, 400-499 test.
+# Val and test never change, so every run (and every ablation) is scored on the same
+# data. N_train picks how much of the pool to train on; smaller runs use the first
+# N_train, so a 75-trajectory run's data is a subset of a 150-trajectory run's.
+N_train = 300
+train_range = range(0, N_train)
+val_range = range(300, 400)
+test_range = range(400, 500)
 rotor_speed_in_rpm = False          # True if hardware logs are in RPM rather than rad/s
 rotor_speed_hold = None             # None -> read from each file's meta ("aligned" for MuJoCo)
 
@@ -70,7 +76,7 @@ settings = DroneTrainSettings(
     w_prior=1e-3,                   # k_f, k_m toward thrust-stand values
     coeff_lr=1e-3,                  # learning rate for k's (stage 1) and mu (stage 2)
     coeff_warmup_epochs=10,         # k's and mu held fixed for the first 10 epochs of their stage (capped at half)
-    lr_schedule=None,           # network lr decays to 0 over each stage (None = constant)
+    lr_schedule="cosine",           # network lr decays to 0 over each stage (None = constant)
 
     # ---- stage 2: contact (near-wall windows, aero frozen) ----
     contact_epochs=400, contact_lr=1e-4,
@@ -90,6 +96,7 @@ save_model_path = os.path.join(model_folder_path, run_name + ".pt")
 
 # Flags to control training, evaluation, visualization, and the run report.
 Train_model = True
+Plot_loss_history = True            # train/val loss and learned coefficients per epoch, both stages
 Evaluate_model = True               # test-set metrics + closed-loop comparison against MuJoCo
 Visualize_model = True              # time-series PNGs and GIFs of the first few closed-loop runs
 Save_run_report = True
@@ -116,7 +123,14 @@ if __name__ == "__main__":
         train_drone_force_model(drone, settings, train, val, save_model_path)
 
     final_path = save_model_path.replace(".pt", "_final.pt")
+    history_path = save_model_path.replace(".pt", "_history.pt")
+    true_values = true_values_from_meta(meta, drone)
     eval_metrics = {}
+    if Plot_loss_history and os.path.exists(history_path):
+        history = torch.load(history_path, weights_only=False)
+        loss_path = os.path.join(model_folder_path, "figures", "loss_history.png")
+        eval_metrics.update(plot_loss_history(history, loss_path, true=true_values, title=run_name))
+        print(f"saved {loss_path}")
     if Evaluate_model:
         from evaluate_drone_model import evaluate_drone_run
         print("\n" + "#" * 70 + "\n# EVALUATION\n" + "#" * 70)
@@ -128,11 +142,21 @@ if __name__ == "__main__":
             sanity_check=sanity_check)
 
     if Save_run_report:
-        history = torch.load(save_model_path.replace(".pt", "_history.pt"), weights_only=False)
-        metrics = collect_drone_metrics(history, true_values=true_values_from_meta(meta, drone))
+        history = torch.load(history_path, weights_only=False)
+        metrics = collect_drone_metrics(history, true_values=true_values)
         metrics.update(eval_metrics)
+        # Every DroneTrainSettings field (contact_dist_clamp, gate, loss weights...) and
+        # every DroneConfig field is written automatically. These add what the data was.
+        wind_max = max(float(d["wind"].norm(dim=1).max()) for d in train)
         save_drone_run_report(model_folder_path, run_name, master_csv, settings, drone, metrics,
-                              extra_settings={"data.folder": trajectory_folder, "data.n_train": len(train),
-                                              "data.n_val": len(val), "data.n_test": len(test_range),
+                              extra_settings={"data.folder": trajectory_folder,
+                                              "data.train_range": f"{train_range.start}-{train_range.stop - 1}",
+                                              "data.val_range": f"{val_range.start}-{val_range.stop - 1}",
+                                              "data.test_range": f"{test_range.start}-{test_range.stop - 1}",
+                                              "data.n_train": len(train), "data.n_val": len(val),
+                                              "data.n_test": len(test_range),
+                                              "data.mu": meta.get("mu"), "data.k_rotor": meta.get("k_rotor"),
+                                              "data.wind_max_mps": round(wind_max, 3),
                                               "eval.n_closed_loop": N_closed_loop,
+                                              "eval.closed_loop_kinds": ",".join(closed_loop_kinds or ()),
                                               "eval.closed_loop_seed": closed_loop_seed})
