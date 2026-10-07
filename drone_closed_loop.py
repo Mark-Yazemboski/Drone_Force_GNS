@@ -242,7 +242,7 @@ def run_to_traj(run, sc, cfg_true, gs):
 # with MuJoCo's own filter update (thrust during a substep = activation before
 # that substep's update), then aligned to frames exactly like the data.
 @torch.no_grad()
-def run_model(sc, cfg_true, gs, model, device="cpu"):
+def run_model(sc, cfg_true, gs, model, device="cpu", use_contact=True):
     model.eval()
     S, h, tau = gs.substeps, gs.timestep, gs.motor_tau
     M = len(cfg_true.rotor_pos)
@@ -268,11 +268,14 @@ def run_model(sc, cfg_true, gs, model, device="cpu"):
         anchor = st["hist"][-1][0]                                   # re-center, as in training
         com_h = [f32(c - anchor) for c, _ in st["hist"]]
         R_h = [f32(R) for _, R in st["hist"]]
-        com_n, R_n, aux = model.step(com_h, R_h, f32(omega), wind, wall_n, f32(sc["wall_point"] - anchor))
+        com_n, R_n, aux = model.step(com_h, R_h, f32(omega), wind, wall_n, f32(sc["wall_point"] - anchor),
+                                     use_contact=use_contact)
         out["F_contact"].append(model.to_newtons(aux["f_c"])[0].cpu().numpy())
-        out["F_pad"].append(model.to_newtons(aux["phi_c"])[0].cpu().numpy())
+        out["F_pad"].append(model.to_newtons(aux["phi_c"])[0].cpu().numpy() if use_contact
+                            else np.zeros((model.contact_rest.shape[0], 3)))
         out["F_aero"].append(model.to_newtons(aux["aero"]["F"])[0].cpu().numpy())
-        out["c_w"].append(aux["c_w"][0, :, 0].cpu().numpy())
+        out["c_w"].append(aux["c_w"][0, :, 0].cpu().numpy() if use_contact
+                          else np.zeros(model.contact_rest.shape[0]))
         out["rotor_speed"].append(omega)
         com_next = com_n[0].double().cpu().numpy() + anchor
         R_next = _orthonormalize(R_n[0].double().cpu().numpy())
@@ -328,6 +331,17 @@ def closed_loop_metrics(true, pred, onestep, sc, cfg_true, touch_N=0.2, impact_N
                pad_err_contact_mm=float(err[touching].mean()) if touching.any() else float("nan"),
                pad_err_free_mm=float(err[~touching].mean()) if (~touching).any() else float("nan"))
 
+    # Heading (yaw) and full attitude difference between the two runs.
+    def heading(R):
+        x = R[:, :, 0]
+        return np.arctan2(x[:, 1], x[:, 0])
+    dyaw = np.degrees(np.angle(np.exp(1j * (heading(pred["R"][:T]) - heading(true["R"][:T])))))
+    R_rel = np.einsum('tji,tjk->tik', true["R"][:T], pred["R"][:T])
+    att = np.degrees(np.arccos(np.clip((np.trace(R_rel, axis1=1, axis2=2) - 1) / 2, -1, 1)))
+    out.update(yaw_err_mean_deg=float(np.abs(dyaw).mean()), yaw_err_max_deg=float(np.abs(dyaw).max()),
+               yaw_err_contact_deg=float(np.abs(dyaw[touching]).mean()) if touching.any() else float("nan"),
+               attitude_err_mean_deg=float(att.mean()))
+
     def onset(Fn):
         idx = np.flatnonzero(Fn > touch_N)
         return idx[0] if idx.size else None
@@ -378,6 +392,7 @@ def evaluate_closed_loop(model, cfg_true, gs, n_runs=6, seed=1234, kinds=("tap",
             print(f"  closed loop {i}: {sc['kind']:6s} {true['n_frames']} frames | "
                   f"{'completed' if pred['completed'] else 'MODEL RUN STOPPED: ' + pred['crash']} | "
                   f"pad err mean {m['pad_err_mean_mm']:.1f} mm (contact {m['pad_err_contact_mm']:.1f}) | "
+                  f"yaw err {m['yaw_err_mean_deg']:.1f} deg (max {m['yaw_err_max_deg']:.1f}) | "
                   f"onset err {m['contact_onset_err_ms']:.0f} ms | sustained contact RMSE: one-step "
                   f"{m.get('one_step_sustained_contact_rmse_N', float('nan')):.2f} N, closed-loop "
                   f"{m.get('closed_loop_sustained_contact_rmse_N', float('nan')):.2f} N "

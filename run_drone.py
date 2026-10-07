@@ -17,9 +17,9 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------- data ----------------
 trajectory_folder = os.path.join(script_dir, "data/mj_drone")
-train_range = range(0, 75)
-val_range = range(75, 95)
-test_range = range(95, 100)
+train_range = range(0, 200)
+val_range = range(200, 250)
+test_range = range(250, 300)
 rotor_speed_in_rpm = False          # True if hardware logs are in RPM rather than rad/s
 rotor_speed_hold = None             # None -> read from each file's meta ("aligned" for MuJoCo)
 
@@ -62,17 +62,18 @@ settings = DroneTrainSettings(
     rotate_aug=True,
 
     # ---- stage 1: aero (contact-free windows) ----
-    aero_epochs=5, aero_lr=3e-4,
+    aero_epochs=200, aero_lr=3e-4,
     w_aero_anchor=0.1,              # each aero node toward its drag law (shapes the network)
     w_aero_coeff_fit=0.01,          # only used with drag_coeff_fit="gradient"
     w_aero_smooth=0.01,             # aero force smooth in time
     w_axial=0.1,                    # rotor axial thrust correction toward zero
     w_prior=1e-3,                   # k_f, k_m toward thrust-stand values
     coeff_lr=1e-3,                  # learning rate for k's (stage 1) and mu (stage 2)
-    coeff_warmup_epochs=10,         # k's and mu held fixed for the first 10 epochs of their stage
+    coeff_warmup_epochs=10,         # k's and mu held fixed for the first 10 epochs of their stage (capped at half)
+    lr_schedule="cosine",           # network lr decays to 0 over each stage (None = constant)
 
     # ---- stage 2: contact (near-wall windows, aero frozen) ----
-    contact_epochs=5, contact_lr=1e-4,
+    contact_epochs=300, contact_lr=1e-4,
     w_fric_dir=1.0, w_fric_mag=1.0, w_fric_cone=1.0,
     mu_init=0.3, learn_mu=True,
 
@@ -94,10 +95,11 @@ Visualize_model = True              # time-series PNGs and GIFs of the first few
 Save_run_report = True
 
 # Closed-loop evaluation: fresh scenarios flown with MuJoCo and with the model as the plant.
-N_closed_loop = 6
+N_closed_loop = 12
 closed_loop_kinds = ("tap", "push", "slide")   # cycled through; None = the generator's mix
 closed_loop_seed = 1234                         # same seed -> same scenarios across runs, so runs compare
-N_visualize = 3                                 # PNG + GIF for the first N closed-loop runs
+N_visualize = 6                                 # PNG + GIF for the first N closed-loop runs
+sanity_check = True                             # also fly the first push with the contact network off
 gif_stride = 3                                  # draw every 3rd frame (100 Hz data -> ~33 fps GIF)
 
 master_csv = os.path.join(script_dir, "models", "drone_master_tracker.csv")
@@ -122,7 +124,8 @@ if __name__ == "__main__":
         eval_metrics = evaluate_drone_run(
             final_path, test, meta, os.path.join(model_folder_path, "figures"),
             n_closed_loop=N_closed_loop, closed_loop_kinds=closed_loop_kinds, closed_loop_seed=closed_loop_seed,
-            n_visualize=N_visualize if Visualize_model else 0, make_gifs=Visualize_model, gif_stride=gif_stride)
+            n_visualize=N_visualize if Visualize_model else 0, make_gifs=Visualize_model, gif_stride=gif_stride,
+            sanity_check=sanity_check)
 
     if Save_run_report:
         history = torch.load(save_model_path.replace(".pt", "_history.pt"), weights_only=False)

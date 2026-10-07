@@ -18,6 +18,7 @@ Validation:
 """
 
 import copy
+import math
 import os
 import time
 from dataclasses import dataclass, asdict
@@ -109,7 +110,9 @@ class DroneTrainSettings:
     w_prior: float = 1e-3           # k_f, k_m toward their thrust-stand values
     coeff_lr: float = 1e-3          # learning rate for the physical coefficients (k's in stage 1, mu in stage 2)
     coeff_warmup_epochs: int = 10   # coefficients held fixed for the first epochs of each stage, so they
-                                    # are not pulled toward an untrained network's forces
+                                    # are not pulled toward an untrained network's forces (capped at
+                                    # half the stage's epochs)
+    lr_schedule: str = None         # None (constant) or "cosine" (network lr decays to 0 over each stage)
     # ---- stage 2: contact ----
     contact_epochs: int = 300
     contact_lr: float = 1e-4
@@ -419,12 +422,20 @@ def force_validation(model, data, index, s, device, max_batches=40):
     if not all("F_contact" in d and "F_aero" in d for d in data):
         return {}
     model.eval()
-    acc = {}
+    acc, means = {}, set()
 
-    def add(key, sq, n):
+    def add(key, sq, n, mean=False):
         a_ = acc.setdefault(key, [0.0, 0])
         a_[0] += float(sq)
         a_[1] += int(n)
+        if mean:
+            means.add(key)
+
+    def angle_deg(a, b):
+        cos = (a * b).sum(-1) / (a.norm(dim=-1) * b.norm(dim=-1)).clamp_min(1e-12)
+        return torch.rad2deg(torch.acos(cos.clamp(-1.0, 1.0)))
+
+    pad_rest = model.aero_rest[model.aero_pad_idx].unsqueeze(0)               # pad center, COM-relative
 
     for i, b in enumerate(_batches(data, index, s, device, 1, train=False)):
         if i >= max_batches:
@@ -446,6 +457,31 @@ def force_validation(model, data, index, s, device, max_batches=40):
         free = mag <= 0.05
         if free.any():
             add("false_contact", Fc_p[free].norm(dim=-1).sum(), free.sum())
+
+        # Sliding friction: frames where MuJoCo's pad is pressed on the wall
+        # (normal > 0.2 N) and its center slides faster than the slip gate.
+        tang = lambda F: F - (F * n).sum(-1, keepdim=True) * n
+        pad_now = nodes_from_state(com_h[-1], R_h[-1], pad_rest)[:, 0]
+        pad_prev = nodes_from_state(com_h[-2], R_h[-2], pad_rest)[:, 0]
+        v_t = tang(pad_now - pad_prev)                                          # m/step
+        Ft_p, Ft_t = tang(Fc_p), tang(Fc_t)
+        Fn_t, Fn_p = (Fc_t * n).sum(-1), (Fc_p * n).sum(-1)
+        sl = (Fn_t > 0.2) & (mag < s.impact_force_N) & (v_t.norm(dim=-1) > s.slip_v0) & \
+             (Ft_t.norm(dim=-1) > 0.02) & (Ft_p.norm(dim=-1) > 0.02) & (Fn_p > 0.05)
+        if sl.any():
+            k = int(sl.sum())
+            add("slide_fric_dir_err_deg", angle_deg(Ft_p[sl], Ft_t[sl]).sum(), k, mean=True)
+            add("slide_fric_vs_slip_deg", angle_deg(Ft_p[sl], -v_t[sl]).sum(), k, mean=True)
+            add("slide_fric_vs_slip_deg_label", angle_deg(Ft_t[sl], -v_t[sl]).sum(), k, mean=True)
+            add("slide_mu_implied", (Ft_p[sl].norm(dim=-1) / Fn_p[sl]).sum(), k, mean=True)
+            add("slide_mu_implied_label", (Ft_t[sl].norm(dim=-1) / Fn_t[sl]).sum(), k, mean=True)
+            # Cancellation among pad nodes: 1 - |sum phi_t| / sum |phi_t| (0 = all aligned).
+            phi_t = model.to_newtons(aux["phi_c"])[sl]
+            phi_t = phi_t - (phi_t * n[sl].unsqueeze(1)).sum(-1, keepdim=True) * n[sl].unsqueeze(1)
+            cancel = 1.0 - phi_t.sum(1).norm(dim=-1) / phi_t.norm(dim=-1).sum(1).clamp_min(1e-12)
+            add("slide_fric_cancellation", cancel.sum(), k, mean=True)
+            node_mag = model.to_newtons(aux["phi_c"])[sl].norm(dim=-1)
+            add("slide_active_nodes", (node_mag > 0.1 * node_mag.sum(1, keepdim=True)).float().sum(), k, mean=True)
         Fa_p, Fa_t = model.to_newtons(aux["aero"]["F"]), b["F_aero"][:, 0]
         add("aero_err", (Fa_p - Fa_t).pow(2).sum(-1).sum(), Fa_t.shape[0])
         add("aero_ref", Fa_t.pow(2).sum(-1).sum(), Fa_t.shape[0])
@@ -455,9 +491,12 @@ def force_validation(model, data, index, s, device, max_batches=40):
     model.train()
     out = {}
     for key, (v, n) in acc.items():
-        out[key] = v / n if key == "false_contact" else (v / n) ** 0.5     # RMS, except false_contact = mean |F|
-        if key not in ("axial", "aero_ref", "aero_err"):
+        # RMS, except false_contact (mean |F|) and the sliding diagnostics (means)
+        out[key] = v / n if (key == "false_contact" or key in means) else (v / n) ** 0.5
+        if key not in ("axial", "aero_ref", "aero_err") and key not in means:
             out[key + "_n"] = n
+        if key == "slide_fric_dir_err_deg":
+            out["slide_frames_n"] = n
     return out
 
 
@@ -493,6 +532,13 @@ def _format_forces(f, impact_N):
         lines.append(f"      {'aero':30s} {f['aero_err']:7.4f} / {f['aero_ref']:7.4f}   ({expl:.0f}% of label variance explained)")
     if "axial" in f:
         lines.append(f"      {'rotor axial correction':30s} {f['axial']:7.4f} RMS per rotor (should be ~0 in sim)")
+    if "slide_fric_dir_err_deg" in f:
+        lines.append(f"    sliding friction ({f['slide_frames_n']} frames): direction error vs MuJoCo "
+                     f"{f['slide_fric_dir_err_deg']:.1f} deg | angle from -slip: model {f['slide_fric_vs_slip_deg']:.1f}, "
+                     f"MuJoCo {f['slide_fric_vs_slip_deg_label']:.1f} deg")
+        lines.append(f"      implied mu |Ft|/Fn: model {f['slide_mu_implied']:.3f}, MuJoCo {f['slide_mu_implied_label']:.3f} | "
+                     f"node cancellation {f['slide_fric_cancellation']:.2f} (0 = aligned) | "
+                     f"active pad nodes {f['slide_active_nodes']:.1f}")
     return lines
 
 
@@ -557,7 +603,20 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
                   dict(params=list(phys.parameters()), lr=s.coeff_lr)]
         epochs = s.contact_epochs
     coeff_params = groups[1]["params"]
-    opt = torch.optim.Adam([g for g in groups if g["params"]])
+    groups = [g for g in groups if g["params"]]
+    opt = torch.optim.Adam(groups)
+    # Learning-rate schedule for the network weights (coefficients keep theirs).
+    sched = None
+    if s.lr_schedule == "cosine":
+        f_net = lambda e: 0.5 * (1.0 + math.cos(math.pi * min(e, epochs) / max(epochs, 1)))
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, [f_net] + [lambda e: 1.0] * (len(groups) - 1))
+    elif s.lr_schedule is not None:
+        raise ValueError(f"lr_schedule must be None or 'cosine', got {s.lr_schedule!r}")
+    # Coefficient warmup, capped at half the stage so short runs still learn mu / k_f.
+    warmup = min(s.coeff_warmup_epochs, epochs // 2)
+    if verbose and warmup < s.coeff_warmup_epochs and coeff_params:
+        print(f"[{stage}] note: coeff_warmup_epochs={s.coeff_warmup_epochs} >= half of {epochs} epochs; "
+              f"using {warmup} so the coefficients ({'k_f, k_m' if stage == 'aero' else 'mu'}) can still move")
     use_contact = stage == "contact"
     hist = history.setdefault(stage, dict(train=[], val=[], params=[]))
     best, best_state = float("inf"), None
@@ -573,7 +632,7 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
             loss, p, raws = unroll_loss(model, phys, b, s, stage)
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            if epoch < s.coeff_warmup_epochs:
+            if epoch < warmup:
                 for cp in coeff_params:
                     cp.grad = None                 # Adam skips parameters without a gradient
             opt.step()
@@ -583,6 +642,8 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
             for k, v in raws.items():
                 raw_acc[k] = raw_acc.get(k, 0.0) + v
         nb = max(nb, 1)
+        if sched is not None:
+            sched.step()
         if lstsq and (epoch + 1) % s.drag_refit_interval == 0:
             k, r2 = fit_drag_coefficients(model, train_data, train_idx, s, device, "network")
             model.params.set_drag(k)

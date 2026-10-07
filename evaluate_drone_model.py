@@ -17,13 +17,15 @@ import numpy as np
 import torch
 
 from train_drone_gns import load_checkpoint, evaluate_on_dataset, _make_phys
+
+import drone_closed_loop as CL
 from drone_closed_loop import evaluate_closed_loop, gen_settings_for
 from visualize_drone_model import plot_closed_loop, animate_closed_loop
 
 
 def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
                        closed_loop_kinds=("tap", "push", "slide"), closed_loop_seed=1234,
-                       n_visualize=3, make_gifs=True, gif_stride=3, device="cpu"):
+                       n_visualize=3, make_gifs=True, gif_stride=3, sanity_check=True, device="cpu"):
     model, cfg, s, ck = load_checkpoint(model_path, device)
     phys = _make_phys(cfg, s).to(device)
     phys.load_state_dict(ck["phys"])
@@ -54,7 +56,7 @@ def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
         metrics.update({f"closed_loop_{k}": v for k, v in avg.items()})
         for kind in sorted({r["scenario"]["kind"] for r in results}):
             sel = [r["metrics"] for r in results if r["scenario"]["kind"] == kind]
-            for k in ("pad_err_mean_mm", "pad_err_contact_mm", "contact_onset_err_ms",
+            for k in ("pad_err_mean_mm", "pad_err_contact_mm", "contact_onset_err_ms", "yaw_err_mean_deg",
                       "closed_loop_sustained_contact_rmse_N", "one_step_sustained_contact_rmse_N"):
                 metrics[f"closed_loop_{kind}_{k}"] = float(np.nanmean([m.get(k, np.nan) for m in sel]))
         mu_true = meta.get("mu") if meta else None
@@ -67,4 +69,23 @@ def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
             print(f"  saved {os.path.basename(stem)}.png" + (" and .gif" if make_gifs else ""))
         torch.save([dict(scenario=r["scenario"], metrics=r["metrics"]) for r in results],
                    os.path.join(out_folder, "closed_loop_summary.pt"))
+
+        # Sanity check: the first push again, with the model's contact network
+        # switched off. The model drone's pad should go through the wall, which
+        # shows the closed-loop figures come from the model, not from MuJoCo.
+        if sanity_check:
+            push = next((r for r in results if r["scenario"]["kind"] == "push"), results[0])
+            sc, true = push["scenario"], push["true"]
+            off = CL.run_model(sc, cfg, gs, model, device, use_contact=False)
+            g = CL.MG.build_drone_graph(cfg)
+            pads = off["com"][:, None, :] + np.einsum('tij,nj->tni', off["R"], g["rest_nodes"].numpy()[g["pad_indices"]])
+            depth = 1e3 * float(((pads - sc["wall_point"]) @ sc["n"]).min())
+            metrics["sanity_contact_off_deepest_pad_mm"] = depth
+            r_off = dict(scenario=sc, true=true, pred=off, one_step=push["one_step"], mu_true=mu_true,
+                         metrics=CL.closed_loop_metrics(true, off, push["one_step"], sc, cfg))
+            plot_closed_loop(r_off, cfg, os.path.join(out_folder, "sanity_check_contact_off.png"),
+                             title="SANITY CHECK: same push, model with its contact network switched off "
+                                   f"(pad goes {-depth:.0f} mm into the wall)")
+            print(f"  sanity check (contact network off): model pad reaches {depth:.1f} mm "
+                  f"({'inside' if depth < 0 else 'outside'} the wall) -> saved sanity_check_contact_off.png")
     return metrics
