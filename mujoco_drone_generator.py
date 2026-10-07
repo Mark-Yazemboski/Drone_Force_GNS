@@ -97,11 +97,11 @@ class GenSettings:
     # well under a degree. A larger time constant mimics a rubber pad, which
     # spreads load over several nodes. Match the real pad.
     pad_solref: tuple = (0.004, 1.0)
-    wind_max: float = 3.0           # m/s mean wind
-    gust_std: float = 0.4           # m/s
+    wind_max: float = 0             # m/s mean wind
+    gust_std: float = 0             # m/s
     excite_max: float = 0.04        # max relative rotor-command noise
-    tilted_wall_prob: float = 0.3
-    wall_tilt_max_deg: float = 10.0
+    tilted_wall_prob: float = 0
+    wall_tilt_max_deg: float = 0
     yaw_offset_max_deg: float = 10.0
     yaw_torque_budget: float = 0.15 # N m of yaw torque the pad's moments may use (see make_scenario)
     scenario_probs: tuple = (("free", 0.10), ("hover_near", 0.15), ("tap", 0.20),
