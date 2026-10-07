@@ -169,8 +169,11 @@ def _moving_average(x, w):
 
 
 def animate_closed_loop(res, cfg, path, stride=3, fps=None, friction_gain=2.5, min_N=0.03,
-                        view_half_width=0.33, true_force_avg_frames=5, dpi=80):
-    """view_half_width: the camera follows the drone with a cube of this half-width (m).
+                        view_half_width=0.33, true_force_avg_frames=5, dpi=80, camera="fixed"):
+    """camera: "fixed" (default) keeps one view of the contact region and a fixed,
+    gridded wall, so sliding reads correctly; "follow" centers on the drone every
+    frame (bigger drone, but the background moves with it, which makes sliding look
+    reversed). view_half_width: half-width of the "follow" view (m).
     true_force_avg_frames: MuJoCo's contact force chatters during slides; its arrows
     and HUD value use a centered moving average over this many frames (5 = 50 ms).
     The force trace on the right shows the raw label."""
@@ -222,6 +225,30 @@ def animate_closed_loop(res, cfg, path, stride=3, fps=None, friction_gain=2.5, m
         W = [p + a * hw * w1 + b * hw * w2 for a, b in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
         wall_art.append(ax.add_collection3d(Poly3DCollection([W], facecolor="#D3D1C7", edgecolor="#888780",
                                                              alpha=0.35)))
+
+    if camera == "fixed":
+        # One view for the whole GIF, centered on where the pad works near the wall,
+        # and a fixed wall with a 5 cm grid as a stationary reference.
+        d_pad = (pad_t[:T] - wp) @ n
+        near = d_pad < 0.10
+        sel = near if near.any() else np.ones(T, bool)
+        c_fix = centers[:T][sel].mean(0)
+        ext = (centers[:T].max(0) - centers[:T].min(0)).max()
+        hw_fix = float(np.clip(0.5 * ext + 0.25, 0.40, 0.60))
+        ax.set_xlim(c_fix[0] - hw_fix, c_fix[0] + hw_fix)
+        ax.set_ylim(c_fix[1] - hw_fix, c_fix[1] + hw_fix)
+        ax.set_zlim(c_fix[2] - hw_fix, c_fix[2] + hw_fix)
+        p0 = pad_t[:T][sel].mean(0)
+        p0 = p0 - ((p0 - wp) @ n) * n
+        hw_w = 0.8 * hw_fix
+        W = [p0 + a * hw_w * w1 + b * hw_w * w2 for a, b in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+        ax.add_collection3d(Poly3DCollection([W], facecolor="#D3D1C7", edgecolor="#888780", alpha=0.30))
+        for s_ in np.arange(-np.floor(hw_w / 0.05) * 0.05, hw_w + 1e-9, 0.05):
+            for u, v_ in ((w1, w2), (w2, w1)):
+                a_, b_ = p0 + s_ * u - hw_w * v_, p0 + s_ * u + hw_w * v_
+                ax.plot([a_[0], b_[0]], [a_[1], b_[1]], [a_[2], b_[2]], color="#B4B2A9", lw=0.5, alpha=0.8)
+    elif camera != "follow":
+        raise ValueError(f"camera must be 'fixed' or 'follow', got {camera!r}")
 
     def make_lines(color, lw, alpha):
         return [ax.plot([], [], [], color=color, lw=lw, alpha=alpha)[0] for _ in polys]
@@ -276,11 +303,12 @@ def animate_closed_loop(res, cfg, path, stride=3, fps=None, friction_gain=2.5, m
         for q in quivers:
             q.remove()
         quivers.clear()
-        c = centers[k]
-        draw_wall(k)
-        ax.set_xlim(c[0] - view_half_width, c[0] + view_half_width)
-        ax.set_ylim(c[1] - view_half_width, c[1] + view_half_width)
-        ax.set_zlim(c[2] - view_half_width, c[2] + view_half_width)
+        if camera == "follow":
+            c = centers[k]
+            draw_wall(k)
+            ax.set_xlim(c[0] - view_half_width, c[0] + view_half_width)
+            ax.set_ylim(c[1] - view_half_width, c[1] + view_half_width)
+            ax.set_zlim(c[2] - view_half_width, c[2] + view_half_width)
         for run, lines in ((true, lines_t), (pred, lines_p)):
             for ln, P in zip(lines, polys):
                 Wp = world(run, k, P)

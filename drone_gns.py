@@ -225,7 +225,7 @@ class DroneForceModel(nn.Module):
         self.cfg, self.h = cfg, s.h
         self.mass, self.dt = cfg.mass, cfg.dt
         self.contact_d0, self.contact_tau = s.contact_d0, s.contact_tau
-        self.dist_clamp = (-0.05, 0.5)
+        self.dist_clamp = tuple(s.contact_dist_clamp)
         self.aero_dist_max = s.aero_dist_max
 
         # Rotor layout and inertia.

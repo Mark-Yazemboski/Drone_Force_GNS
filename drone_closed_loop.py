@@ -358,6 +358,14 @@ def closed_loop_metrics(true, pred, onestep, sc, cfg_true, touch_N=0.2, impact_N
             out[f"{name}_sustained_normal_mean_err_N"] = float((d @ n).mean())
     if sustained.any():
         out["sustained_contact_label_rms_N"] = float(np.sqrt((true["F_contact"][:T][sustained] ** 2).sum(1).mean()))
+    # High-frequency content of the normal force during sustained contact:
+    # RMS of the frame-to-frame change (N per 10 ms step), MuJoCo vs. model.
+    both = sustained[1:] & sustained[:-1]
+    if both.any():
+        for name, F in (("label", true["F_contact"][:T]), ("one_step", onestep["F_contact"][:T]),
+                        ("closed_loop", pred["F_contact"][:T])):
+            dF = np.diff(F @ n)[both]
+            out[f"fn_jitter_{name}_N"] = float(np.sqrt((dF ** 2).mean()))
     da = onestep["F_aero"][:T] - true["F_aero"][:T]
     out["one_step_aero_rmse_N"] = float(np.sqrt((da ** 2).sum(1).mean()))
     out["aero_label_rms_N"] = float(np.sqrt((true["F_aero"][:T] ** 2).sum(1).mean()))
