@@ -81,7 +81,11 @@ def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
             pads = off["com"][:, None, :] + np.einsum('tij,nj->tni', off["R"], g["rest_nodes"].numpy()[g["pad_indices"]])
             depth = 1e3 * float(((pads - sc["wall_point"]) @ sc["n"]).min())
             metrics["sanity_contact_off_deepest_pad_mm"] = depth
-            r_off = dict(scenario=sc, true=true, pred=off, one_step=push["one_step"], mu_true=mu_true,
+            # The one-step trace comes from the normal (contact-on) model, so hide its
+            # contact forces here; the aero one-step trace is unaffected and kept.
+            one_off = dict(push["one_step"])
+            one_off["F_contact"] = np.full_like(one_off["F_contact"], np.nan)
+            r_off = dict(scenario=sc, true=true, pred=off, one_step=one_off, mu_true=mu_true,
                          metrics=CL.closed_loop_metrics(true, off, push["one_step"], sc, cfg))
             plot_closed_loop(r_off, cfg, os.path.join(out_folder, "sanity_check_contact_off.png"),
                              title="SANITY CHECK: same push, model with its contact network switched off "
