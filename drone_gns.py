@@ -79,6 +79,24 @@ class DronePhysicsParams(nn.Module):
     def k_pad(self):
         return torch.exp(self.log_kpad)
 
+    DRAG_NAMES = ("k_rot", "k_body", "k_rod", "k_pad")
+
+    # The four drag coefficients as a vector, in drag_basis() column order.
+    def drag_vector(self):
+        return torch.stack([self.k_rot, self.k_body, self.k_rod, self.k_pad])
+
+    @torch.no_grad()
+    def set_drag(self, k, floor=1e-9):
+        for name, v in zip(("log_krot", "log_kbody", "log_krod", "log_kpad"), k):
+            getattr(self, name).copy_(torch.log(torch.as_tensor(max(float(v), floor))))
+
+    def drag_parameters(self):
+        return [getattr(self, n) for n in ("log_krot", "log_kbody", "log_krod", "log_kpad")
+                if isinstance(getattr(self, n), nn.Parameter)]
+
+    def thrust_parameters(self):
+        return [getattr(self, n) for n in ("log_kf", "log_km") if isinstance(getattr(self, n), nn.Parameter)]
+
     # Values for logging.
     def as_dict(self):
         with torch.no_grad():
@@ -322,22 +340,33 @@ class DroneForceModel(nn.Module):
         f_b = raw[..., 0:3] * self.aero_scale
         f_b = f_b - self.mask_rotor * (f_b * a).sum(-1, keepdim=True) * a
         axial = raw[..., 3] * self.aero_scale * self.mask_rotor.squeeze(-1)
+        f_drag = f_b
         f_b = f_b + axial.unsqueeze(-1) * a
 
         f_w = torch.einsum('bij,bnj->bni', R_curr, f_b)
         F = f_w.sum(1)
         tau = _cross(r, f_w).sum(1)
 
-        # Anchor laws per node type (body frame), m/s^2 -> per step^2.
-        p = self.params
-        om_node = omega @ self.rotor_sel                                     # (B, Na)
+        # Anchor laws per node type (body frame): law = basis @ [k_rot, k_body, k_rod, k_pad].
+        basis = self.drag_basis(u_b, omega)
+        law = basis @ self.params.drag_vector()
+        return dict(F=F, tau=tau, f_body=f_b, f_drag=f_drag, law_body=law, axial=axial, basis=basis)
+
+    # Per-node drag laws per unit coefficient, body frame, per step^2: (B, Na, 3, 4),
+    # columns [rotor drag w_j u_perp, body |u| u, rod |u_perp| u_perp, pad |u| u].
+    # The laws are linear in the coefficients, which is what lets them be fit
+    # exactly by least squares (see train_drone_gns.fit_drag_coefficients).
+    def drag_basis(self, u_b, omega):
+        a = self.aero_node_axis
+        un = u_b.norm(dim=-1, keepdim=True)
+        om_node = (omega @ self.rotor_sel).unsqueeze(-1)                     # (B, Na, 1)
         u_rot = u_b - (u_b * a).sum(-1, keepdim=True) * a
         u_rod = u_b - (u_b * self.rod_axis).sum(-1, keepdim=True) * self.rod_axis
-        law = (self.mask_rotor * p.k_rot * om_node.unsqueeze(-1) * u_rot
-               + self.mask_rod * p.k_rod * u_rod.norm(dim=-1, keepdim=True) * u_rod
-               + self.mask_com * p.k_body * un * u_b
-               + self.mask_pad * p.k_pad * un * u_b) * self.dt ** 2
-        return dict(F=F, tau=tau, f_body=f_b, law_body=law, axial=axial)
+        cols = [self.mask_rotor * om_node * u_rot,
+                self.mask_com * un * u_b,
+                self.mask_rod * u_rod.norm(dim=-1, keepdim=True) * u_rod,
+                self.mask_pad * un * u_b]
+        return torch.stack(cols, -1) * self.dt ** 2
 
     # ---------------- contact ----------------
     # Raw contact-GNN inputs. Dynamic features are normalized; static are not.

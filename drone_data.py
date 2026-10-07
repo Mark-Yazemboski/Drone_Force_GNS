@@ -83,8 +83,6 @@ def load_drone_trajectory(path, cfg, rotor_speed_in_rpm=False, rotor_speed_hold=
 # mismatch fails loudly instead of being absorbed into the learned forces.
 def build_drone_dataset(traj_range, folder, cfg, rotor_speed_in_rpm=False, rotor_speed_hold=None):
     dataset, meta0 = [], None
-
-    #Runs through the specified trajectory range and loads each trajectory into the dataset
     for i in traj_range:
         d, meta = load_drone_trajectory(os.path.join(folder, f"{i}.pt"), cfg,
                                          rotor_speed_in_rpm, rotor_speed_hold)
@@ -119,6 +117,18 @@ def annotate_pad_distance(dataset, pad_rest_nodes):
         nodes = nodes_from_state(d["com"] - d["wall_c"], d["R"].double(), pad_rest_nodes.double())
         d["pad_dmin"] = (nodes * d["wall_n"].double()).sum(-1).min(dim=1).values.float()
     return dataset
+
+
+# Keeps the windows whose closest pad approach over the whole window (inputs and
+# targets) is below max_dist and/or above min_dist. None = no bound.
+def filter_chain_index(dataset, chain_index, h, multistep, max_dist=None, min_dist=None):
+    span = h + 1 + multistep
+    out = []
+    for ti, s in chain_index:
+        dmin = float(dataset[ti]["pad_dmin"][s:s + span].min())
+        if (max_dist is None or dmin < max_dist) and (min_dist is None or dmin > min_dist):
+            out.append((ti, s))
+    return out
 
 
 # Splits a chain index by the closest pad approach over the whole window

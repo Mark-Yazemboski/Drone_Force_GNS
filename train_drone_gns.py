@@ -22,13 +22,14 @@ import os
 import time
 from dataclasses import dataclass, asdict
 
+import numpy as np
 import torch
 
 from force_gns import nodes_from_state
 from physics_losses import PhysicsLosses
 from drone_config import DroneConfig
 from drone_gns import DroneForceModel
-from drone_data import (build_chain_index, split_chain_index, annotate_pad_distance,
+from drone_data import (build_chain_index, filter_chain_index, annotate_pad_distance,
                         iterate_drone_chains, rotate_drone_chain)
 from drone_normalization import xy_pooled_scale, rms_scale
 
@@ -62,6 +63,19 @@ class DroneTrainSettings:
     k_f_scale: float = 1.0
     k_m_scale: float = 1.0
     learn_drag_coeffs: bool = True       # k_rot, k_body, k_rod, k_pad (the anchor-law coefficients)
+    # How the drag coefficients are learned:
+    #   "lstsq"    exact least squares. The laws are linear in the k's, so they are
+    #              fit in closed form: from the measured motion residual (measured
+    #              acceleration - thrust - gravity, contact-free windows) before stage 1,
+    #              then refit to the aero network's total force and torque every
+    #              drag_refit_interval epochs. No learning rate, no drift.
+    #   "gradient" gradient descent through w_aero_coeff_fit. Converges very slowly:
+    #              the laws are strongly correlated (rotor vs body drag ~0.94), so
+    #              from a poor start the k's crawl along a long valley.
+    drag_coeff_fit: str = "lstsq"
+    drag_refit_interval: int = 5
+    # Initial drag coefficients ("gradient" fit, or learn_drag_coeffs=False). With
+    # "lstsq" they are replaced by the fit from the motion residual before stage 1.
     k_rot_init: float = 5e-5        # rotor drag:  k_rot * w_j * u_perp      (per rotor, 1/rad)
     k_body_init: float = 0.02       # body drag:   k_body * |u| u            (1/m)
     k_rod_init: float = 0.05        # rod drag:    k_rod * |u_perp| u_perp   (1/m)
@@ -71,6 +85,10 @@ class DroneTrainSettings:
     batch_size: int = 256
     aero_min_pad_dist: float = 0.026  # stage-1 (aero) windows: every pad node stays farther than
                                       # this from the wall for the whole window (m)
+    contact_max_pad_dist: float = 0.05  # stage-2 (contact) windows: the pad comes closer than this
+                                        # at some frame of the window (m). None = every window.
+                                        # Farther windows carry no gradient for the contact GNN
+                                        # (gate ~ e^-29 at 5 cm), so skipping them only saves time.
     # Input noise (random walk on the input window). None = set per stage as
     # noise_frac x that stage's median residual (the typical size of the signal
     # it learns); rotation noise gives the same displacement at the pad.
@@ -82,10 +100,16 @@ class DroneTrainSettings:
     # ---- stage 1: aero ----
     aero_epochs: int = 200
     aero_lr: float = 3e-4
-    w_aero_anchor: float = 0.1      # each aero node's force toward its drag law
+    w_aero_anchor: float = 0.1      # each aero node's force toward its drag law (moves the network only)
+    w_aero_coeff_fit: float = 0.01  # drag coefficients fit to the network's total aero force/torque
+                                    # (moves only the k's; Adam normalizes their step, so the weight
+                                    # mainly sets how much this term adds to the logged total loss)
     w_aero_smooth: float = 0.01     # aero force changes smoothly between steps
     w_axial: float = 0.1            # rotor axial thrust correction toward zero (no law to anchor to)
     w_prior: float = 1e-3           # k_f, k_m toward their thrust-stand values
+    coeff_lr: float = 1e-3          # learning rate for the physical coefficients (k's in stage 1, mu in stage 2)
+    coeff_warmup_epochs: int = 10   # coefficients held fixed for the first epochs of each stage, so they
+                                    # are not pulled toward an untrained network's forces
     # ---- stage 2: contact ----
     contact_epochs: int = 300
     contact_lr: float = 1e-4
@@ -100,6 +124,9 @@ class DroneTrainSettings:
     val_horizon: int = 20           # steps rolled forward per validation window (match the MPC horizon)
     val_stride: int = 5             # a validation window starts every val_stride frames
     val_interval: int = 10          # validate every val_interval epochs
+    best_metric: str = "val_loss"   # "val_loss" (same normalized loss as training, on validation
+                                    # windows, no noise/augmentation) or "pad_err" (pad error at val_horizon)
+    impact_force_N: float = 10.0    # force-label validation splits contact frames at this magnitude
     near_thresh: float = 0.05
 
 
@@ -192,9 +219,9 @@ def fit_aero_stats(model, data, free_idx, s, device):
 
 
 # Before stage 2, with the trained aero model:
-#   contact input stats over all windows (the non-contact acceleration now
-#   includes aero); the contact output scale from contact windows (residual
-#   after thrust, aero, gravity); the stage-2 loss scale over all windows.
+#   contact input stats over the stage-2 windows (the non-contact acceleration
+#   now includes aero); the contact output scale from touching windows (residual
+#   after thrust, aero, gravity); the stage-2 loss scale over the stage-2 windows.
 @torch.no_grad()
 def fit_contact_stats(model, data, all_idx, contact_idx, s, device):
     dyns, edges = [], []
@@ -227,6 +254,54 @@ def fit_contact_stats(model, data, all_idx, contact_idx, s, device):
 
 
 # ======================================================================
+# Drag coefficients by least squares
+# ======================================================================
+
+# Fits [k_rot, k_body, k_rod, k_pad] in closed form (non-negative least squares),
+# on clean contact-free windows (first step of each), in the body frame:
+#   target="residual": the measured COM residual (measured acceleration - thrust
+#       - gravity). Motion data only, so it works the same on hardware. Force only.
+#   target="network":  the aero network's total force and torque about the COM.
+# Returns the coefficient vector and R^2 of the fit.
+@torch.no_grad()
+def fit_drag_coefficients(model, data, index, s, device, target):
+    from scipy.optimize import nnls
+    A_rows, y_rows = [], []
+    L = float(model.aero_rest.norm(dim=-1).max())
+    r_b = model.aero_rest.unsqueeze(0)
+    for i, b in enumerate(_batches(data, index, s, device, 1, train=False)):
+        if i >= s.stats_batches:
+            break
+        com_h, R_h = _window(b, s.h)
+        omega, wind = b["omega"][:, 0], b["wind"][:, 0]
+        u_b, _ = model.aero_airspeed(com_h[-2], com_h[-1], R_h[-2], R_h[-1], wind)
+        basis = model.drag_basis(u_b, omega)                                   # (B, Na, 3, 4)
+        A_F = basis.sum(1)                                                     # (B, 3, 4)
+        if target == "residual":
+            f_thr, _ = model.thrust_wrench(omega, R_h[-1])
+            res_w = b["tgt_com"][:, 0] - 2 * com_h[-1] + com_h[-2] - f_thr - model.g_step
+            A_rows.append(A_F)
+            y_rows.append(torch.einsum('bji,bj->bi', R_h[-1], res_w))         # body frame
+        else:
+            a = model.aero_forces(com_h[-2], com_h[-1], R_h[-2], R_h[-1], omega, wind, b["wall_n"], b["wall_c"])
+            A_T = torch.linalg.cross(r_b.unsqueeze(-1).expand_as(basis), basis, dim=2).sum(1) / L
+            A_rows.append(torch.cat([A_F, A_T], 1))
+            y_rows.append(torch.cat([a["f_drag"].sum(1), torch.linalg.cross(r_b.expand_as(a["f_drag"]),
+                                                                            a["f_drag"], dim=-1).sum(1) / L], 1))
+    A = torch.cat(A_rows).reshape(-1, 4).double().cpu().numpy()
+    y = torch.cat(y_rows).reshape(-1).double().cpu().numpy()
+    col = np.linalg.norm(A, axis=0) + 1e-300
+    k, _ = nnls(A / col, y)
+    k = k / col
+    r2 = 1.0 - float(((A @ k - y) ** 2).sum() / max((y ** 2).sum(), 1e-300))
+    return k, r2
+
+
+def _fmt_k(k):
+    return "  ".join(f"{n} {v:.3g}" for n, v in zip(("k_rot", "k_body", "k_rod", "k_pad"), k))
+
+
+# ======================================================================
 # Loss
 # ======================================================================
 
@@ -250,8 +325,24 @@ def unroll_loss(model, phys, batch, s, stage):
         if stage == "aero":
             a = aux["aero"]
             sc = model.aero_scale
+            # Per-node anchor: pulls each node's drag toward its law. The law is
+            # DETACHED, so this term shapes the network and never moves the k's.
+            # (The data pins only the TOTAL aero wrench, not how it is split among
+            # nodes; letting k follow each node made the k's drift with whatever
+            # split the network happened to use, and dragged the total down.)
             raws["aero_anchor"] = raws.get("aero_anchor", 0.0) + \
-                ((a["f_body"] - a["law_body"]) / sc).pow(2).sum(-1).mean() / K
+                ((a["f_drag"] - a["law_body"].detach()) / sc).pow(2).sum(-1).mean() / K
+            # Coefficient fit: the summed laws (force and torque about the COM,
+            # body frame) against the network's total, which is DETACHED. Only the
+            # k's move: a regression of the data-pinned aero wrench onto the laws.
+            if s.drag_coeff_fit == "gradient":
+                r_b = model.aero_rest.unsqueeze(0)
+                f_net, law = a["f_drag"].detach(), a["law_body"]
+                L = r_b.norm(dim=-1).max()
+                raws["aero_coeff_fit"] = raws.get("aero_coeff_fit", 0.0) + (
+                    ((f_net.sum(1) - law.sum(1)) / sc).pow(2).sum(-1).mean()
+                    + ((torch.linalg.cross(r_b.expand_as(law), f_net - law, dim=-1).sum(1)) / (sc * L)).pow(2).sum(-1).mean()
+                ) / K
             raws["axial"] = raws.get("axial", 0.0) + (a["axial"] / sc).pow(2).mean() / K
             F_series.append(a["F"])
         else:
@@ -269,7 +360,8 @@ def unroll_loss(model, phys, batch, s, stage):
         if K > 1:
             raws["aero_smooth"] = torch.stack([((F_series[k] - F_series[k - 1]) / model.aero_scale).pow(2).sum(-1).mean()
                                                for k in range(1, K)]).mean()
-        weights = dict(aero_anchor=s.w_aero_anchor, axial=s.w_axial, aero_smooth=s.w_aero_smooth)
+        weights = dict(aero_anchor=s.w_aero_anchor, aero_coeff_fit=s.w_aero_coeff_fit, axial=s.w_axial,
+                       aero_smooth=s.w_aero_smooth)
         total = total + sum(weights[n] * v for n, v in raws.items()) + s.w_prior * model.params.prior_loss()
     else:
         total = total + PhysicsLosses.weighted_total(raws, fric_w)
@@ -319,12 +411,21 @@ def kstep_validation(model, data, index, s, device, use_contact):
 
 
 # MuJoCo only: one-step learned forces vs. the generator's force labels (N).
+# Contact frames are split into sustained contact (pushing/sliding, label below
+# impact_force_N) and impacts (taps), because a few large tap impulses would
+# otherwise dominate a single RMSE and hide how well pushes and slides are learned.
 @torch.no_grad()
-def force_validation(model, data, index, s, device, max_batches=20):
+def force_validation(model, data, index, s, device, max_batches=40):
     if not all("F_contact" in d and "F_aero" in d for d in data):
         return {}
     model.eval()
-    acc = dict(c_sq=0.0, c_ref=0.0, cn=0.0, ct=0.0, n_c=0, false_f=0.0, n_f=0, a_sq=0.0, a_ref=0.0, n_a=0)
+    acc = {}
+
+    def add(key, sq, n):
+        a_ = acc.setdefault(key, [0.0, 0])
+        a_[0] += float(sq)
+        a_[1] += int(n)
+
     for i, b in enumerate(_batches(data, index, s, device, 1, train=False)):
         if i >= max_batches:
             break
@@ -332,36 +433,80 @@ def force_validation(model, data, index, s, device, max_batches=20):
         _, _, aux = model.step(com_h, R_h, b["omega"][:, 0], b["wind"][:, 0], b["wall_n"], b["wall_c"])
         n = b["wall_n"]
         Fc_p, Fc_t = model.to_newtons(aux["f_c"]), b["F_contact"][:, 0]
+        mag = Fc_t.norm(dim=-1)
+        for name, m in (("sustained", (mag > 0.05) & (mag < s.impact_force_N)),
+                        ("impact", mag >= s.impact_force_N)):
+            if m.any():
+                d = Fc_p[m] - Fc_t[m]
+                dn = (d * n[m]).sum(-1)
+                add(f"{name}_err", d.pow(2).sum(-1).sum(), m.sum())
+                add(f"{name}_ref", Fc_t[m].pow(2).sum(-1).sum(), m.sum())
+                add(f"{name}_normal", dn.pow(2).sum(), m.sum())
+                add(f"{name}_tangential", (d - dn.unsqueeze(-1) * n[m]).pow(2).sum(-1).sum(), m.sum())
+        free = mag <= 0.05
+        if free.any():
+            add("false_contact", Fc_p[free].norm(dim=-1).sum(), free.sum())
         Fa_p, Fa_t = model.to_newtons(aux["aero"]["F"]), b["F_aero"][:, 0]
-        touching = Fc_t.norm(dim=-1) > 0.05
-        if touching.any():
-            d = Fc_p[touching] - Fc_t[touching]
-            nn_ = n[touching]
-            dn = (d * nn_).sum(-1)
-            acc["c_sq"] += float(d.pow(2).sum(-1).sum())
-            acc["c_ref"] += float(Fc_t[touching].pow(2).sum(-1).sum())
-            acc["cn"] += float(dn.pow(2).sum())
-            acc["ct"] += float((d - dn.unsqueeze(-1) * nn_).pow(2).sum(-1).sum())
-            acc["n_c"] += int(touching.sum())
-        if (~touching).any():
-            acc["false_f"] += float(Fc_p[~touching].norm(dim=-1).sum())
-            acc["n_f"] += int((~touching).sum())
-        acc["a_sq"] += float((Fa_p - Fa_t).pow(2).sum(-1).sum())
-        acc["a_ref"] += float(Fa_t.pow(2).sum(-1).sum())
-        acc["n_a"] += Fa_t.shape[0]
+        add("aero_err", (Fa_p - Fa_t).pow(2).sum(-1).sum(), Fa_t.shape[0])
+        add("aero_ref", Fa_t.pow(2).sum(-1).sum(), Fa_t.shape[0])
+        # Rotor axial thrust correction (N per rotor); should stay ~0 in MuJoCo.
+        ax = model.to_newtons(aux["aero"]["axial"]) @ model.rotor_sel.T
+        add("axial", ax.pow(2).sum(), ax.numel())
     model.train()
     out = {}
-    if acc["n_c"]:
-        out.update(contact_rmse_N=(acc["c_sq"] / acc["n_c"]) ** 0.5,
-                   contact_label_rms_N=(acc["c_ref"] / acc["n_c"]) ** 0.5,
-                   contact_normal_rmse_N=(acc["cn"] / acc["n_c"]) ** 0.5,
-                   contact_tangential_rmse_N=(acc["ct"] / acc["n_c"]) ** 0.5)
-    if acc["n_f"]:
-        out["false_contact_mean_N"] = acc["false_f"] / acc["n_f"]
-    if acc["n_a"]:
-        out.update(aero_rmse_N=(acc["a_sq"] / acc["n_a"]) ** 0.5,
-                   aero_label_rms_N=(acc["a_ref"] / acc["n_a"]) ** 0.5)
+    for key, (v, n) in acc.items():
+        out[key] = v / n if key == "false_contact" else (v / n) ** 0.5     # RMS, except false_contact = mean |F|
+        if key not in ("axial", "aero_ref", "aero_err"):
+            out[key + "_n"] = n
     return out
+
+
+# Full evaluation on a held-out set (the test trajectories): validation losses
+# for both stages, k-step error by regime, and (MuJoCo) learned vs. true forces.
+# Returns a flat dict of floats for the run report.
+@torch.no_grad()
+def evaluate_on_dataset(model, phys, data, s, device="cpu"):
+    annotate_pad_distance(data, model.pad_rest.cpu())
+    w = stage_windows(data, data, s)
+    out = {"aero_loss": validation_loss(model, phys, data, w["vl_aero"], s, device, "aero"),
+           "contact_loss": validation_loss(model, phys, data, w["vl_contact"], s, device, "contact")}
+    for regime, m in kstep_validation(model, data, w["va_all"], s, device, use_contact=True).items():
+        for k, v in m.items():
+            out[f"kstep{s.val_horizon}_{regime}_{k}"] = v
+    for k, v in force_validation(model, data, w["va_all"], s, device, max_batches=10 ** 6).items():
+        out[f"force_{k}"] = v
+    return out
+
+
+def _format_forces(f, impact_N):
+    lines = ["    forces vs MuJoCo labels (RMSE / label RMS, N):"]
+    for name, label in (("sustained", f"contact, sustained (<{impact_N:g} N)"),
+                        ("impact", f"contact, impacts (>={impact_N:g} N)")):
+        if f"{name}_err" in f:
+            lines.append(f"      {label:30s} {f[name + '_err']:7.3f} / {f[name + '_ref']:7.3f}   "
+                         f"[normal {f[name + '_normal']:.3f}, tangential {f[name + '_tangential']:.3f}]  "
+                         f"({f[name + '_err_n']} frames)")
+    if "false_contact" in f:
+        lines.append(f"      {'false contact (not touching)':30s} {f['false_contact']:7.3f} mean |F|")
+    if "aero_err" in f:
+        expl = 100 * (1 - (f["aero_err"] / max(f["aero_ref"], 1e-12)) ** 2)
+        lines.append(f"      {'aero':30s} {f['aero_err']:7.4f} / {f['aero_ref']:7.4f}   ({expl:.0f}% of label variance explained)")
+    if "axial" in f:
+        lines.append(f"      {'rotor axial correction':30s} {f['axial']:7.4f} RMS per rotor (should be ~0 in sim)")
+    return lines
+
+
+# Same normalized loss as training (no input noise, no augmentation), on
+# validation windows of the training unroll length.
+@torch.no_grad()
+def validation_loss(model, phys, data, index, s, device, stage):
+    model.eval()
+    tot = n = 0.0
+    for b in _batches(data, index, s, device, s.multistep, train=False):
+        tot += float(unroll_loss(model, phys, b, s, stage)[1]) * b["B"]
+        n += b["B"]
+    model.train()
+    return tot / max(n, 1)
 
 
 # ======================================================================
@@ -392,18 +537,27 @@ def _make_phys(cfg, s):
                          slip_v0=s.slip_v0, slip_tau=s.slip_tau)
 
 
-def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val_idx, stem,
+def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val_idx, val_loss_idx, stem,
                 device, history, verbose):
+    # Network weights and physical coefficients get separate learning rates: the
+    # coefficients (k's, mu) see weak, noisy gradients through the anchor and
+    # friction losses and move very slowly at a network learning rate.
+    _set_trainable(model, False)
+    lstsq = stage == "aero" and s.drag_coeff_fit == "lstsq" and s.learn_drag_coeffs
     if stage == "aero":
-        _set_trainable(model, False)
         _set_trainable(model.aero, True)
         _set_trainable(model.params, True)
-        params, lr, epochs = list(model.aero.parameters()) + list(model.params.parameters()), s.aero_lr, s.aero_epochs
+        coeffs = model.params.thrust_parameters() + ([] if lstsq else model.params.drag_parameters())
+        groups = [dict(params=list(model.aero.parameters()), lr=s.aero_lr),
+                  dict(params=coeffs, lr=s.coeff_lr)]
+        epochs = s.aero_epochs
     else:
-        _set_trainable(model, False)
         _set_trainable(model.contact, True)
-        params, lr, epochs = list(model.contact.parameters()) + list(phys.parameters()), s.contact_lr, s.contact_epochs
-    opt = torch.optim.Adam(params, lr=lr)
+        groups = [dict(params=list(model.contact.parameters()), lr=s.contact_lr),
+                  dict(params=list(phys.parameters()), lr=s.coeff_lr)]
+        epochs = s.contact_epochs
+    coeff_params = groups[1]["params"]
+    opt = torch.optim.Adam([g for g in groups if g["params"]])
     use_contact = stage == "contact"
     hist = history.setdefault(stage, dict(train=[], val=[], params=[]))
     best, best_state = float("inf"), None
@@ -419,6 +573,9 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
             loss, p, raws = unroll_loss(model, phys, b, s, stage)
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            if epoch < s.coeff_warmup_epochs:
+                for cp in coeff_params:
+                    cp.grad = None                 # Adam skips parameters without a gradient
             opt.step()
             tot += float(loss.detach())
             pred += float(p)
@@ -426,6 +583,11 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
             for k, v in raws.items():
                 raw_acc[k] = raw_acc.get(k, 0.0) + v
         nb = max(nb, 1)
+        if lstsq and (epoch + 1) % s.drag_refit_interval == 0:
+            k, r2 = fit_drag_coefficients(model, train_data, train_idx, s, device, "network")
+            model.params.set_drag(k)
+            if verbose:
+                print(f"[{stage}] drag coefficients refit to the network's aero wrench (R^2 {r2:.4f}): {_fmt_k(k)}")
         hist["train"].append((epoch, tot / nb, pred / nb))
         pv = dict(epoch=epoch, **model.params.as_dict(), mu=float(phys.mu.detach()))
         hist["params"].append(pv)
@@ -434,26 +596,62 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
                + (f"  k_f {pv['k_f']:.3e} k_rot {pv['k_rot']:.2e}" if stage == "aero" else f"  mu {pv['mu']:.3f}")
                + f"  {time.time() - t0:.1f}s")
 
+        if verbose:
+            print(msg, flush=True)
+
         if (epoch + 1) % s.val_interval == 0 or epoch == epochs - 1:
+            vloss = validation_loss(model, phys, val_data, val_loss_idx, s, device, stage)
             kval = kstep_validation(model, val_data, val_idx, s, device, use_contact)
             fval = force_validation(model, val_data, val_idx, s, device)
-            hist["val"].append(dict(epoch=epoch, kstep=kval, forces=fval))
-            score = kval.get("all", {}).get("pad_end_mm", float("inf"))
-            msg += f"  | val pad err @{s.val_horizon}: " + " ".join(
-                f"{r} {kval[r]['pad_end_mm']:.2f}mm" for r in ("free", "near", "contact", "all") if r in kval)
-            if fval:
-                msg += "  | " + " ".join(f"{k} {v:.3f}" for k, v in fval.items())
+            hist["val"].append(dict(epoch=epoch, loss=vloss, kstep=kval, forces=fval))
+            score = vloss if s.best_metric == "val_loss" else kval.get("all", {}).get("pad_end_mm", float("inf"))
+            if verbose:
+                which = "contact-free windows" if stage == "aero" else "all windows"
+                lines = [f"[{stage}] validation after epoch {epoch} ({which})",
+                         f"    val loss {vloss:.3e}   (train pred {pred / nb:.3e})",
+                         f"    pad error after {s.val_horizon} steps: " + "   ".join(
+                             f"{r} {kval[r]['pad_end_mm']:.3f} mm" for r in ("free", "near", "contact", "all") if r in kval)
+                         + "   (windows: " + ", ".join(f"{r} {kval[r]['n']}" for r in ("free", "near", "contact") if r in kval) + ")"]
+                if fval:
+                    lines += _format_forces(fval, s.impact_force_N)
+                if score < best:
+                    prev = "first" if best == float("inf") else f"was {best:.4g}"
+                    lines.append(f"    * new best {s.best_metric} {score:.4g} ({prev}) -> saved {os.path.basename(stem)}_{stage}_best.pt")
+                print("\n".join(lines), flush=True)
             if score < best:
                 best = score
                 best_state = copy.deepcopy(model.state_dict())
                 save_checkpoint(f"{stem}_{stage}_best.pt", model, phys, cfg, s,
                                 {"stage": stage, "epoch": epoch, "history": history})
-        if verbose:
-            print(msg, flush=True)
 
     if best_state is not None:
         model.load_state_dict(best_state)          # continue from the best validation point
     return model
+
+
+# Window sets for both stages. Distances are the closest pad node to the wall
+# over the whole window (ground truth, so the split is the same for every model).
+#   tr_aero     stage 1: pad farther than aero_min_pad_dist throughout
+#   tr_contact  stage 2: pad closer than contact_max_pad_dist at some frame
+#   tr_touch    pad inside the gate distance at some frame (contact output scale, noise)
+#   va_*        validation windows of length val_horizon (k-step error, force check)
+#   vl_*        validation windows of the training unroll length (validation loss)
+# The stage-2 k-step validation uses every window, so free-flight error stays visible.
+def stage_windows(train_data, val_data, s):
+    K, H = s.multistep, s.val_horizon
+    tr_all = build_chain_index(train_data, s.h, K)
+    va_all = build_chain_index(val_data, s.h, H, stride=s.val_stride)
+    vl_all = build_chain_index(val_data, s.h, K, stride=s.val_stride)
+    cmax = s.contact_max_pad_dist
+    return dict(
+        n_train_all=len(tr_all),
+        tr_aero=filter_chain_index(train_data, tr_all, s.h, K, min_dist=s.aero_min_pad_dist),
+        tr_contact=filter_chain_index(train_data, tr_all, s.h, K, max_dist=cmax),
+        tr_touch=filter_chain_index(train_data, tr_all, s.h, K, max_dist=s.contact_d0),
+        va_aero=filter_chain_index(val_data, va_all, s.h, H, min_dist=s.aero_min_pad_dist),
+        va_all=va_all,
+        vl_aero=filter_chain_index(val_data, vl_all, s.h, K, min_dist=s.aero_min_pad_dist),
+        vl_contact=filter_chain_index(val_data, vl_all, s.h, K, max_dist=cmax))
 
 
 def train_drone_force_model(cfg, s, train_data, val_data, save_path, device=None,
@@ -471,36 +669,38 @@ def train_drone_force_model(cfg, s, train_data, val_data, save_path, device=None
     pad_rest = model.pad_rest.cpu()
     annotate_pad_distance(train_data, pad_rest)
     annotate_pad_distance(val_data, pad_rest)
-    free_d, contact_d = s.aero_min_pad_dist, s.contact_d0
-
-    tr_all = build_chain_index(train_data, s.h, s.multistep)
-    tr_free, tr_contact = split_chain_index(train_data, tr_all, s.h, s.multistep, free_d, contact_d)
-    va_all = build_chain_index(val_data, s.h, s.val_horizon, stride=s.val_stride)
-    va_free, _ = split_chain_index(val_data, va_all, s.h, s.val_horizon, free_d, contact_d)
+    w = stage_windows(train_data, val_data, s)
     if verbose:
-        print(f"windows: train {len(tr_all)} (contact-free {len(tr_free)}, contact {len(tr_contact)}) | "
-              f"val {len(va_all)} (contact-free {len(va_free)})")
+        print(f"windows: train {w['n_train_all']} total | stage 1 (pad > {100 * s.aero_min_pad_dist:.1f} cm "
+              f"throughout) {len(w['tr_aero'])} | stage 2 (pad < "
+              + (f"{100 * s.contact_max_pad_dist:.1f} cm" if s.contact_max_pad_dist else "any distance")
+              + f" at some frame) {len(w['tr_contact'])}, of which touching {len(w['tr_touch'])}")
     history = {}
 
     if "aero" in stages:
-        if not tr_free:
+        if not w["tr_aero"]:
             raise ValueError("no contact-free training windows for stage 1")
-        fit_aero_stats(model, train_data, tr_free, s, device)
+        fit_aero_stats(model, train_data, w["tr_aero"], s, device)
         if verbose:
             print(f"stage 1 scales: aero output {float(model.aero_scale):.3e}, "
                   f"loss {float(model.loss_scale_aero):.3e} (m/step^2)")
-        train_stage("aero", model, phys, cfg, s, train_data, tr_free, val_data, va_free,
+        if s.learn_drag_coeffs and s.drag_coeff_fit == "lstsq":
+            k, r2 = fit_drag_coefficients(model, train_data, w["tr_aero"], s, device, "residual")
+            model.params.set_drag(k)
+            if verbose:
+                print(f"initial drag coefficients from the measured motion residual (R^2 {r2:.4f}): {_fmt_k(k)}")
+        train_stage("aero", model, phys, cfg, s, train_data, w["tr_aero"], val_data, w["va_aero"], w["vl_aero"],
                     stem, device, history, verbose)
 
     if "contact" in stages:
-        if not tr_contact:
+        if not w["tr_touch"]:
             raise ValueError("no contact training windows for stage 2")
-        fit_contact_stats(model, train_data, tr_all, tr_contact, s, device)
+        fit_contact_stats(model, train_data, w["tr_contact"], w["tr_touch"], s, device)
         if verbose:
             print(f"stage 2 scales: contact output {[f'{v:.3e}' for v in model.contact_scale.tolist()]}, "
                   f"loss {float(model.loss_scale_contact):.3e} (m/step^2)")
-        train_stage("contact", model, phys, cfg, s, train_data, tr_all, val_data, va_all,
-                    stem, device, history, verbose)
+        train_stage("contact", model, phys, cfg, s, train_data, w["tr_contact"], val_data, w["va_all"],
+                    w["vl_contact"], stem, device, history, verbose)
 
     _set_trainable(model, True)
     save_checkpoint(f"{stem}_final.pt", model, phys, cfg, s, {"stage": "final", "history": history})
