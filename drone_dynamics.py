@@ -49,12 +49,21 @@ def world_inertia(R, J_body):
     return R @ J_body @ R.transpose(-1, -2)
 
 
+# J_w^-1 applied to a vector, using J_w^-1 = R J_body^-1 R^T exactly (R is a rotation).
+# Replaces torch.linalg.solve: same result, fewer kernels, and no GPU->CPU sync
+# (linalg.solve checks for singular matrices on the host). inv_ex skips that check;
+# J_body is a constant, physical inertia, so it is never singular.
+def world_inertia_solve(R, J_body, v):
+    J_inv = torch.linalg.inv_ex(J_body)[0]
+    return (R @ (J_inv @ (R.transpose(-1, -2) @ v.unsqueeze(-1)))).squeeze(-1)
+
+
 # Angular acceleration from a specific torque, including the gyroscopic term.
 # tau, w: (B,3) world frame, per-step units. Returns alpha (B,3) in rad/step^2.
 def angular_accel(tau, w, R, J_body):
     J_w = world_inertia(R, J_body)
     gyro = torch.linalg.cross(w, (J_w @ w.unsqueeze(-1)).squeeze(-1), dim=-1)
-    return torch.linalg.solve(J_w, (tau - gyro).unsqueeze(-1)).squeeze(-1)
+    return world_inertia_solve(R, J_body, tau - gyro)
 
 
 # Acceleration of every node of the rigid body under a given wrench.
@@ -95,8 +104,7 @@ def rigid_step_drone(f_ext, tau_ext, com_prev, com_curr, R_prev, R_curr, J_body,
     w_next = w_prev + angular_accel(tau_ext, w_prev, R_curr, J_body)
     for _ in range(n_iter):
         R_half_next = so3_exp(0.5 * w_next) @ R_curr
-        w_next = torch.linalg.solve(world_inertia(R_half_next, J_body),
-                                    L_next.unsqueeze(-1)).squeeze(-1)
+        w_next = world_inertia_solve(R_half_next, J_body, L_next)
 
     R_next = so3_exp(w_next) @ R_curr
     return com_next, R_next
