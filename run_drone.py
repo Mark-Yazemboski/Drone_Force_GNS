@@ -48,6 +48,8 @@ settings = DroneTrainSettings(
     aero_latent_dim=128, aero_mlp_layers=2, aero_msg_passing_steps=4, aero_msg_passing_repeats=1,
     contact_latent_dim=128, contact_mlp_layers=2, contact_msg_passing_steps=3, contact_msg_passing_repeats=1,
     contact_d0=0.006, contact_tau=0.0015,   # gate: pad sphere radius 4 mm + margin
+    contact_dist_clamp=(-0.05, 0.5),        # contact GNN's wall-distance input clamped to this range (m)
+    aero_dist_max=1.0,                      # rotor-to-wall distance input clamped/scaled by this (m)
 
     # ---- physical coefficients (learned in stage 1, frozen in stage 2) ----
     learn_thrust_coeffs=True,       # k_f, k_m, held near thrust-stand values by w_prior
@@ -62,6 +64,7 @@ settings = DroneTrainSettings(
 
     # ---- windows / batches ----
     multistep=4, batch_size=256,
+    eval_batch_size=2048,           # no-grad passes only (stats, refit, validation): speed, not results
     aero_min_pad_dist=0.026,        # stage-1 windows: pad stays > 2.6 cm from the wall throughout
     contact_max_pad_dist=0.05,      # stage-2 windows: pad comes within 5 cm at some frame (None = all)
     noise_frac=0.2,                 # input noise = 0.2 x each stage's median residual
