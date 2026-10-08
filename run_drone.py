@@ -138,11 +138,11 @@ if __name__ == "__main__":
         from evaluate_drone_model import evaluate_drone_run
         print("\n" + "#" * 70 + "\n# EVALUATION\n" + "#" * 70)
         test, _ = build_drone_dataset(test_range, trajectory_folder, drone, rotor_speed_in_rpm, rotor_speed_hold)
-        eval_metrics = evaluate_drone_run(
+        eval_metrics.update(evaluate_drone_run(
             final_path, test, meta, os.path.join(model_folder_path, "figures"),
             n_closed_loop=N_closed_loop, closed_loop_kinds=closed_loop_kinds, closed_loop_seed=closed_loop_seed,
             n_visualize=N_visualize if Visualize_model else 0, make_gifs=Visualize_model, gif_stride=gif_stride,
-            sanity_check=sanity_check)
+            sanity_check=sanity_check))
 
     if Save_run_report:
         history = torch.load(history_path, weights_only=False)
