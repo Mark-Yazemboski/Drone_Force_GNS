@@ -56,9 +56,9 @@ class DroneTrainSettings:
     contact_d0: float = 0.006       # gate center: pad sphere radius (4 mm) + margin
     contact_tau: float = 0.0015
     aero_dist_max: float = 1.0      # rotor-to-wall distance is clamped/scaled by this (m)
-    contact_dist_clamp: tuple = (-0.01, 0.02)   # contact-GNN wall-distance feature clamped to this range (m),
+    contact_dist_clamp: tuple = (-0.05, 0.5)   # contact-GNN wall-distance feature clamped to this range (m),
                                                # as in the cube; a tighter range (e.g. (-0.01, 0.02)) spends
-                                               # more of the normalized feature on the last few mm
+                                               # more of the normalized feature on the last few mm (-0.05, 0.5) old
     # Physical coefficients (learned in stage 1, frozen in stage 2).
     learn_thrust_coeffs: bool = True     # k_f, k_m (kept near thrust-stand values by w_prior)
     # k_f, k_m start at (and the prior is centered on) the DroneConfig values

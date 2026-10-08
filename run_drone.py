@@ -68,7 +68,7 @@ settings = DroneTrainSettings(
     rotate_aug=True,
 
     # ---- stage 1: aero (contact-free windows) ----
-    aero_epochs=100, aero_lr=3e-4,
+    aero_epochs=200, aero_lr=3e-4,
     w_aero_anchor=0.1,              # each aero node toward its drag law (shapes the network)
     w_aero_coeff_fit=0.01,          # only used with drag_coeff_fit="gradient"
     w_aero_smooth=0.01,             # aero force smooth in time
@@ -102,10 +102,10 @@ Visualize_model = True              # time-series PNGs and GIFs of the first few
 Save_run_report = True
 
 # Closed-loop evaluation: fresh scenarios flown with MuJoCo and with the model as the plant.
-N_closed_loop = 12
+N_closed_loop = 30
 closed_loop_kinds = ("tap", "push", "slide")   # cycled through; None = the generator's mix
 closed_loop_seed = 1234                         # same seed -> same scenarios across runs, so runs compare
-N_visualize = 6                                 # PNG + GIF for the first N closed-loop runs
+N_visualize = 9                                 # PNG + GIF for the first N closed-loop runs
 sanity_check = True                             # also fly the first push with the contact network off
 gif_stride = 3                                  # draw every 3rd frame (100 Hz data -> ~33 fps GIF)
 
