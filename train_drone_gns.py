@@ -58,7 +58,7 @@ class DroneTrainSettings:
     aero_dist_max: float = 1.0      # rotor-to-wall distance is clamped/scaled by this (m)
     contact_dist_clamp: tuple = (-0.05, 0.5)   # contact-GNN wall-distance feature clamped to this range (m),
                                                # as in the cube; a tighter range (e.g. (-0.01, 0.02)) spends
-                                               # more of the normalized feature on the last few mm (-0.05, 0.5) old
+                                               # more of the normalized feature on the last few mm
     # Physical coefficients (learned in stage 1, frozen in stage 2).
     learn_thrust_coeffs: bool = True     # k_f, k_m (kept near thrust-stand values by w_prior)
     # k_f, k_m start at (and the prior is centered on) the DroneConfig values
@@ -87,6 +87,8 @@ class DroneTrainSettings:
     # ---- windows / batches ----
     multistep: int = 4
     batch_size: int = 256
+    eval_batch_size: int = 2048     # no-grad passes (stats, drag refit, validation): no effect on the
+                                    # optimization, only speed. stats_batches counts these batches.
     aero_min_pad_dist: float = 0.026  # stage-1 (aero) windows: every pad node stays farther than
                                       # this from the wall for the whole window (m)
     contact_max_pad_dist: float = 0.05  # stage-2 (contact) windows: the pad comes closer than this
@@ -157,7 +159,7 @@ def _set_trainable(module, flag):
 
 
 def _batches(data, index, s, device, K, train, noise=(0.0, 0.0)):
-    for b in iterate_drone_chains(data, index, s.batch_size, s.h, K, device,
+    for b in iterate_drone_chains(data, index, s.batch_size if train else s.eval_batch_size, s.h, K, device,
                                   noise[0] if train else 0.0, noise[1] if train else 0.0,
                                   shuffle=train):
         yield rotate_drone_chain(b) if (train and s.rotate_aug) else b

@@ -155,38 +155,55 @@ def split_chain_index(dataset, chain_index, h, multistep, free_dist, contact_dis
 # Force labels (MuJoCo only) come along for validation when every trajectory has them.
 # Noise goes on the INPUT window only. COM and rotation noise are set separately:
 # at the pad, rotation noise is multiplied by the rod length.
+# Each dataset is packed once per device into concatenated tensors (positions kept
+# float64), and every batch is one vectorized gather from them. The old per-sample
+# Python loop cost ~0.05 ms per window, which made the batch builder the bottleneck
+# at large batch sizes. Batches are identical to the loop version, sample for sample.
+_PACK_CACHE = {}
+
+
+def _packed(dataset, device, label_keys):
+    key = (id(dataset), str(device), tuple(label_keys))
+    hit = _PACK_CACHE.get(key)
+    if hit is not None and hit[0] is dataset and hit[1] == len(dataset):
+        return hit[2]
+    T = torch.tensor([d["T"] for d in dataset])
+    p = dict(offset=(torch.cumsum(T, 0) - T).to(device),
+             com=torch.cat([d["com"] for d in dataset]).to(device, torch.float64),
+             R=torch.cat([d["R"] for d in dataset]).to(device),
+             omega=torch.cat([d["omega"] for d in dataset]).to(device),
+             wind=torch.cat([d["wind"] for d in dataset]).to(device),
+             wall_n=torch.stack([d["wall_n"] for d in dataset]).to(device),
+             wall_c=torch.stack([d["wall_c"] for d in dataset]).to(device, torch.float64),
+             **{k: torch.cat([d[k] for d in dataset]).to(device) for k in label_keys})
+    _PACK_CACHE[key] = (dataset, len(dataset), p)       # holding the list keeps its id from being reused
+    return p
+
+
 def iterate_drone_chains(dataset, chain_index, batch_size, h, multistep, device,
                          com_noise=0.0, rot_noise=0.0, shuffle=True):
     order = torch.randperm(len(chain_index)) if shuffle else torch.arange(len(chain_index))
-    M = dataset[0]["omega"].shape[1]
     label_keys = [k for k in ("F_contact", "F_aero") if all(k in d for d in dataset)]
+    p = _packed(dataset, device, label_keys)
+    idx = torch.as_tensor(chain_index, dtype=torch.long).reshape(-1, 2)
+    ar_in = torch.arange(h + 1, device=device)
+    ar_k = torch.arange(multistep, device=device)
 
     for start in range(0, len(chain_index), batch_size):
-        sel = order[start:start + batch_size].tolist()
-        B = len(sel)
-        com_win, R_win = torch.empty(B, h + 1, 3), torch.empty(B, h + 1, 3, 3)
-        tgt_com, tgt_R = torch.empty(B, multistep, 3), torch.empty(B, multistep, 3, 3)
-        omega, wind = torch.empty(B, multistep, M), torch.empty(B, multistep, 3)
-        wall_n, wall_c = torch.empty(B, 3), torch.empty(B, 3)
-        labels = {k: torch.empty(B, multistep, 3) for k in label_keys}
-
-        for b, idx in enumerate(sel):
-            ti, s = chain_index[idx]
-            d = dataset[ti]
-            anchor = d["com"][s + h]
-            com_win[b], R_win[b] = d["com"][s:s + h + 1] - anchor, d["R"][s:s + h + 1]
-            tgt_com[b] = d["com"][s + h + 1:s + h + 1 + multistep] - anchor
-            tgt_R[b] = d["R"][s + h + 1:s + h + 1 + multistep]
-            # The step from frame t to t+1 uses the inputs (and labels) at frame t.
-            omega[b] = d["omega"][s + h:s + h + multistep]
-            wind[b] = d["wind"][s + h:s + h + multistep]
-            wall_n[b], wall_c[b] = d["wall_n"], d["wall_c"] - anchor
-            for k in label_keys:
-                labels[k][b] = d[k][s + h:s + h + multistep]
-
-        batch = {k: v.to(device) for k, v in dict(
-            com_win=com_win, R_win=R_win, tgt_com=tgt_com, tgt_R=tgt_R,
-            omega=omega, wind=wind, wall_n=wall_n, wall_c=wall_c, **labels).items()}
+        sel = idx[order[start:start + batch_size]].to(device)
+        B = sel.shape[0]
+        ti = sel[:, 0]
+        base = p["offset"][ti] + sel[:, 1]                       # global frame of window start
+        f_in = base[:, None] + ar_in                             # (B, h+1) input frames
+        f_tg = base[:, None] + h + 1 + ar_k                      # (B, K)   target frames
+        f_u = base[:, None] + h + ar_k                           # (B, K)   inputs for step t -> t+1
+        anchor = p["com"][base + h]                              # (B, 3) float64
+        batch = dict(
+            com_win=(p["com"][f_in] - anchor[:, None]).float(), R_win=p["R"][f_in],
+            tgt_com=(p["com"][f_tg] - anchor[:, None]).float(), tgt_R=p["R"][f_tg],
+            omega=p["omega"][f_u], wind=p["wind"][f_u],
+            wall_n=p["wall_n"][ti], wall_c=(p["wall_c"][ti] - anchor).float(),
+            **{k: p[k][f_u] for k in label_keys})
         batch["B"] = B
 
         if com_noise > 0:

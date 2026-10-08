@@ -196,8 +196,8 @@ def main():
             sync(device); t0 = time.perf_counter()
             fit_drag_coefficients(model, data, idx, s, device, "network")
             sync(device)
-            t_fit = (time.perf_counter() - t0) * scale
-            print(f"one drag refit (scaled): {t_fit:.1f} s, every {s0.drag_refit_interval} epochs "
+            t_fit = time.perf_counter() - t0             # capped at stats_batches, so not scaled
+            print(f"one drag refit: {t_fit:.1f} s, every {s0.drag_refit_interval} epochs "
                   f"-> +{t_fit / s0.drag_refit_interval:.1f} s/epoch on average")
 
         if not a.no_profiler:
