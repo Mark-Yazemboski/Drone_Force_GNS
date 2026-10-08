@@ -47,7 +47,7 @@ settings = DroneTrainSettings(
     # and repeats of those steps (same weights). Total rounds = steps x repeats.
     aero_latent_dim=128, aero_mlp_layers=2, aero_msg_passing_steps=4, aero_msg_passing_repeats=1,
     contact_latent_dim=128, contact_mlp_layers=2, contact_msg_passing_steps=3, contact_msg_passing_repeats=1,
-    contact_d0=0.006, contact_tau=0.0015,   # gate: pad sphere radius 4 mm + margin
+    contact_d0=0.0045, contact_tau=0.001,   # gate: pad sphere radius 4 mm + margin
     contact_dist_clamp=(-0.05, 0.5),        # contact GNN's wall-distance input clamped to this range (m)
     aero_dist_max=1.0,                      # rotor-to-wall distance input clamped/scaled by this (m)
 
@@ -63,7 +63,7 @@ settings = DroneTrainSettings(
     k_pad_init=0.05,                # pad drag    k_pad * |u| u
 
     # ---- windows / batches ----
-    multistep=4, batch_size=256,
+    multistep=4, batch_size=1024,
     eval_batch_size=2048,           # no-grad passes only (stats, refit, validation): speed, not results
     aero_min_pad_dist=0.026,        # stage-1 windows: pad stays > 2.6 cm from the wall throughout
     contact_max_pad_dist=0.05,      # stage-2 windows: pad comes within 5 cm at some frame (None = all)
@@ -71,18 +71,18 @@ settings = DroneTrainSettings(
     rotate_aug=True,
 
     # ---- stage 1: aero (contact-free windows) ----
-    aero_epochs=200, aero_lr=3e-4,
+    aero_epochs=200, aero_lr=6e-4,
     w_aero_anchor=0.1,              # each aero node toward its drag law (shapes the network)
     w_aero_coeff_fit=0.01,          # only used with drag_coeff_fit="gradient"
     w_aero_smooth=0.01,             # aero force smooth in time
     w_axial=0.1,                    # rotor axial thrust correction toward zero
     w_prior=1e-3,                   # k_f, k_m toward thrust-stand values
-    coeff_lr=1e-3,                  # learning rate for k's (stage 1) and mu (stage 2)
+    coeff_lr=4e-3,                  # learning rate for k's (stage 1) and mu (stage 2)
     coeff_warmup_epochs=10,         # k's and mu held fixed for the first 10 epochs of their stage (capped at half)
     lr_schedule="cosine",           # network lr decays to 0 over each stage (None = constant)
 
     # ---- stage 2: contact (near-wall windows, aero frozen) ----
-    contact_epochs=400, contact_lr=1e-4,
+    contact_epochs=400, contact_lr=2e-4,
     w_fric_dir=1.0, w_fric_mag=1.0, w_fric_cone=1.0,
     mu_init=0.3, learn_mu=True,
 
