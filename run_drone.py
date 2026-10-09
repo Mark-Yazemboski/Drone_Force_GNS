@@ -48,7 +48,7 @@ settings = DroneTrainSettings(
     aero_latent_dim=128, aero_mlp_layers=2, aero_msg_passing_steps=4, aero_msg_passing_repeats=1,
     contact_latent_dim=128, contact_mlp_layers=2, contact_msg_passing_steps=3, contact_msg_passing_repeats=1,
     contact_d0=0.0045, contact_tau=0.001,   # gate: pad sphere radius 4 mm + margin
-    contact_dist_clamp=(-0.05, 0.5),        # contact GNN's wall-distance input clamped to this range (m)
+    contact_dist_clamp=(-0.01, 0.02),        # contact GNN's wall-distance input clamped to this range (m)
     aero_dist_max=1.0,                      # rotor-to-wall distance input clamped/scaled by this (m)
 
     # ---- physical coefficients (learned in stage 1, frozen in stage 2) ----
