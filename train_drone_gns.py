@@ -432,7 +432,7 @@ def force_validation(model, data, index, s, device, max_batches=40):
     def add(key, sq, n, mean=False):
         a_ = acc.setdefault(key, [0.0, 0])
         a_[0] += float(sq)
-        a_[1] += int(n)
+        a_[1] += float(n)
         if mean:
             means.add(key)
 
@@ -459,6 +459,27 @@ def force_validation(model, data, index, s, device, max_batches=40):
                 add(f"{name}_ref", Fc_t[m].pow(2).sum(-1).sum(), m.sum())
                 add(f"{name}_normal", dn.pow(2).sum(), m.sum())
                 add(f"{name}_tangential", (d - dn.unsqueeze(-1) * n[m]).pow(2).sum(-1).sum(), m.sum())
+        # Contact torque about the COM, and the centre of pressure: where the
+        # contact force's line of action meets the wall plane. Motion pins down
+        # the net contact wrench (force + torque), so these are identifiable;
+        # the split among pad nodes is not.
+        if "tau_contact" in b:
+            tau_p, tau_t = model.to_newtons(aux["tau_c"]), b["tau_contact"][:, 0]
+            m = (mag > 0.05) & (mag < s.impact_force_N)
+            if m.any():
+                add("sustained_torque_err", (tau_p[m] - tau_t[m]).pow(2).sum(-1).sum(), m.sum())
+                add("sustained_torque_ref", tau_t[m].pow(2).sum(-1).sum(), m.sum())
+
+            def cop(F, tau, m):
+                F, tau, nm = F[m], tau[m], n[m]
+                x0 = com_h[-1][m] + torch.linalg.cross(F, tau, dim=-1) / F.pow(2).sum(-1, keepdim=True).clamp_min(1e-12)
+                t_ = ((b["wall_c"][m] - x0) * nm).sum(-1, keepdim=True) / (F * nm).sum(-1, keepdim=True)
+                return x0 + t_ * F
+            Fn_p_ = (Fc_p * n).sum(-1)
+            m = ((Fc_t * n).sum(-1) > 0.5) & (mag < s.impact_force_N) & (Fn_p_ > 0.05)
+            if m.any():
+                e = 1e3 * (cop(Fc_p, tau_p, m) - cop(Fc_t, tau_t, m)).norm(dim=-1)
+                add("cop_err_mm", e.sum(), m.sum(), mean=True)
         free = mag <= 0.05
         if free.any():
             add("false_contact", Fc_p[free].norm(dim=-1).sum(), free.sum())
@@ -471,15 +492,20 @@ def force_validation(model, data, index, s, device, max_batches=40):
         v_t = tang(pad_now - pad_prev)                                          # m/step
         Ft_p, Ft_t = tang(Fc_p), tang(Fc_t)
         Fn_t, Fn_p = (Fc_t * n).sum(-1), (Fc_p * n).sum(-1)
+        # The population is defined by MuJoCo and the kinematics only, so a weak
+        # or missing predicted force counts against the model instead of being
+        # filtered out.
         sl = (Fn_t > 0.2) & (mag < s.impact_force_N) & (v_t.norm(dim=-1) > s.slip_v0) & \
-             (Ft_t.norm(dim=-1) > 0.02) & (Ft_p.norm(dim=-1) > 0.02) & (Fn_p > 0.05)
+             (Ft_t.norm(dim=-1) > 0.02)
         if sl.any():
             k = int(sl.sum())
             add("slide_fric_dir_err_deg", angle_deg(Ft_p[sl], Ft_t[sl]).sum(), k, mean=True)
             add("slide_fric_vs_slip_deg", angle_deg(Ft_p[sl], -v_t[sl]).sum(), k, mean=True)
             add("slide_fric_vs_slip_deg_label", angle_deg(Ft_t[sl], -v_t[sl]).sum(), k, mean=True)
-            add("slide_mu_implied", (Ft_p[sl].norm(dim=-1) / Fn_p[sl]).sum(), k, mean=True)
-            add("slide_mu_implied_label", (Ft_t[sl].norm(dim=-1) / Fn_t[sl]).sum(), k, mean=True)
+            # sum|Ft| / sum Fn over the sliding frames (a ratio of sums stays finite
+            # when the model predicts ~0 normal force on some frame)
+            add("slide_mu_implied", Ft_p[sl].norm(dim=-1).sum(), Fn_p[sl].sum().clamp_min(1e-9), mean=True)
+            add("slide_mu_implied_label", Ft_t[sl].norm(dim=-1).sum(), Fn_t[sl].sum(), mean=True)
             # Cancellation among pad nodes: 1 - |sum phi_t| / sum |phi_t| (0 = all aligned).
             phi_t = model.to_newtons(aux["phi_c"])[sl]
             phi_t = phi_t - (phi_t * n[sl].unsqueeze(1)).sum(-1, keepdim=True) * n[sl].unsqueeze(1)
@@ -499,9 +525,9 @@ def force_validation(model, data, index, s, device, max_batches=40):
         # RMS, except false_contact (mean |F|) and the sliding diagnostics (means)
         out[key] = v / n if (key == "false_contact" or key in means) else (v / n) ** 0.5
         if key not in ("axial", "aero_ref", "aero_err") and key not in means:
-            out[key + "_n"] = n
+            out[key + "_n"] = int(n)
         if key == "slide_fric_dir_err_deg":
-            out["slide_frames_n"] = n
+            out["slide_frames_n"] = int(n)
     return out
 
 
@@ -517,7 +543,10 @@ def evaluate_on_dataset(model, phys, data, s, device="cpu"):
     for regime, m in kstep_validation(model, data, w["va_all"], s, device, use_contact=True).items():
         for k, v in m.items():
             out[f"kstep{s.val_horizon}_{regime}_{k}"] = v
-    for k, v in force_validation(model, data, w["va_all"], s, device, max_batches=10 ** 6).items():
+    # Forces are scored on EVERY frame here (training-time validation samples
+    # every val_stride frames), so short impacts are not skipped.
+    every_frame = build_chain_index(data, s.h, 1, stride=1)
+    for k, v in force_validation(model, data, every_frame, s, device, max_batches=10 ** 6).items():
         out[f"force_{k}"] = v
     return out
 
@@ -530,6 +559,11 @@ def _format_forces(f, impact_N):
             lines.append(f"      {label:30s} {f[name + '_err']:7.3f} / {f[name + '_ref']:7.3f}   "
                          f"[normal {f[name + '_normal']:.3f}, tangential {f[name + '_tangential']:.3f}]  "
                          f"({f[name + '_err_n']} frames)")
+    if "sustained_torque_err" in f:
+        lines.append(f"      {'contact torque, sustained':30s} {f['sustained_torque_err']:7.3f} / "
+                     f"{f['sustained_torque_ref']:7.3f} N m")
+    if "cop_err_mm" in f:
+        lines.append(f"      {'centre of pressure':30s} {f['cop_err_mm']:7.2f} mm mean error")
     if "false_contact" in f:
         lines.append(f"      {'false contact (not touching)':30s} {f['false_contact']:7.3f} mean |F|")
     if "aero_err" in f:
@@ -624,7 +658,7 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
               f"using {warmup} so the coefficients ({'k_f, k_m' if stage == 'aero' else 'mu'}) can still move")
     use_contact = stage == "contact"
     hist = history.setdefault(stage, dict(train=[], val=[], params=[]))
-    best, best_state = float("inf"), None
+    best, best_state, best_phys = float("inf"), None, None
     noise = _stage_noise(model, s, stage)
     if verbose:
         print(f"[{stage}] input noise: COM {noise[0]:.2e} m/step, rotation {noise[1]:.2e} rad/step")
@@ -687,11 +721,14 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
             if score < best:
                 best = score
                 best_state = copy.deepcopy(model.state_dict())
+                best_phys = copy.deepcopy(phys.state_dict())      # mu lives here, not in the model
+                hist["best"] = dict(hist["params"][-1])           # coefficients at the kept epoch
                 save_checkpoint(f"{stem}_{stage}_best.pt", model, phys, cfg, s,
                                 {"stage": stage, "epoch": epoch, "history": history})
 
     if best_state is not None:
-        model.load_state_dict(best_state)          # continue from the best validation point
+        model.load_state_dict(best_state)          # continue from the best validation point,
+        phys.load_state_dict(best_phys)            # with the coefficients that went with it
     return model
 
 

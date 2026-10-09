@@ -54,15 +54,20 @@ def collect_drone_metrics(history, test_metrics=None, true_values=None, last_n=1
         if not params:
             continue
         ep = [p["epoch"] for p in params]
+        # "final" = the coefficients of the checkpoint actually kept (best
+        # validation epoch), which is the model that gets evaluated. Older
+        # histories without a "best" entry fall back to the last epoch.
+        kept = history[stage].get("best", params[-1])
         for name in names:
             v = [p[name] for p in params]
             out[f"{name}_init"] = v[0]
-            out[f"{name}_final"] = v[-1]
-            out[f"{name}_drift"] = v[-1] - v[0]
+            out[f"{name}_final"] = kept[name]
+            out[f"{name}_last_epoch"] = v[-1]
+            out[f"{name}_drift"] = kept[name] - v[0]
             out[f"{name}_slope_per_100ep"] = _tail_slope(ep, v)
             if name in true_values:
                 out[f"{name}_true"] = true_values[name]
-                out[f"{name}_rel_err"] = (v[-1] - true_values[name]) / true_values[name]
+                out[f"{name}_rel_err"] = (kept[name] - true_values[name]) / true_values[name]
 
     for k, v in (test_metrics or {}).items():
         out[f"test_{k}"] = v

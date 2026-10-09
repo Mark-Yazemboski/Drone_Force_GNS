@@ -61,6 +61,15 @@ def _tangential(F, n):
     return np.linalg.norm(F - (F @ n)[:, None] * n, axis=1)
 
 
+# Upper axis limit that clips nothing: the max over every trace drawn (MuJoCo,
+# one step, closed loop), so neither true impact peaks nor model overshoots
+# are hidden by the axis.
+def _full_range(*traces, floor=1.0):
+    vals = np.concatenate([np.ravel(t) for t in traces])
+    vals = vals[np.isfinite(vals)]
+    return max(floor, 1.1 * float(vals.max())) if vals.size else floor
+
+
 def plot_closed_loop(res, cfg, path, title=None):
     sc, true, pred, one = res["scenario"], res["true"], res["pred"], res["one_step"]
     n, wp = sc["n"], sc["wall_point"]
@@ -84,8 +93,7 @@ def plot_closed_loop(res, cfg, path, title=None):
     ax[1].plot(tt, one["F_contact"] @ n, color=C_ONE, lw=1.0, label="model, one step")
     ax[1].plot(tp, pred["F_contact"] @ n, color=C_CL, lw=1.0, label="model, closed loop")
     ax[1].set_ylabel("normal contact\nforce (N)")
-    hi = np.percentile(np.r_[true["F_contact"] @ n, 1.0], 99.5)
-    ax[1].set_ylim(-0.2, max(1.0, 1.3 * hi))
+    ax[1].set_ylim(-0.2, _full_range(true["F_contact"] @ n, one["F_contact"] @ n, pred["F_contact"] @ n))
 
     ax[2].plot(tt, _tangential(true["F_contact"], n), color=C_TRUE)
     ax[2].plot(tt, _tangential(one["F_contact"], n), color=C_ONE, lw=1.0)
@@ -95,7 +103,8 @@ def plot_closed_loop(res, cfg, path, title=None):
         ax[2].plot(tt, mu * np.maximum(true["F_contact"] @ n, 0), ":", color=C_TRUE, lw=0.8, label=f"mu x normal (mu={mu:g})")
         ax[2].legend(loc="upper right", fontsize=8)
     ax[2].set_ylabel("friction (N)")
-    ax[2].set_ylim(-0.05, max(0.3, 1.3 * np.percentile(_tangential(true["F_contact"], n), 99.5)))
+    ax[2].set_ylim(-0.05, _full_range(_tangential(true["F_contact"], n), _tangential(one["F_contact"], n),
+                                      _tangential(pred["F_contact"], n), floor=0.3))
 
     ax[3].plot(tt, np.linalg.norm(true["F_aero"], axis=1), color=C_TRUE)
     ax[3].plot(tt, np.linalg.norm(one["F_aero"], axis=1), color=C_ONE, lw=1.0)
@@ -272,7 +281,8 @@ def animate_closed_loop(res, cfg, path, stride=3, fps=None, friction_gain=2.5, m
     axf.plot(tt, true["F_contact"][:T] @ n, color=C_TRUE, lw=1.0, label="MuJoCo")
     axf.plot(tt, pred["F_contact"][:T] @ n, color=C_CL, lw=1.0, label="model, closed loop")
     axf.plot(tt, res["one_step"]["F_contact"][:T] @ n, color=C_ONE, lw=0.8, label="model, one step")
-    axf.set_ylim(-0.2, max(1.0, 1.3 * np.percentile(np.r_[true["F_contact"][:T] @ n, 1.0], 99.0)))
+    axf.set_ylim(-0.2, _full_range(true["F_contact"][:T] @ n, pred["F_contact"][:T] @ n,
+                                   res["one_step"]["F_contact"][:T] @ n))
     axf.set_ylabel("normal force (N)", fontsize=9)
     axf.legend(fontsize=7, loc="upper right")
     axd.plot(tt, 1e3 * _wall_dist(true, cfg, n, wp)[:T], color=C_TRUE, lw=1.0)

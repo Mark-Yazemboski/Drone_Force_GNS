@@ -8,16 +8,19 @@ recorded start diverges from tiny errors whatever the model quality, so the
 cube-style open-loop rollout says nothing here. But the drone is never flown
 open loop. With the controller in the loop, both plants are pulled toward the
 same reference, so the two trajectories stay comparable and their difference
-measures model error as a controller experiences it. This is also exactly how
-the model will be used inside the MPC.
+measures model error as a controller experiences it. Feedback also corrects
+part of the model's error as it goes, so this tests the model as a plant under
+feedback, not its open-loop prediction. The MPC leans on the model more
+directly (it plans with it); the k-step test-set metric and a d(F_n)/d(omega)
+check speak to that.
 
 WHAT IS SHARED BETWEEN THE TWO RUNS
   scenario   wall pose, heading, reference waypoints and push profile, wind
   controller the generator's geometric controller and gains, run ONCE PER FRAME
              (100 Hz) from a finite-difference state estimate (velocity and
              angular velocity from the last two poses, like a mocap system).
-             The training data used 500 Hz control with the true velocity;
-             here the controller must only see what both plants provide.
+             The training data uses the same 100 Hz rate with the true
+             velocity; here the controller must only see what both plants provide.
   excitation the same random rotor-command noise sequence
   motors     the same first-order lag (the learned plant reproduces MuJoCo's
              filter update exactly), and the same Verlet-aligned rotor speeds
@@ -349,6 +352,12 @@ def closed_loop_metrics(true, pred, onestep, sc, cfg_true, touch_N=0.2, impact_N
     dt = true["com"].shape[0] and (1.0 / 100.0)
     a, b = onset(Fn_t), onset(pred["F_contact"][:T] @ n)
     out["contact_onset_err_ms"] = float(1e3 * (b - a) * dt) if (a is not None and b is not None) else float("nan")
+    # Signed errors can cancel across runs and a missing contact is NaN (dropped
+    # by nanmean), so also report the absolute error and the failure counts.
+    # Averaged over runs, missed/spurious become fractions of runs.
+    out["contact_onset_abs_err_ms"] = abs(out["contact_onset_err_ms"])
+    out["contact_missed"] = float(a is not None and b is None)       # MuJoCo touches, model never does
+    out["contact_spurious"] = float(a is None and b is not None)     # model touches, MuJoCo never does
 
     sustained = touching & (np.linalg.norm(true["F_contact"][:T], axis=1) < impact_N)
     for name, F in (("closed_loop", pred["F_contact"][:T]), ("one_step", onestep["F_contact"][:T])):

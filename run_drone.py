@@ -17,7 +17,7 @@ from plot_training_history import plot_loss_history
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------- data ----------------
-trajectory_folder = os.path.join(script_dir, "data/mj_drone")
+trajectory_folder = os.path.join(script_dir, "data/mj_drone_100hz")
 # Fixed split of 500 trajectories: 0-299 training pool, 300-399 validation, 400-499 test.
 # Val and test never change, so every run (and every ablation) is scored on the same
 # data. N_train picks how much of the pool to train on; smaller runs use the first

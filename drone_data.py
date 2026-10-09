@@ -183,7 +183,7 @@ def _packed(dataset, device, label_keys):
 def iterate_drone_chains(dataset, chain_index, batch_size, h, multistep, device,
                          com_noise=0.0, rot_noise=0.0, shuffle=True):
     order = torch.randperm(len(chain_index)) if shuffle else torch.arange(len(chain_index))
-    label_keys = [k for k in ("F_contact", "F_aero") if all(k in d for d in dataset)]
+    label_keys = [k for k in ("F_contact", "F_aero", "tau_contact") if all(k in d for d in dataset)]
     p = _packed(dataset, device, label_keys)
     idx = torch.as_tensor(chain_index, dtype=torch.long).reshape(-1, 2)
     ar_in = torch.arange(h + 1, device=device)
@@ -229,7 +229,7 @@ def rotate_drone_chain(batch):
     z, o = torch.zeros_like(th), torch.ones_like(th)
     Rz = torch.stack([torch.stack([c, -s, z], -1), torch.stack([s, c, z], -1),
                       torch.stack([z, z, o], -1)], -2)                 # (B, 3, 3)
-    for k in ("com_win", "tgt_com", "wind", "F_contact", "F_aero"):
+    for k in ("com_win", "tgt_com", "wind", "F_contact", "F_aero", "tau_contact"):
         if k in batch:
             batch[k] = torch.einsum('bij,btj->bti', Rz, batch[k])
     for k in ("wall_n", "wall_c"):

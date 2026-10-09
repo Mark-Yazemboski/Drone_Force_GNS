@@ -56,7 +56,8 @@ def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
         metrics.update({f"closed_loop_{k}": v for k, v in avg.items()})
         for kind in sorted({r["scenario"]["kind"] for r in results}):
             sel = [r["metrics"] for r in results if r["scenario"]["kind"] == kind]
-            for k in ("pad_err_mean_mm", "pad_err_contact_mm", "contact_onset_err_ms", "yaw_err_mean_deg",
+            for k in ("pad_err_mean_mm", "pad_err_contact_mm", "contact_onset_err_ms", "contact_onset_abs_err_ms",
+                      "contact_missed", "contact_spurious", "yaw_err_mean_deg",
                       "fn_jitter_label_N", "fn_jitter_one_step_N", "fn_jitter_closed_loop_N",
                       "closed_loop_sustained_contact_rmse_N", "one_step_sustained_contact_rmse_N"):
                 metrics[f"closed_loop_{kind}_{k}"] = float(np.nanmean([m.get(k, np.nan) for m in sel]))

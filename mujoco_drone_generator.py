@@ -12,9 +12,12 @@ inputs. So any controller that reliably makes the contacts we want is fine.
                  wall frame, smoothed with min-jerk segments, plus a push-force
                  profile
   controller     standard geometric (SE(3)) position + attitude controller
-                 (Lee et al. 2010) at 500 Hz, with a slow yaw loop. Pushing is a
-                 feedforward force into the wall on top of position tracking,
-                 so the controller needs no force measurement
+                 (Lee et al. 2010) once per recorded frame (100 Hz), with a slow
+                 yaw loop. Pushing is a feedforward force into the wall on top
+                 of position tracking, so the controller needs no force
+                 measurement. The command is held for the whole frame, so the
+                 rotor speeds over [t, t+1] depend only on the state at t (see
+                 CAUSALITY below)
   mixer          desired collective thrust + body torques -> 4 rotor thrusts,
                  roll/pitch first, then as much yaw as still fits
   excitation     random band-limited noise on the rotor commands, so rotor
@@ -48,6 +51,15 @@ WHAT IS RECORDED (per frame, dt = timestep * substeps)
       F_contact, tau_contact (about the COM), F_pad (per pad sphere), F_aero
   meta                dt, gravity, mass/inertia/COM read from the compiled
                       model, k_f, k_m, mu, scenario, and generator settings
+
+CAUSALITY
+  rotor_speed[t] is aligned over the two intervals around frame t, so it
+  includes the motor response during [t, t+1]. That is legitimate (it is what
+  an MPC computes from its planned command), as long as the command for
+  [t, t+1] was chosen from the state at t. With a faster controller (the old
+  500 Hz), commands inside [t, t+1] reacted to what happened inside it, e.g. a
+  contact starting there, and that reaction leaked into rotor_speed[t]. Hence
+  ctrl_every = substeps. audit_checks.py verifies this.
 
 STABILITY NOTES (learned building this; they apply to hardware too)
   - Pushing needs nose-down pitch (about atan(F/mg)). With a level rod at or
@@ -85,7 +97,7 @@ PHASES = {"free": 0, "approach": 1, "hold": 2, "slide": 3, "release": 4, "hover_
 class GenSettings:
     timestep: float = 0.0005
     substeps: int = 20              # dt = 0.01 s, 100 Hz recorded
-    ctrl_every: int = 4             # controller at 500 Hz
+    ctrl_every: int = 20            # controller once per frame (100 Hz); must equal substeps for causal data
     duration: tuple = (4.0, 7.0)    # seconds, random per trajectory
     motor_tau: float = 0.025        # s, thrust first-order lag
     t_max_over_hover: float = 2.5
@@ -484,7 +496,10 @@ def set_wall_pose(model, data, n, wall_point):
     data.mocap_quat[0] = _mat2quat(np.column_stack([n, t1, np.cross(n, t1)]))   # box local x = n
 
 
-def simulate_trajectory(model, cfg_true, gs, rng):
+# pulse: optional (t_start, t_end, force_xyz) external force on the drone, used
+# only by audit_checks.py to show that perturbing the future leaves past rotor
+# speeds unchanged.
+def simulate_trajectory(model, cfg_true, gs, rng, pulse=None):
     plant = MujocoDronePlant(model, cfg_true, gs)
     data = plant.data
     S, h = gs.substeps, gs.timestep
@@ -577,6 +592,8 @@ def simulate_trajectory(model, cfg_true, gs, rng):
             data.ctrl[:] = np.clip(T_cmd * (1.0 + ex), 0.0, ctrl.t_max)
 
         # Wind gusts, then one physics substep (rotor drag + MuJoCo + force logging).
+        if pulse is not None:
+            data.qfrc_applied[0:3] = pulse[2] if pulse[0] <= t < pulse[1] else 0.0
         gust += -gust * h / 1.0 + gust_sig * math.sqrt(2 * h) * np.r_[rng.normal(size=2), 0.2 * rng.normal()]
         log_thrust[j], log_Fa[j], log_Fc[j], log_tc[j], log_pad[j] = plant.substep(w_mean + gust, t)
 
