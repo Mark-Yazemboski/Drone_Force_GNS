@@ -88,6 +88,8 @@ def build_drone_dataset(traj_range, folder, cfg, rotor_speed_in_rpm=False, rotor
                                          rotor_speed_in_rpm, rotor_speed_hold)
         if meta0 is None:
             meta0 = meta
+        d["traj_id"] = i                                         # file number, for per-trajectory reports
+        d["scenario"] = meta.get("scenario", "unknown")
         if d["omega"].shape[1] != len(cfg.rotor_pos):
             raise ValueError(f"traj {i}: {d['omega'].shape[1]} rotor speeds, config has {len(cfg.rotor_pos)} rotors")
         dataset.append(d)

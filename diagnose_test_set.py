@@ -30,8 +30,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from drone_data import build_drone_dataset, annotate_pad_distance, iterate_drone_chains
-from train_drone_gns import (load_checkpoint, _make_phys, stage_windows, validation_loss, _window,
-                             _loss_nodes)
+from train_drone_gns import (load_checkpoint, _make_phys, stage_windows, validation_loss,
+                             per_window_contact_loss)
 
 
 def load_run_file(path):
@@ -49,24 +49,7 @@ def parse_range(txt, default):
     return list(range(int(a), int(b) + 1))
 
 
-# The prediction term of unroll_loss (stage "contact"), per window instead of
-# averaged over the batch. Its mean over all windows equals validation_loss.
-@torch.no_grad()
-def per_window_loss(model, data, index, s, device):
-    out = []
-    for b in iterate_drone_chains(data, index, s.eval_batch_size, s.h, s.multistep, device, shuffle=False):
-        com_h, R_h = _window(b, s.h)
-        terms = []
-        for k in range(s.multistep):
-            com_n, R_n, _ = model.step(com_h, R_h, b["omega"][:, k], b["wind"][:, k],
-                                       b["wall_n"], b["wall_c"], use_contact=True)
-            x_prev, x_curr = _loss_nodes(model, com_h[-2], R_h[-2]), _loss_nodes(model, com_h[-1], R_h[-1])
-            a_pred = _loss_nodes(model, com_n, R_n) - 2 * x_curr + x_prev
-            a_true = _loss_nodes(model, b["tgt_com"][:, k], b["tgt_R"][:, k]) - 2 * x_curr + x_prev
-            terms.append(((a_pred - a_true) / model.loss_scale_contact).pow(2).flatten(1).mean(1))
-            com_h, R_h = com_h[1:] + [com_n], R_h[1:] + [R_n]
-        out.append(torch.stack(terms).mean(0).cpu())
-    return torch.cat(out).numpy() if out else np.zeros(0)
+per_window_loss = per_window_contact_loss          # shared with evaluate_on_dataset
 
 
 def traj_stats(d, dt):

@@ -531,6 +531,52 @@ def force_validation(model, data, index, s, device, max_batches=40):
     return out
 
 
+# The contact-stage prediction loss of unroll_loss, per window instead of
+# averaged over the batch. Its mean over all windows equals validation_loss.
+@torch.no_grad()
+def per_window_contact_loss(model, data, index, s, device):
+    model.eval()
+    out = []
+    for b in _batches(data, index, s, device, s.multistep, train=False):
+        com_h, R_h = _window(b, s.h)
+        terms = []
+        for k in range(s.multistep):
+            com_n, R_n, _ = model.step(com_h, R_h, b["omega"][:, k], b["wind"][:, k],
+                                       b["wall_n"], b["wall_c"], use_contact=True)
+            x_prev, x_curr = _loss_nodes(model, com_h[-2], R_h[-2]), _loss_nodes(model, com_h[-1], R_h[-1])
+            a_pred = _loss_nodes(model, com_n, R_n) - 2 * x_curr + x_prev
+            a_true = _loss_nodes(model, b["tgt_com"][:, k], b["tgt_R"][:, k]) - 2 * x_curr + x_prev
+            terms.append(((a_pred - a_true) / model.loss_scale_contact).pow(2).flatten(1).mean(1))
+            com_h, R_h = com_h[1:] + [com_n], R_h[1:] + [R_n]
+        out.append(torch.stack(terms).mean(0).cpu())
+    model.train()
+    return torch.cat(out).numpy() if out else np.zeros(0)
+
+
+# Robust summaries of the test contact loss. It is a squared-error mean, so one
+# impact far outside the training range can dominate it (one 1.37 m/s tap was
+# 95% of a test set's loss). Reported next to the plain mean:
+#   per scenario (tap / push / slide / ...), the mean with the worst trajectory
+#   left out, the median per-trajectory loss, and which trajectory was worst.
+def contact_loss_breakdown(model, data, index, s, device):
+    pw = per_window_contact_loss(model, data, index, s, device)
+    if not len(pw):
+        return {}
+    ti = np.array([t for t, _ in index])
+    per_traj = {t: pw[ti == t] for t in np.unique(ti)}
+    sums = {t: v.sum() for t, v in per_traj.items()}
+    worst = max(sums, key=sums.get)
+    keep = ti != worst
+    out = {"contact_loss_traj_median": float(np.median([v.mean() for v in per_traj.values()])),
+           "contact_loss_excl_worst_traj": float(pw[keep].mean()) if keep.any() else float("nan"),
+           "contact_loss_worst_traj_share": float(sums[worst] / pw.sum()),
+           "contact_loss_worst_traj_id": float(data[worst].get("traj_id", worst))}
+    scen = np.array([data[t].get("scenario", "unknown") for t in ti])
+    for name in np.unique(scen):
+        out[f"contact_loss_{name}"] = float(pw[scen == name].mean())
+    return out
+
+
 # Full evaluation on a held-out set (the test trajectories): validation losses
 # for both stages, k-step error by regime, and (MuJoCo) learned vs. true forces.
 # Returns a flat dict of floats for the run report.
@@ -540,6 +586,7 @@ def evaluate_on_dataset(model, phys, data, s, device="cpu"):
     w = stage_windows(data, data, s)
     out = {"aero_loss": validation_loss(model, phys, data, w["vl_aero"], s, device, "aero"),
            "contact_loss": validation_loss(model, phys, data, w["vl_contact"], s, device, "contact")}
+    out.update(contact_loss_breakdown(model, data, w["vl_contact"], s, device))
     for regime, m in kstep_validation(model, data, w["va_all"], s, device, use_contact=True).items():
         for k, v in m.items():
             out[f"kstep{s.val_horizon}_{regime}_{k}"] = v

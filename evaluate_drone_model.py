@@ -38,6 +38,14 @@ def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
         metrics.update({f"test_{k}": v for k, v in test.items()})
         H = s.val_horizon
         print(f"  loss: aero {test['aero_loss']:.3e}  contact {test['contact_loss']:.3e}")
+        if "contact_loss_excl_worst_traj" in test:
+            scen = "  ".join(f"{k[13:]} {v:.3e}" for k, v in test.items()
+                             if k.startswith("contact_loss_") and k[13:] not in
+                             ("traj_median", "excl_worst_traj", "worst_traj_share", "worst_traj_id"))
+            print(f"  contact loss without the worst trajectory ({int(test['contact_loss_worst_traj_id'])}, "
+                  f"{100 * test['contact_loss_worst_traj_share']:.0f}% of the total): "
+                  f"{test['contact_loss_excl_worst_traj']:.3e} | per-trajectory median "
+                  f"{test['contact_loss_traj_median']:.3e}\n  by scenario: {scen}")
         print(f"  pad error after {H} steps: " + "   ".join(
             f"{r} {test[f'kstep{H}_{r}_pad_end_mm']:.3f} mm" for r in ("free", "near", "contact", "all")
             if f"kstep{H}_{r}_pad_end_mm" in test))
