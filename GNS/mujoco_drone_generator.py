@@ -109,7 +109,7 @@ class GenSettings:
     # well under a degree. A larger time constant mimics a rubber pad, which
     # spreads load over several nodes. Match the real pad.
     pad_solref: tuple = (0.004, 1.0)
-    wind_max: float = 0             # m/s mean wind
+    wind_max: float = 5             # m/s mean wind
     gust_std: float = 0             # m/s
     excite_max: float = 0.04        # max relative rotor-command noise
     tilted_wall_prob: float = 0
