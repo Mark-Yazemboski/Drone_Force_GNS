@@ -1,9 +1,11 @@
 /models/*
 !/models/.gitkeep
-
+GNS/models/*
+!/GNS/models/.gitkeep
 /data/pytorch_datasets/*
+GNS/data/pytorch_datasets/*
 /figure_assets/*
-!/data/pytorch_datasets/.gitkeep
+!/GNS/data/pytorch_datasets/.gitkeep
 
 __pycache__/
 *.py[cod]
