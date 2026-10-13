@@ -61,6 +61,17 @@ def _tangential(F, n):
     return np.linalg.norm(F - (F @ n)[:, None] * n, axis=1)
 
 
+# Contact-force axes use a symmetric log scale: linear below FORCE_LINTHRESH_N (so the
+# exact zeros off the wall still plot), logarithmic above it, so a 1-5 N push and a
+# 100 N tap are both readable on one axis.
+FORCE_LINTHRESH_N = 0.1
+
+
+def _force_axis(ax, top):
+    ax.set_yscale("symlog", linthresh=FORCE_LINTHRESH_N, linscale=0.5)
+    ax.set_ylim(0.0, top)
+
+
 # Upper axis limit that clips nothing: the max over every trace drawn (MuJoCo,
 # one step, closed loop), so neither true impact peaks nor model overshoots
 # are hidden by the axis.
@@ -92,8 +103,8 @@ def plot_closed_loop(res, cfg, path, title=None):
     ax[1].plot(tt, true["F_contact"] @ n, color=C_TRUE, label="MuJoCo label")
     ax[1].plot(tt, one["F_contact"] @ n, color=C_ONE, lw=1.0, label="model, one step")
     ax[1].plot(tp, pred["F_contact"] @ n, color=C_CL, lw=1.0, label="model, closed loop")
-    ax[1].set_ylabel("normal contact\nforce (N)")
-    ax[1].set_ylim(-0.2, _full_range(true["F_contact"] @ n, one["F_contact"] @ n, pred["F_contact"] @ n))
+    ax[1].set_ylabel("normal contact\nforce (N, symlog)")
+    _force_axis(ax[1], _full_range(true["F_contact"] @ n, one["F_contact"] @ n, pred["F_contact"] @ n))
 
     ax[2].plot(tt, _tangential(true["F_contact"], n), color=C_TRUE)
     ax[2].plot(tt, _tangential(one["F_contact"], n), color=C_ONE, lw=1.0)
@@ -102,8 +113,8 @@ def plot_closed_loop(res, cfg, path, title=None):
     if mu:
         ax[2].plot(tt, mu * np.maximum(true["F_contact"] @ n, 0), ":", color=C_TRUE, lw=0.8, label=f"mu x normal (mu={mu:g})")
         ax[2].legend(loc="upper right", fontsize=8)
-    ax[2].set_ylabel("friction (N)")
-    ax[2].set_ylim(-0.05, _full_range(_tangential(true["F_contact"], n), _tangential(one["F_contact"], n),
+    ax[2].set_ylabel("friction (N, symlog)")
+    _force_axis(ax[2], _full_range(_tangential(true["F_contact"], n), _tangential(one["F_contact"], n),
                                       _tangential(pred["F_contact"], n), floor=0.3))
 
     ax[3].plot(tt, np.linalg.norm(true["F_aero"], axis=1), color=C_TRUE)
@@ -281,9 +292,9 @@ def animate_closed_loop(res, cfg, path, stride=3, fps=None, friction_gain=2.5, m
     axf.plot(tt, true["F_contact"][:T] @ n, color=C_TRUE, lw=1.0, label="MuJoCo")
     axf.plot(tt, pred["F_contact"][:T] @ n, color=C_CL, lw=1.0, label="model, closed loop")
     axf.plot(tt, res["one_step"]["F_contact"][:T] @ n, color=C_ONE, lw=0.8, label="model, one step")
-    axf.set_ylim(-0.2, _full_range(true["F_contact"][:T] @ n, pred["F_contact"][:T] @ n,
+    _force_axis(axf, _full_range(true["F_contact"][:T] @ n, pred["F_contact"][:T] @ n,
                                    res["one_step"]["F_contact"][:T] @ n))
-    axf.set_ylabel("normal force (N)", fontsize=9)
+    axf.set_ylabel("normal force (N, symlog)", fontsize=9)
     axf.legend(fontsize=7, loc="upper right")
     axd.plot(tt, 1e3 * _wall_dist(true, cfg, n, wp)[:T], color=C_TRUE, lw=1.0)
     axd.plot(tt, 1e3 * _wall_dist(pred, cfg, n, wp)[:T], color=C_CL, lw=1.0)

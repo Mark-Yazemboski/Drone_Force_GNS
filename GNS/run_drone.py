@@ -56,7 +56,7 @@ settings = DroneTrainSettings(
     k_f_scale=1.0, k_m_scale=1.0,   # k_f, k_m themselves come from drone_config.json (sim) or the thrust stand
     learn_drag_coeffs=True,         # anchor-law coefficients below
     drag_coeff_fit="lstsq",         # exact least squares: from the motion residual, then refit to the
-    drag_refit_interval=5,          #   network's total aero wrench every 5 epochs ("gradient" = old way)
+    drag_refit_interval_steps=500,  #   network's total aero wrench every 500 optimizer steps ("gradient" = old way)
     k_rot_init=5e-5,                # rotor drag  k_rot * w_j * u_perp   (per rotor)
     k_body_init=0.02,               # body drag   k_body * |u| u
     k_rod_init=0.05,                # rod drag    k_rod * |u_perp| u_perp
@@ -71,25 +71,27 @@ settings = DroneTrainSettings(
     rotate_aug=True,
 
     # ---- stage 1: aero (contact-free windows) ----
-    aero_epochs=200, aero_lr=6e-4,
+    # Training length is in OPTIMIZER STEPS (same for every N_train); each stage prints the
+    # equivalent epochs. 23,200 / 38,800 = 200 / 400 epochs at 300 trajectories, batch 1024.
+    aero_steps=23200, aero_lr=6e-4,
     w_aero_anchor=0.1,              # each aero node toward its drag law (shapes the network)
     w_aero_coeff_fit=0.01,          # only used with drag_coeff_fit="gradient"
     w_aero_smooth=0.01,             # aero force smooth in time
     w_axial=0.1,                    # rotor axial thrust correction toward zero
     w_prior=1e-3,                   # k_f, k_m toward thrust-stand values
     coeff_lr=4e-3,                  # learning rate for k's (stage 1) and mu (stage 2)
-    coeff_warmup_epochs=10,         # k's and mu held fixed for the first 10 epochs of their stage (capped at half)
+    coeff_warmup_steps=1000,        # k's and mu held fixed for the first 1000 steps of their stage (capped at half)
     lr_schedule="cosine",           # network lr decays to 0 over each stage (None = constant)
 
     # ---- stage 2: contact (near-wall windows, aero frozen) ----
-    contact_epochs=400, contact_lr=2e-4,
+    contact_steps=38800, contact_lr=2e-4,
     w_fric_dir=1.0, w_fric_mag=1.0, w_fric_cone=1.0,
     mu_init=0.3, learn_mu=True,
 
     # ---- validation ----
     val_horizon=20,                 # steps rolled forward per window (match the MPC horizon)
     val_stride=5,                   # start a validation window every 5 frames
-    val_interval=10,                # validate every 10 epochs
+    val_interval_steps=1000,        # validate about every 1000 optimizer steps
     best_metric="val_loss",         # keep the checkpoint with the lowest validation loss ("pad_err" also works)
 )
 

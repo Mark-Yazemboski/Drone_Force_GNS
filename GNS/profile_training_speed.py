@@ -18,7 +18,7 @@ scales with batch size:
         NOT help; fewer launches (vectorized code, bigger batches, CUDA graphs) will.
     ~proportional to batch size                 -> COMPUTE-BOUND: the GPU is the limit.
 It also times one validation pass and one drag-coefficient refit, which run
-every val_interval / drag_refit_interval epochs, and prints a torch.profiler
+every val_interval_steps / drag_refit_interval_steps optimizer steps, and prints a torch.profiler
 summary of one training step (CPU time vs GPU time, number of kernel launches).
 Nothing is trained or saved.
 """
@@ -191,14 +191,14 @@ def main():
         sync(device)
         t_val = (time.perf_counter() - t0) * (len(run.val_range) / len(val))
         print(f"one validation pass (scaled to {len(run.val_range)} val trajectories): {t_val:.1f} s, "
-              f"every {s0.val_interval} epochs -> +{t_val / s0.val_interval:.1f} s/epoch on average")
+              f"every {s0.val_interval_steps} steps -> +{t_val / s0.val_interval_steps * 1e3:.2f} s per 1000 steps")
         if stage == "aero" and s0.learn_drag_coeffs and s0.drag_coeff_fit == "lstsq":
             sync(device); t0 = time.perf_counter()
             fit_drag_coefficients(model, data, idx, s, device, "network")
             sync(device)
             t_fit = time.perf_counter() - t0             # capped at stats_batches, so not scaled
-            print(f"one drag refit: {t_fit:.1f} s, every {s0.drag_refit_interval} epochs "
-                  f"-> +{t_fit / s0.drag_refit_interval:.1f} s/epoch on average")
+            print(f"one drag refit: {t_fit:.1f} s, every {s0.drag_refit_interval_steps} steps "
+                  f"-> +{t_fit / s0.drag_refit_interval_steps * 1e3:.2f} s per 1000 steps")
 
         if not a.no_profiler:
             cpu_ms, gpu_ms, n_k, n_ops = profile_one_step(model, phys, data, idx, s, device, stage)

@@ -21,7 +21,7 @@ import copy
 import math
 import os
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 
 import numpy as np
 import torch
@@ -72,12 +72,12 @@ class DroneTrainSettings:
     #              fit in closed form: from the measured motion residual (measured
     #              acceleration - thrust - gravity, contact-free windows) before stage 1,
     #              then refit to the aero network's total force and torque every
-    #              drag_refit_interval epochs. No learning rate, no drift.
+    #              drag_refit_interval_steps optimizer steps. No learning rate, no drift.
     #   "gradient" gradient descent through w_aero_coeff_fit. Converges very slowly:
     #              the laws are strongly correlated (rotor vs body drag ~0.94), so
     #              from a poor start the k's crawl along a long valley.
     drag_coeff_fit: str = "lstsq"
-    drag_refit_interval: int = 5
+    drag_refit_interval_steps: int = 500
     # Initial drag coefficients ("gradient" fit, or learn_drag_coeffs=False). With
     # "lstsq" they are replaced by the fit from the motion residual before stage 1.
     k_rot_init: float = 5e-5        # rotor drag:  k_rot * w_j * u_perp      (per rotor, 1/rad)
@@ -104,7 +104,10 @@ class DroneTrainSettings:
     rotate_aug: bool = True
     stats_batches: int = 40
     # ---- stage 1: aero ----
-    aero_epochs: int = 200
+    # Training length is set in OPTIMIZER STEPS, so runs on different amounts of data get
+    # the same number of updates. Each stage converts steps to epochs at startup
+    # (ceil(steps / batches per epoch)); the log, history and CSV report both.
+    aero_steps: int = 23_200        # = 200 epochs at 300 trajectories, batch 1024
     aero_lr: float = 3e-4
     w_aero_anchor: float = 0.1      # each aero node's force toward its drag law (moves the network only)
     w_aero_coeff_fit: float = 0.01  # drag coefficients fit to the network's total aero force/torque
@@ -114,12 +117,12 @@ class DroneTrainSettings:
     w_axial: float = 0.1            # rotor axial thrust correction toward zero (no law to anchor to)
     w_prior: float = 1e-3           # k_f, k_m toward their thrust-stand values
     coeff_lr: float = 1e-3          # learning rate for the physical coefficients (k's in stage 1, mu in stage 2)
-    coeff_warmup_epochs: int = 10   # coefficients held fixed for the first epochs of each stage, so they
+    coeff_warmup_steps: int = 1000  # coefficients held fixed for the first steps of each stage, so they
                                     # are not pulled toward an untrained network's forces (capped at
-                                    # half the stage's epochs)
+                                    # half the stage)
     lr_schedule: str = None         # None (constant) or "cosine" (network lr decays to 0 over each stage)
     # ---- stage 2: contact ----
-    contact_epochs: int = 300
+    contact_steps: int = 38_800     # = 400 epochs at 300 trajectories, batch 1024
     contact_lr: float = 1e-4
     w_fric_dir: float = 1.0
     w_fric_mag: float = 1.0
@@ -131,7 +134,7 @@ class DroneTrainSettings:
     # ---- validation ----
     val_horizon: int = 20           # steps rolled forward per validation window (match the MPC horizon)
     val_stride: int = 5             # a validation window starts every val_stride frames
-    val_interval: int = 10          # validate every val_interval epochs
+    val_interval_steps: int = 1000  # validate about every this many optimizer steps (rounded to whole epochs)
     best_metric: str = "val_loss"   # "val_loss" (same normalized loss as training, on validation
                                     # windows, no noise/augmentation) or "pad_err" (pad error at val_horizon)
     impact_force_N: float = 10.0    # force-label validation splits contact frames at this magnitude
@@ -653,7 +656,8 @@ def save_checkpoint(path, model, phys, cfg, s, extra=None):
 def load_checkpoint(path, device="cpu"):
     ck = torch.load(path, map_location=device, weights_only=False)
     cfg = DroneConfig(**ck["drone_cfg"])
-    s = DroneTrainSettings(**ck["settings"])
+    known = {f.name for f in fields(DroneTrainSettings)}
+    s = DroneTrainSettings(**{k: v for k, v in ck["settings"].items() if k in known})
     model = DroneForceModel(cfg, s).to(device)
     model.load_state_dict(ck["model"])
     return model.eval(), cfg, s, ck
@@ -682,14 +686,22 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
         coeffs = model.params.thrust_parameters() + ([] if lstsq else model.params.drag_parameters())
         groups = [dict(params=list(model.aero.parameters()), lr=s.aero_lr),
                   dict(params=coeffs, lr=s.coeff_lr)]
-        epochs = s.aero_epochs
+        total_steps = s.aero_steps
     else:
         _set_trainable(model.contact, True)
         groups = [dict(params=list(model.contact.parameters()), lr=s.contact_lr),
                   dict(params=list(phys.parameters()), lr=s.coeff_lr)]
-        epochs = s.contact_epochs
+        total_steps = s.contact_steps
     coeff_params = groups[1]["params"]
     groups = [g for g in groups if g["params"]]
+    # Optimizer steps -> epochs for this stage's number of training windows.
+    steps_per_epoch = max(1, math.ceil(len(train_idx) / s.batch_size))
+    epochs = max(1, math.ceil(total_steps / steps_per_epoch))
+    val_every = max(1, round(s.val_interval_steps / steps_per_epoch))
+    refit_every = max(1, round(s.drag_refit_interval_steps / steps_per_epoch))
+    if verbose:
+        print(f"[{stage}] {total_steps} optimizer steps = {epochs} epochs x {steps_per_epoch} steps/epoch "
+              f"({len(train_idx)} windows, batch {s.batch_size}); validate every {val_every} epochs")
     opt = torch.optim.Adam(groups)
     # Learning-rate schedule for the network weights (coefficients keep theirs).
     sched = None
@@ -699,12 +711,14 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
     elif s.lr_schedule is not None:
         raise ValueError(f"lr_schedule must be None or 'cosine', got {s.lr_schedule!r}")
     # Coefficient warmup, capped at half the stage so short runs still learn mu / k_f.
-    warmup = min(s.coeff_warmup_epochs, epochs // 2)
-    if verbose and warmup < s.coeff_warmup_epochs and coeff_params:
-        print(f"[{stage}] note: coeff_warmup_epochs={s.coeff_warmup_epochs} >= half of {epochs} epochs; "
-              f"using {warmup} so the coefficients ({'k_f, k_m' if stage == 'aero' else 'mu'}) can still move")
+    warmup_req = round(s.coeff_warmup_steps / steps_per_epoch)
+    warmup = min(warmup_req, epochs // 2)
+    if verbose and warmup < warmup_req and coeff_params:
+        print(f"[{stage}] note: coeff_warmup_steps={s.coeff_warmup_steps} is over half the stage; "
+              f"using {warmup} epochs so the coefficients ({'k_f, k_m' if stage == 'aero' else 'mu'}) can still move")
     use_contact = stage == "contact"
     hist = history.setdefault(stage, dict(train=[], val=[], params=[]))
+    hist.update(steps_per_epoch=steps_per_epoch, epochs=epochs, total_steps=total_steps)
     best, best_state, best_phys = float("inf"), None, None
     noise = _stage_noise(model, s, stage)
     if verbose:
@@ -730,7 +744,7 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
         nb = max(nb, 1)
         if sched is not None:
             sched.step()
-        if lstsq and (epoch + 1) % s.drag_refit_interval == 0:
+        if lstsq and (epoch + 1) % refit_every == 0:
             k, r2 = fit_drag_coefficients(model, train_data, train_idx, s, device, "network")
             model.params.set_drag(k)
             if verbose:
@@ -738,7 +752,7 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
         hist["train"].append((epoch, tot / nb, pred / nb))
         pv = dict(epoch=epoch, **model.params.as_dict(), mu=float(phys.mu.detach()))
         hist["params"].append(pv)
-        msg = (f"[{stage}] ep {epoch:4d}  loss {tot / nb:.3e}  pred {pred / nb:.3e}  "
+        msg = (f"[{stage}] ep {epoch:4d} (step {(epoch + 1) * steps_per_epoch:6d})  loss {tot / nb:.3e}  pred {pred / nb:.3e}  "
                + " ".join(f"{k}={v / nb:.2e}" for k, v in raw_acc.items())
                + (f"  k_f {pv['k_f']:.3e} k_rot {pv['k_rot']:.2e}" if stage == "aero" else f"  mu {pv['mu']:.3f}")
                + f"  {time.time() - t0:.1f}s")
@@ -746,7 +760,7 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
         if verbose:
             print(msg, flush=True)
 
-        if (epoch + 1) % s.val_interval == 0 or epoch == epochs - 1:
+        if (epoch + 1) % val_every == 0 or epoch == epochs - 1:
             vloss = validation_loss(model, phys, val_data, val_loss_idx, s, device, stage)
             kval = kstep_validation(model, val_data, val_idx, s, device, use_contact)
             fval = force_validation(model, val_data, val_idx, s, device)
@@ -754,7 +768,7 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
             score = vloss if s.best_metric == "val_loss" else kval.get("all", {}).get("pad_end_mm", float("inf"))
             if verbose:
                 which = "contact-free windows" if stage == "aero" else "all windows"
-                lines = [f"[{stage}] validation after epoch {epoch} ({which})",
+                lines = [f"[{stage}] validation after epoch {epoch}, step {(epoch + 1) * steps_per_epoch} ({which})",
                          f"    val loss {vloss:.3e}   (train pred {pred / nb:.3e})",
                          f"    pad error after {s.val_horizon} steps: " + "   ".join(
                              f"{r} {kval[r]['pad_end_mm']:.3f} mm" for r in ("free", "near", "contact", "all") if r in kval)

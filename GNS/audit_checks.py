@@ -137,18 +137,19 @@ def _train_once(cfg, s, train, val, folder, seed):
     return state, history
 
 
-def check_labels(run, n_traj, epochs):
+def check_labels(run, n_traj, steps):
     from drone_data import build_drone_dataset
     print("\n" + "=" * 72 + "\n2. FORCE LABELS NEVER REACH TRAINING\n" + "=" * 72)
     torch.use_deterministic_algorithms(True)
     cfg = run.drone
-    s = dataclasses.replace(run.settings, aero_epochs=epochs, contact_epochs=epochs, val_interval=1,
-                            coeff_warmup_epochs=0)
+    # a short run: `steps` optimizer steps per stage, validating every epoch
+    s = dataclasses.replace(run.settings, aero_steps=steps, contact_steps=steps, val_interval_steps=1,
+                            coeff_warmup_steps=0)
     ids = list(run.train_range)[:n_traj]
     vids = list(run.val_range)[:max(2, n_traj // 3)]
     train, _ = build_drone_dataset(ids, run.trajectory_folder, cfg, run.rotor_speed_in_rpm, run.rotor_speed_hold)
     val, _ = build_drone_dataset(vids, run.trajectory_folder, cfg, run.rotor_speed_in_rpm, run.rotor_speed_hold)
-    print(f"  {len(train)} train / {len(val)} val trajectories, {epochs} epochs per stage, CPU, batch {s.batch_size}")
+    print(f"  {len(train)} train / {len(val)} val trajectories, {steps} optimizer steps per stage, CPU, batch {s.batch_size}")
 
     with tempfile.TemporaryDirectory() as tmp:
         a_dir, b_dir = os.path.join(tmp, "a"), os.path.join(tmp, "b")
@@ -189,14 +190,14 @@ def main():
     ap.add_argument("--run-file", default=os.path.join(HERE, "run_drone.py"))
     ap.add_argument("--only", choices=("causality", "labels"), default=None)
     ap.add_argument("--n-traj", type=int, default=12, help="training trajectories for the label check")
-    ap.add_argument("--epochs", type=int, default=3, help="epochs per stage for the label check")
+    ap.add_argument("--steps", type=int, default=10, help="optimizer steps per stage for the label check")
     a = ap.parse_args()
 
     results = {}
     if a.only in (None, "causality"):
         results["generator causality"] = check_causality()
     if a.only in (None, "labels"):
-        results["labels never reach training"] = check_labels(load_run_file(a.run_file), a.n_traj, a.epochs)
+        results["labels never reach training"] = check_labels(load_run_file(a.run_file), a.n_traj, a.steps)
     print("\n" + "=" * 72)
     for name, ok in results.items():
         print(f"  {'PASS' if ok else 'FAIL'}  {name}")

@@ -1,14 +1,22 @@
-"""Loss history for both training stages, to judge whether more epochs would help.
+"""Loss history for both training stages, to judge whether more training would help.
+
+x axis: optimizer steps (bottom) and epochs (top). Training length is set in steps,
+so curves from runs with different amounts of data line up. Histories from
+before step-based training have no steps-per-epoch record and are plotted in epochs.
 
 Top row (one column per stage, aero then contact), log scale:
     train pred   the normalized prediction loss on training windows (1 = no better
                  than zero learned force). Inputs are noised, so it sits above val.
     train total  pred + the stage's regularizers (anchor, smoothness, friction terms...)
-    val          the same normalized prediction loss on validation windows, every
-                 val_interval epochs. The star marks the lowest one.
-Bottom row: learned coefficients over epochs.
+    val          the same normalized prediction loss on validation windows. The star
+                 marks the lowest one; the dotted vertical line marks the checkpoint
+                 actually kept (best_metric), when that differs.
+Bottom row: learned coefficients.
     aero     k_f, k_m, k_rot divided by their true values (1.0 = recovered exactly)
-    contact  mu, with the true value as a dashed line
+    contact  the learned mu parameter (it only feeds the friction regularizer), the
+             friction-to-normal ratio of the PREDICTED sliding forces on validation
+             (what the model actually does), the same ratio for MuJoCo's labels, and
+             the true mu
 
 Each top panel is titled with how much the val loss fell over the last 25% of the
 stage's epochs. Still falling a few percent or more -> more epochs would likely
@@ -34,7 +42,7 @@ COEFF_COLORS = {"k_f": "#185FA5", "k_m": "#2ca02c", "k_rot": "#D85A30", "mu": "#
 
 
 def val_tail_change(hist, frac=0.25):
-    """Relative change of the val loss over the last `frac` of the stage's epochs
+    """Relative change of the val loss over the last `frac` of the stage
     (negative = still improving). NaN if there are too few validation points."""
     val = [(v["epoch"], v["loss"]) for v in hist.get("val", [])]
     if len(val) < 2 or not hist.get("train"):
@@ -48,22 +56,48 @@ def val_tail_change(hist, frac=0.25):
     return float(loss[-1] / ref - 1.0)
 
 
+# Epoch index -> optimizer steps completed at the end of that epoch (or the epoch
+# itself for histories without a steps-per-epoch record).
+def _xaxis(hist):
+    spe = hist.get("steps_per_epoch")
+    if spe:
+        return (lambda ep: (np.asarray(ep, float) + 1) * spe), "optimizer step", spe
+    return (lambda ep: np.asarray(ep, float)), "epoch", None
+
+
+def _epoch_axis(ax, spe):
+    if spe:
+        top = ax.secondary_xaxis("top", functions=(lambda x: x / spe, lambda e: e * spe))
+        top.set_xlabel("epoch", fontsize=8)
+        top.tick_params(labelsize=7)
+
+
+def _kept_epoch(hist):
+    return hist.get("best", {}).get("epoch")
+
+
 def _loss_panel(ax, hist, stage):
+    X, xlabel, spe = _xaxis(hist)
     tr = np.array(hist["train"], dtype=float)           # (epoch, total, pred)
-    ax.plot(tr[:, 0], tr[:, 2], color=C_PRED, lw=1.4, label="train pred")
-    ax.plot(tr[:, 0], tr[:, 1], color=C_TOTAL, lw=1.0, ls="--", label="train total")
+    ax.plot(X(tr[:, 0]), tr[:, 2], color=C_PRED, lw=1.4, label="train pred")
+    ax.plot(X(tr[:, 0]), tr[:, 1], color=C_TOTAL, lw=1.0, ls="--", label="train total")
     if hist.get("val"):
         ve = np.array([v["epoch"] for v in hist["val"]])
         vl = np.array([v["loss"] for v in hist["val"]])
-        ax.plot(ve, vl, "o-", color=C_VAL, ms=3, lw=1.4, label="val")
+        ax.plot(X(ve), vl, "o-", color=C_VAL, ms=3, lw=1.4, label="val")
         b = int(np.argmin(vl))
-        ax.plot(ve[b], vl[b], "*", color=C_BEST, ms=12, zorder=5, label=f"lowest val (ep {ve[b]})")
+        where = f"step {int(X(ve[b]))}" if spe else f"ep {ve[b]}"
+        ax.plot(X(ve[b]), vl[b], "*", color=C_BEST, ms=12, zorder=5, label=f"lowest val ({where})")
+        kept = _kept_epoch(hist)
+        if kept is not None and kept != ve[b]:
+            ax.axvline(X(kept), color=C_BEST, ls=":", lw=1.2, label="kept checkpoint")
     ax.set_yscale("log")
     ax.grid(True, which="both", alpha=0.25)
-    ax.set_xlabel("epoch")
+    ax.set_xlabel(xlabel)
+    _epoch_axis(ax, spe)
     ax.set_ylabel("normalized loss (1 = zero learned force)")
     ch = val_tail_change(hist)
-    tail = "" if np.isnan(ch) else f"\nval loss over last 25% of epochs: {100 * ch:+.1f}%"
+    tail = "" if np.isnan(ch) else f"\nval loss over the last 25% of training: {100 * ch:+.1f}%"
     ax.set_title(f"{stage} stage{tail}", fontsize=10)
     ax.legend(fontsize=8, loc="best")
 
@@ -73,7 +107,8 @@ def _coeff_panel(ax, hist, stage, true):
     if not p:
         ax.set_visible(False)
         return
-    ep = np.array([q["epoch"] for q in p])
+    X, xlabel, spe = _xaxis(hist)
+    ep = X([q["epoch"] for q in p])
     if stage == "aero":
         for k in ("k_f", "k_m", "k_rot"):
             if true.get(k):
@@ -83,12 +118,30 @@ def _coeff_panel(ax, hist, stage, true):
         ax.set_ylabel("learned / true")
     else:
         mu = np.array([q["mu"] for q in p])
-        ax.plot(ep, mu, color=COEFF_COLORS["mu"], lw=1.4, label=f"mu: final {mu[-1]:.3f}")
+        ax.plot(ep, mu, color=COEFF_COLORS["mu"], lw=1.4, label=f"learned mu parameter: final {mu[-1]:.3f}")
+        # Friction-to-normal ratio of the sliding forces, at each validation pass.
+        vals = [v for v in hist.get("val", []) if "slide_mu_implied" in v.get("forces", {})]
+        if vals:
+            ve = X([v["epoch"] for v in vals])
+            imp = np.array([v["forces"]["slide_mu_implied"] for v in vals])
+            lab = np.array([v["forces"].get("slide_mu_implied_label", np.nan) for v in vals])
+            ax.plot(ve, imp, "o-", color="#185FA5", ms=3, lw=1.2,
+                    label=f"implied by predicted forces (|F_t|/F_n): last {imp[-1]:.3f}")
+            if np.isfinite(lab).any():
+                ax.axhline(float(np.nanmean(lab)), color="#185FA5", ls="--", lw=1,
+                           label=f"implied by MuJoCo labels {np.nanmean(lab):.3f}")
         if true.get("mu"):
             ax.axhline(true["mu"], color=C_BEST, ls="--", lw=1, label=f"true mu {true['mu']:.2f}")
+        kept = _kept_epoch(hist)
+        if kept is not None:
+            ax.axvline(X(kept), color=C_BEST, ls=":", lw=1.2)
+        # Early in training the implied ratio can be far off (tiny normal forces);
+        # cap the axis so it does not squash the mu lines.
+        ax.set_ylim(0.0, min(1.0, max(0.6, ax.get_ylim()[1])))
         ax.set_ylabel("friction coefficient")
     ax.grid(True, alpha=0.25)
-    ax.set_xlabel("epoch")
+    ax.set_xlabel(xlabel)
+    _epoch_axis(ax, spe)
     if ax.get_legend_handles_labels()[0]:
         ax.legend(fontsize=8, loc="best")
     else:
