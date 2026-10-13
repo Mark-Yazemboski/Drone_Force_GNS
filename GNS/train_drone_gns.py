@@ -86,6 +86,17 @@ class DroneTrainSettings:
     k_pad_init: float = 0.05        # pad drag:    k_pad * |u| u             (1/m)
     # ---- windows / batches ----
     multistep: int = 4
+    # Prediction loss on the normalized node-acceleration error e (per axis):
+    #   "mse"    e^2
+    #   "huber"  e^2 for |e| <= huber_delta, 2 delta |e| - delta^2 beyond (same value and
+    #            slope at delta, so it is MSE for ordinary errors and grows linearly for
+    #            the few huge ones, i.e. impacts far outside the training range).
+    # Applies to both stages. huber_delta is in normalized units: 1 = an error as large
+    # as the RMS of the whole signal the stage learns (zero-learned-force residual).
+    # On contact windows ~10% of that signal is above 1, but a trained model's errors
+    # are well below it except on the worst impacts.
+    pred_loss: str = "mse"
+    huber_delta: float = 1.0
     batch_size: int = 256
     eval_batch_size: int = 2048     # no-grad passes (stats, drag refit, validation): no effect on the
                                     # optimization, only speed. stats_batches counts these batches.
@@ -135,8 +146,12 @@ class DroneTrainSettings:
     val_horizon: int = 20           # steps rolled forward per validation window (match the MPC horizon)
     val_stride: int = 5             # a validation window starts every val_stride frames
     val_interval_steps: int = 1000  # validate about every this many optimizer steps (rounded to whole epochs)
-    best_metric: str = "val_loss"   # "val_loss" (same normalized loss as training, on validation
-                                    # windows, no noise/augmentation) or "pad_err" (pad error at val_horizon)
+    best_metric: str = "val_loss"   # which checkpoint is kept:
+                                    #   "val_loss"   normalized MSE prediction loss on validation windows
+                                    #   "val_huber"  the same with the Huber loss (huber_delta)
+                                    #   "pad_err"    mean pad position error after val_horizon steps
+                                    # Both val losses are computed and logged every validation pass,
+                                    # whichever pred_loss trains.
     impact_force_N: float = 10.0    # force-label validation splits contact frames at this magnitude
     near_thresh: float = 0.05
 
@@ -316,7 +331,23 @@ def _fmt_k(k):
 # Loss
 # ======================================================================
 
-def unroll_loss(model, phys, batch, s, stage):
+PRED_LOSSES = ("mse", "huber")
+BEST_METRICS = ("val_loss", "val_huber", "pad_err")
+
+
+def pred_error(e, kind, delta):
+    """Elementwise prediction loss on the normalized error e (see pred_loss)."""
+    if kind == "mse":
+        return e.pow(2)
+    if kind == "huber":
+        a = e.abs()
+        return torch.where(a <= delta, a.pow(2), 2 * delta * a - delta ** 2)
+    raise ValueError(f"pred_loss must be one of {PRED_LOSSES}, got {kind!r}")
+
+
+# pred_kind: None = the training loss (s.pred_loss); validation passes "mse" or "huber".
+def unroll_loss(model, phys, batch, s, stage, pred_kind=None):
+    pred_kind = pred_kind or s.pred_loss
     h, K = s.h, batch["tgt_com"].shape[1]
     use_contact = stage == "contact"
     loss_scale = model.loss_scale_contact if use_contact else model.loss_scale_aero
@@ -331,7 +362,7 @@ def unroll_loss(model, phys, batch, s, stage):
         x_prev, x_curr = _loss_nodes(model, com_h[-2], R_h[-2]), _loss_nodes(model, com_h[-1], R_h[-1])
         a_pred = _loss_nodes(model, com_n, R_n) - 2 * x_curr + x_prev
         a_true = _loss_nodes(model, batch["tgt_com"][:, k], batch["tgt_R"][:, k]) - 2 * x_curr + x_prev
-        pred_terms.append(((a_pred - a_true) / loss_scale).pow(2).mean())
+        pred_terms.append(pred_error((a_pred - a_true) / loss_scale, pred_kind, s.huber_delta).mean())
 
         if stage == "aero":
             a = aux["aero"]
@@ -588,7 +619,9 @@ def evaluate_on_dataset(model, phys, data, s, device="cpu"):
     annotate_pad_distance(data, model.pad_rest.cpu())
     w = stage_windows(data, data, s)
     out = {"aero_loss": validation_loss(model, phys, data, w["vl_aero"], s, device, "aero"),
-           "contact_loss": validation_loss(model, phys, data, w["vl_contact"], s, device, "contact")}
+           "contact_loss": validation_loss(model, phys, data, w["vl_contact"], s, device, "contact"),
+           "aero_loss_huber": validation_loss(model, phys, data, w["vl_aero"], s, device, "aero", "huber"),
+           "contact_loss_huber": validation_loss(model, phys, data, w["vl_contact"], s, device, "contact", "huber")}
     out.update(contact_loss_breakdown(model, data, w["vl_contact"], s, device))
     for regime, m in kstep_validation(model, data, w["va_all"], s, device, use_contact=True).items():
         for k, v in m.items():
@@ -634,11 +667,13 @@ def _format_forces(f, impact_N):
 # Same normalized loss as training (no input noise, no augmentation), on
 # validation windows of the training unroll length.
 @torch.no_grad()
-def validation_loss(model, phys, data, index, s, device, stage):
+# Normalized prediction loss on validation windows (no noise, no augmentation).
+# kind: "mse" (default, comparable across all runs) or "huber".
+def validation_loss(model, phys, data, index, s, device, stage, kind="mse"):
     model.eval()
     tot = n = 0.0
     for b in _batches(data, index, s, device, s.multistep, train=False):
-        tot += float(unroll_loss(model, phys, b, s, stage)[1]) * b["B"]
+        tot += float(unroll_loss(model, phys, b, s, stage, pred_kind=kind)[1]) * b["B"]
         n += b["B"]
     model.train()
     return tot / max(n, 1)
@@ -678,6 +713,10 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
     # Network weights and physical coefficients get separate learning rates: the
     # coefficients (k's, mu) see weak, noisy gradients through the anchor and
     # friction losses and move very slowly at a network learning rate.
+    if s.pred_loss not in PRED_LOSSES:
+        raise ValueError(f"pred_loss must be one of {PRED_LOSSES}, got {s.pred_loss!r}")
+    if s.best_metric not in BEST_METRICS:
+        raise ValueError(f"best_metric must be one of {BEST_METRICS}, got {s.best_metric!r}")
     _set_trainable(model, False)
     lstsq = stage == "aero" and s.drag_coeff_fit == "lstsq" and s.learn_drag_coeffs
     if stage == "aero":
@@ -761,15 +800,17 @@ def train_stage(stage, model, phys, cfg, s, train_data, train_idx, val_data, val
             print(msg, flush=True)
 
         if (epoch + 1) % val_every == 0 or epoch == epochs - 1:
-            vloss = validation_loss(model, phys, val_data, val_loss_idx, s, device, stage)
+            vloss = validation_loss(model, phys, val_data, val_loss_idx, s, device, stage, "mse")
+            vhuber = validation_loss(model, phys, val_data, val_loss_idx, s, device, stage, "huber")
             kval = kstep_validation(model, val_data, val_idx, s, device, use_contact)
             fval = force_validation(model, val_data, val_idx, s, device)
-            hist["val"].append(dict(epoch=epoch, loss=vloss, kstep=kval, forces=fval))
-            score = vloss if s.best_metric == "val_loss" else kval.get("all", {}).get("pad_end_mm", float("inf"))
+            hist["val"].append(dict(epoch=epoch, loss=vloss, loss_huber=vhuber, kstep=kval, forces=fval))
+            score = {"val_loss": vloss, "val_huber": vhuber,
+                     "pad_err": kval.get("all", {}).get("pad_end_mm", float("inf"))}[s.best_metric]
             if verbose:
                 which = "contact-free windows" if stage == "aero" else "all windows"
                 lines = [f"[{stage}] validation after epoch {epoch}, step {(epoch + 1) * steps_per_epoch} ({which})",
-                         f"    val loss {vloss:.3e}   (train pred {pred / nb:.3e})",
+                         f"    val loss: MSE {vloss:.3e}  Huber {vhuber:.3e}   (train pred, {s.pred_loss}: {pred / nb:.3e})",
                          f"    pad error after {s.val_horizon} steps: " + "   ".join(
                              f"{r} {kval[r]['pad_end_mm']:.3f} mm" for r in ("free", "near", "contact", "all") if r in kval)
                          + "   (windows: " + ", ".join(f"{r} {kval[r]['n']}" for r in ("free", "near", "contact") if r in kval) + ")"]
@@ -839,7 +880,7 @@ def train_drone_force_model(cfg, s, train_data, val_data, save_path, device=None
               f"throughout) {len(w['tr_aero'])} | stage 2 (pad < "
               + (f"{100 * s.contact_max_pad_dist:.1f} cm" if s.contact_max_pad_dist else "any distance")
               + f" at some frame) {len(w['tr_contact'])}, of which touching {len(w['tr_touch'])}")
-    history = {}
+    history = {"settings": asdict(s)}
 
     if "aero" in stages:
         if not w["tr_aero"]:

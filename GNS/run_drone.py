@@ -65,6 +65,8 @@ settings = DroneTrainSettings(
     # ---- windows / batches ----
     multistep=4, batch_size=1024,
     eval_batch_size=2048,           # no-grad passes only (stats, refit, validation): speed, not results
+    pred_loss="mse",                # prediction loss, both stages: "mse" or "huber" (linear beyond huber_delta)
+    huber_delta=1.0,                # normalized units: 1 = RMS of the signal the stage learns
     aero_min_pad_dist=0.026,        # stage-1 windows: pad stays > 2.6 cm from the wall throughout
     contact_max_pad_dist=0.05,      # stage-2 windows: pad comes within 5 cm at some frame (None = all)
     noise_frac=0.2,                 # input noise = 0.2 x each stage's median residual
@@ -92,7 +94,7 @@ settings = DroneTrainSettings(
     val_horizon=20,                 # steps rolled forward per window (match the MPC horizon)
     val_stride=5,                   # start a validation window every 5 frames
     val_interval_steps=1000,        # validate about every 1000 optimizer steps
-    best_metric="val_loss",         # keep the checkpoint with the lowest validation loss ("pad_err" also works)
+    best_metric="val_loss",         # checkpoint kept: "val_loss" (MSE), "val_huber", or "pad_err" (pad error after val_horizon)
 )
 
 run_name = "drone_two_stage"

@@ -40,11 +40,21 @@ def collect_drone_metrics(history, test_metrics=None, true_values=None, last_n=1
         out[f"{stage}_final_train_loss"] = float(tail.mean())
         out[f"{stage}_final_train_loss_std"] = float(tail.std(ddof=1)) if tail.size > 1 else 0.0
         if h["val"]:
-            best = min(h["val"], key=lambda v: v["loss"])
+            # "best_*" = the validation pass of the checkpoint actually KEPT (best_metric),
+            # which is the model that gets evaluated; min_val_* = the lowest over training.
+            kept_ep = h.get("best", {}).get("epoch")
+            best = next((v for v in h["val"] if v["epoch"] == kept_ep), None) or min(h["val"], key=lambda v: v["loss"])
             out[f"{stage}_best_val_loss"] = best["loss"]
+            if "loss_huber" in best:
+                out[f"{stage}_best_val_huber"] = best["loss_huber"]
             out[f"{stage}_best_val_epoch"] = best["epoch"]
             for regime, m in best["kstep"].items():
                 out[f"{stage}_best_pad_err_mm_{regime}"] = m["pad_end_mm"]
+            out[f"{stage}_min_val_loss"] = min(v["loss"] for v in h["val"])
+            hub = [v["loss_huber"] for v in h["val"] if "loss_huber" in v]
+            if hub:
+                out[f"{stage}_min_val_huber"] = min(hub)
+            out[f"{stage}_min_pad_err_mm_all"] = min(v["kstep"].get("all", {}).get("pad_end_mm", np.inf) for v in h["val"])
 
     # Learned physical coefficients: k's move in stage 1, mu in stage 2.
     true_values = true_values or {}

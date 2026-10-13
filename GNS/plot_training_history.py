@@ -5,11 +5,12 @@ so curves from runs with different amounts of data line up. Histories from
 before step-based training have no steps-per-epoch record and are plotted in epochs.
 
 Top row (one column per stage, aero then contact), log scale:
-    train pred   the normalized prediction loss on training windows (1 = no better
-                 than zero learned force). Inputs are noised, so it sits above val.
+    train pred   the normalized prediction loss on training windows, in the training
+                 loss (MSE or Huber; for MSE, 1 = no better than zero learned force).
+                 Inputs are noised, so it sits above val.
     train total  pred + the stage's regularizers (anchor, smoothness, friction terms...)
-    val          the same normalized prediction loss on validation windows. The star
-                 marks the lowest one; the dotted vertical line marks the checkpoint
+    val          the normalized prediction loss on validation windows, MSE (solid) and
+                 Huber (dashed), whichever trains. The star marks the lowest MSE; the dotted vertical line marks the checkpoint
                  actually kept (best_metric), when that differs.
 Bottom row: learned coefficients.
     aero     k_f, k_m, k_rot divided by their true values (1.0 = recovered exactly)
@@ -76,18 +77,21 @@ def _kept_epoch(hist):
     return hist.get("best", {}).get("epoch")
 
 
-def _loss_panel(ax, hist, stage):
+def _loss_panel(ax, hist, stage, pred_loss="mse"):
     X, xlabel, spe = _xaxis(hist)
     tr = np.array(hist["train"], dtype=float)           # (epoch, total, pred)
-    ax.plot(X(tr[:, 0]), tr[:, 2], color=C_PRED, lw=1.4, label="train pred")
+    ax.plot(X(tr[:, 0]), tr[:, 2], color=C_PRED, lw=1.4, label=f"train pred ({pred_loss})")
     ax.plot(X(tr[:, 0]), tr[:, 1], color=C_TOTAL, lw=1.0, ls="--", label="train total")
     if hist.get("val"):
         ve = np.array([v["epoch"] for v in hist["val"]])
         vl = np.array([v["loss"] for v in hist["val"]])
-        ax.plot(X(ve), vl, "o-", color=C_VAL, ms=3, lw=1.4, label="val")
+        ax.plot(X(ve), vl, "o-", color=C_VAL, ms=3, lw=1.4, label="val (MSE)")
+        if all("loss_huber" in v for v in hist["val"]):
+            ax.plot(X(ve), [v["loss_huber"] for v in hist["val"]], "o--", color=C_VAL, ms=2, lw=1.0,
+                    alpha=0.6, label="val (Huber)")
         b = int(np.argmin(vl))
         where = f"step {int(X(ve[b]))}" if spe else f"ep {ve[b]}"
-        ax.plot(X(ve[b]), vl[b], "*", color=C_BEST, ms=12, zorder=5, label=f"lowest val ({where})")
+        ax.plot(X(ve[b]), vl[b], "*", color=C_BEST, ms=12, zorder=5, label=f"lowest val MSE ({where})")
         kept = _kept_epoch(hist)
         if kept is not None and kept != ve[b]:
             ax.axvline(X(kept), color=C_BEST, ls=":", lw=1.2, label="kept checkpoint")
@@ -159,7 +163,7 @@ def plot_loss_history(history, path, true=None, title=None):
                              gridspec_kw=dict(height_ratios=[1.6, 1]))
     out = {}
     for j, st in enumerate(stages):
-        _loss_panel(axes[0, j], history[st], st)
+        _loss_panel(axes[0, j], history[st], st, history.get("settings", {}).get("pred_loss", "mse"))
         _coeff_panel(axes[1, j], history[st], st, true)
         out[f"{st}_val_loss_tail_change"] = val_tail_change(history[st])
     if title:
