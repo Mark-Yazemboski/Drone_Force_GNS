@@ -73,7 +73,7 @@ settings = DroneTrainSettings(
     # ---- stage 1: aero (contact-free windows) ----
     # Training length is in OPTIMIZER STEPS (same for every N_train); each stage prints the
     # equivalent epochs. 23,200 / 38,800 = 200 / 400 epochs at 300 trajectories, batch 1024.
-    aero_steps=23200, aero_lr=6e-4,
+    aero_steps=23_200, aero_lr=6e-4,
     w_aero_anchor=0.1,              # each aero node toward its drag law (shapes the network)
     w_aero_coeff_fit=0.01,          # only used with drag_coeff_fit="gradient"
     w_aero_smooth=0.01,             # aero force smooth in time
@@ -84,7 +84,7 @@ settings = DroneTrainSettings(
     lr_schedule="cosine",           # network lr decays to 0 over each stage (None = constant)
 
     # ---- stage 2: contact (near-wall windows, aero frozen) ----
-    contact_steps=38800, contact_lr=2e-4,
+    contact_steps=38_800, contact_lr=2e-4,
     w_fric_dir=1.0, w_fric_mag=1.0, w_fric_cone=1.0,
     mu_init=0.3, learn_mu=True,
 
@@ -113,6 +113,14 @@ closed_loop_seed = 1234                         # same seed -> same scenarios ac
 N_visualize = 9                                 # PNG + GIF for the first N closed-loop runs
 sanity_check = True                             # also fly the first push with the contact network off
 gif_stride = 3                                  # draw every 3rd frame (100 Hz data -> ~33 fps GIF)
+
+# Open-loop evaluation: every test trajectory replayed from its recorded rotor speeds,
+# no controller, from 4 start points (in air, just before contact, mid contact, just
+# before pull-away), with the contact network on and off. Stops a run once the pad is
+# 30 cm off MuJoCo's or the drone tilts past 60 deg.
+Open_loop_eval = True
+open_loop_horizon_s = 2.0
+N_open_loop_gifs = 4                            # one GIF per start kind (needs Visualize_model)
 
 master_csv = os.path.join(script_dir, "models", "drone_master_tracker.csv")
 
@@ -150,7 +158,8 @@ if __name__ == "__main__":
             final_path, test, meta, os.path.join(model_folder_path, "figures"),
             n_closed_loop=N_closed_loop, closed_loop_kinds=closed_loop_kinds, closed_loop_seed=closed_loop_seed,
             n_visualize=N_visualize if Visualize_model else 0, make_gifs=Visualize_model, gif_stride=gif_stride,
-            sanity_check=sanity_check, data_wind_max=closed_loop_wind_max))
+            sanity_check=sanity_check, data_wind_max=closed_loop_wind_max,
+            open_loop=Open_loop_eval, open_loop_horizon_s=open_loop_horizon_s, n_open_loop_gifs=N_open_loop_gifs))
 
     if Save_run_report:
         history = torch.load(history_path, weights_only=False)
@@ -170,4 +179,6 @@ if __name__ == "__main__":
                                               "eval.n_closed_loop": N_closed_loop,
                                               "eval.closed_loop_kinds": ",".join(closed_loop_kinds or ()),
                                               "eval.closed_loop_seed": closed_loop_seed,
-                                              "eval.closed_loop_wind_max": closed_loop_wind_max})
+                                              "eval.closed_loop_wind_max": closed_loop_wind_max,
+                                              "eval.open_loop": Open_loop_eval,
+                                              "eval.open_loop_horizon_s": open_loop_horizon_s})

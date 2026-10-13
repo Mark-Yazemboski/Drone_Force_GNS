@@ -7,6 +7,10 @@
      controller with MuJoCo and with the model as the plant. Reports pad error,
      contact-onset timing, and contact force error (one step and closed loop).
   3. Figures for the first few closed-loop runs: a time-series PNG and a GIF.
+  4. Open loop (see drone_open_loop.py): the test trajectories replayed from their
+     recorded rotor speeds with no controller, from 4 start points each, with the
+     contact network on and off. Time to 1 cm / 5 cm pad error, error-growth
+     figure, one GIF per start kind.
 
 Returns one flat dict of metrics for the run report.
 """
@@ -26,7 +30,7 @@ from visualize_drone_model import plot_closed_loop, animate_closed_loop
 def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
                        closed_loop_kinds=("tap", "push", "slide"), closed_loop_seed=1234,
                        n_visualize=3, make_gifs=True, gif_stride=3, sanity_check=True, device="cpu",
-                       data_wind_max=None):
+                       data_wind_max=None, open_loop=True, open_loop_horizon_s=2.0, n_open_loop_gifs=4):
     model, cfg, s, ck = load_checkpoint(model_path, device)
     phys = _make_phys(cfg, s).to(device)
     phys.load_state_dict(ck["phys"])
@@ -109,4 +113,10 @@ def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
                                    f"(pad goes {-depth:.0f} mm into the wall)")
             print(f"  sanity check (contact network off): model pad reaches {depth:.1f} mm "
                   f"({'inside' if depth < 0 else 'outside'} the wall) -> saved sanity_check_contact_off.png")
+
+    if open_loop and test_data:
+        from drone_open_loop import evaluate_open_loop
+        metrics.update(evaluate_open_loop(model, cfg, test_data, out_folder, horizon_s=open_loop_horizon_s,
+                                          n_gifs=n_open_loop_gifs if make_gifs else 0, gif_stride=gif_stride,
+                                          device=device))
     return metrics

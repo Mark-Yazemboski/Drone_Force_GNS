@@ -189,8 +189,12 @@ def _moving_average(x, w):
 
 
 def animate_closed_loop(res, cfg, path, stride=3, fps=None, friction_gain=2.5, min_N=0.03,
-                        view_half_width=0.33, true_force_avg_frames=5, dpi=80, camera="fixed"):
-    """camera: "fixed" (default) keeps one view of the contact region and a fixed,
+                        view_half_width=0.33, true_force_avg_frames=5, dpi=80, camera="fixed",
+                        mode="closed loop"):
+    """mode: "closed loop" (model as the plant under the same controller) or
+    "open loop" (recorded rotor speeds, no controller; drone_open_loop.py). It only
+    changes the labels. res["one_step"] may be None (open loop has no one-step trace).
+    camera: "fixed" (default) keeps one view of the contact region and a fixed,
     gridded wall, so sliding reads correctly; "follow" centers on the drone every
     frame (bigger drone, but the background moves with it, which makes sliding look
     reversed). view_half_width: half-width of the "follow" view (m).
@@ -278,7 +282,9 @@ def animate_closed_loop(res, cfg, path, stride=3, fps=None, friction_gain=2.5, m
     trail_t, = ax.plot([], [], [], color=C_DRONE_TRUE, lw=0.8, alpha=0.6)
     trail_p, = ax.plot([], [], [], color=C_DRONE_PRED, lw=0.8, alpha=0.6)
     hud = fig.text(0.02, 0.97, "", fontsize=9, va="top", family="monospace")
-    fig.text(0.02, 0.02, "gray (thick): MuJoCo    blue: model as the plant, same controller and scenario\n"
+    blue = ("blue: model as the plant, same controller and scenario" if mode == "closed loop" else
+            "blue: model, open loop (recorded rotor speeds, no controller)")
+    fig.text(0.02, 0.02, f"gray (thick): MuJoCo    {blue}\n"
                          f"arrows: green normal, orange friction (x{friction_gain:g}), magenta aero at COM; "
                          f"log-scaled, {100 * ARROW_REF_LEN:.0f} cm = {ARROW_REF_N:g} N (capped at {100 * ARROW_MAX_LEN:.0f} cm)\n"
                          f"model arrows per pad node; MuJoCo arrows = net force, {10 * true_force_avg_frames} ms average",
@@ -290,10 +296,12 @@ def animate_closed_loop(res, cfg, path, stride=3, fps=None, friction_gain=2.5, m
     _shade(axf, true["phase"][:T], dt)
     _shade(axd, true["phase"][:T], dt)
     axf.plot(tt, true["F_contact"][:T] @ n, color=C_TRUE, lw=1.0, label="MuJoCo")
-    axf.plot(tt, pred["F_contact"][:T] @ n, color=C_CL, lw=1.0, label="model, closed loop")
-    axf.plot(tt, res["one_step"]["F_contact"][:T] @ n, color=C_ONE, lw=0.8, label="model, one step")
-    _force_axis(axf, _full_range(true["F_contact"][:T] @ n, pred["F_contact"][:T] @ n,
-                                   res["one_step"]["F_contact"][:T] @ n))
+    axf.plot(tt, pred["F_contact"][:T] @ n, color=C_CL, lw=1.0, label=f"model, {mode}")
+    traces = [true["F_contact"][:T] @ n, pred["F_contact"][:T] @ n]
+    if res.get("one_step") is not None:
+        axf.plot(tt, res["one_step"]["F_contact"][:T] @ n, color=C_ONE, lw=0.8, label="model, one step")
+        traces.append(res["one_step"]["F_contact"][:T] @ n)
+    _force_axis(axf, _full_range(*traces))
     axf.set_ylabel("normal force (N, symlog)", fontsize=9)
     axf.legend(fontsize=7, loc="upper right")
     axd.plot(tt, 1e3 * _wall_dist(true, cfg, n, wp)[:T], color=C_TRUE, lw=1.0)

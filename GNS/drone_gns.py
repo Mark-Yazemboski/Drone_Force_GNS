@@ -383,7 +383,29 @@ class DroneForceModel(nn.Module):
         d = x_flat[ei[0]] - x_flat[ei[1]]
         return dyn.reshape(B * N, -1), static.reshape(B * N, -1), torch.cat([d, d.norm(dim=-1, keepdim=True)], -1)
 
-    def contact_forces(self, hist, a_nc, wall_n, wall_c):
+    # Contact GNN from the COM state, the same kind of input as aero_forces():
+    #   com_hist, R_hist  the last h+1 COM positions (B,3) and attitudes (B,3,3), oldest first
+    #   f_nc, tau_nc      non-contact force and torque about the COM WITHOUT gravity, per-step
+    #                     units: thrust_wrench() + aero_forces()["F"/"tau"]
+    #   wall_n, wall_c    wall normal and a point on the wall (B,3)
+    # Inside: the contact-node positions x_i = p + R r_i at every pose (their differences are
+    # the node velocities), and each node's non-contact acceleration
+    # a_i = a + alpha x r_i + w x (w x r_i) with gravity at the COM; then the GNN.
+    # Returns phi (B,N,3) per-node contact force, gate (B,N,1), F (B,3) and tau (B,3) the net
+    # contact force and torque about the COM, r (B,N,3) the node lever arms; all per-step units
+    # (to_newtons() converts).
+    def contact_forces(self, com_hist, R_hist, f_nc, tau_nc, wall_n, wall_c):
+        R_prev, R_curr = R_hist[-2], R_hist[-1]
+        w_step = so3_log(R_curr @ R_prev.transpose(-1, -2))
+        r_c = torch.einsum('bij,nj->bni', R_curr, self.contact_rest)
+        a_nc = node_accel_from_wrench(f_nc + self.g_step, tau_nc, w_step, R_curr, self.J_body, r_c)
+        hist = [nodes_from_state(c, R, self.contact_rest) for c, R in zip(com_hist, R_hist)]
+        phi_c, c_w = self._contact_forces_nodes(hist, a_nc, wall_n, wall_c)
+        return dict(phi=phi_c, gate=c_w, F=phi_c.sum(1), tau=_cross(r_c, phi_c).sum(1), r=r_c)
+
+    # The same contact GNN from node-level inputs (node position history and per-node a_nc).
+    # Used by step(), which already has these from noncontact().
+    def _contact_forces_nodes(self, hist, a_nc, wall_n, wall_c):
         B = hist[-1].shape[0]
         dyn, static, e = self.contact_features(hist, a_nc, wall_n, wall_c)
         x = torch.cat([self.contact_in(dyn), static], -1)
@@ -429,7 +451,7 @@ class DroneForceModel(nn.Module):
         tau_c = torch.zeros_like(tau_nc)
         if use_contact:
             hist, a_nc = aux["hist"], aux["a_nc"]
-            phi_c, c_w = self.contact_forces(hist, a_nc.detach() if detach_nc else a_nc, wall_n, wall_c)
+            phi_c, c_w = self._contact_forces_nodes(hist, a_nc.detach() if detach_nc else a_nc, wall_n, wall_c)
             f_c = phi_c.sum(1)
             tau_c = _cross(aux["r_c"], phi_c).sum(1)
             aux.update(phi_c=phi_c, c_w=c_w, v_node=hist[-1] - hist[-2])
