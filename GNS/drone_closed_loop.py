@@ -420,10 +420,21 @@ def evaluate_closed_loop(model, cfg_true, gs, n_runs=6, seed=1234, kinds=("tap",
 
 
 def gen_settings_for(meta, **overrides):
-    """GenSettings matching the training data (mu, k_rotor from its metadata)."""
-    gs = MG.GenSettings()
+    """GenSettings matching the training data. Data generated with the current
+    generator records its settings (meta["gen_settings"]); older data does not,
+    and then the generator's current defaults are used (with a warning), plus
+    mu and k_rotor from the metadata. overrides (e.g. wind_max from the run
+    file) win over both."""
+    known = {f.name for f in dataclasses.fields(MG.GenSettings)}
+    saved = (meta or {}).get("gen_settings")
+    if saved:
+        gs = MG.GenSettings(**{k: v for k, v in saved.items() if k in known})
+    else:
+        gs = MG.GenSettings()
+        print("  note: the training data does not record its generator settings; the closed-loop "
+              "scenarios use mujoco_drone_generator.GenSettings defaults, except wind, which matches the training data")
     upd = {k: meta[k] for k in ("mu", "k_rotor") if meta and k in meta}
-    upd.update(overrides)
+    upd.update({k: v for k, v in overrides.items() if v is not None})
     return dataclasses.replace(gs, **upd)
 
 

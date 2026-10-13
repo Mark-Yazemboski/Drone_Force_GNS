@@ -17,7 +17,7 @@ from plot_training_history import plot_loss_history
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------- data ----------------
-trajectory_folder = os.path.join(script_dir, "data/mj_drone_100hz")
+trajectory_folder = os.path.join(script_dir, "data/mj_drone")
 # Fixed split of 500 trajectories: 0-299 training pool, 300-399 validation, 400-499 test.
 # Val and test never change, so every run (and every ablation) is scored on the same
 # data. N_train picks how much of the pool to train on; smaller runs use the first
@@ -47,8 +47,8 @@ settings = DroneTrainSettings(
     # and repeats of those steps (same weights). Total rounds = steps x repeats.
     aero_latent_dim=128, aero_mlp_layers=2, aero_msg_passing_steps=4, aero_msg_passing_repeats=1,
     contact_latent_dim=128, contact_mlp_layers=2, contact_msg_passing_steps=3, contact_msg_passing_repeats=1,
-    contact_d0=0.0045, contact_tau=0.001,   # gate: pad sphere radius 4 mm + margin
-    contact_dist_clamp=(-0.01, 0.02),        # contact GNN's wall-distance input clamped to this range (m)
+    contact_d0=0.006, contact_tau=0.0015,   # gate: pad sphere radius 4 mm + margin
+    contact_dist_clamp=(-0.05, 0.5),        # contact GNN's wall-distance input clamped to this range (m)
     aero_dist_max=1.0,                      # rotor-to-wall distance input clamped/scaled by this (m)
 
     # ---- physical coefficients (learned in stage 1, frozen in stage 2) ----
@@ -63,7 +63,7 @@ settings = DroneTrainSettings(
     k_pad_init=0.05,                # pad drag    k_pad * |u| u
 
     # ---- windows / batches ----
-    multistep=4, batch_size=1024,
+    multistep=4, batch_size=256,
     eval_batch_size=2048,           # no-grad passes only (stats, refit, validation): speed, not results
     aero_min_pad_dist=0.026,        # stage-1 windows: pad stays > 2.6 cm from the wall throughout
     contact_max_pad_dist=0.05,      # stage-2 windows: pad comes within 5 cm at some frame (None = all)
@@ -71,18 +71,18 @@ settings = DroneTrainSettings(
     rotate_aug=True,
 
     # ---- stage 1: aero (contact-free windows) ----
-    aero_epochs=200, aero_lr=6e-4,
+    aero_epochs=200, aero_lr=3e-4,
     w_aero_anchor=0.1,              # each aero node toward its drag law (shapes the network)
     w_aero_coeff_fit=0.01,          # only used with drag_coeff_fit="gradient"
     w_aero_smooth=0.01,             # aero force smooth in time
     w_axial=0.1,                    # rotor axial thrust correction toward zero
     w_prior=1e-3,                   # k_f, k_m toward thrust-stand values
-    coeff_lr=4e-3,                  # learning rate for k's (stage 1) and mu (stage 2)
+    coeff_lr=1e-3,                  # learning rate for k's (stage 1) and mu (stage 2)
     coeff_warmup_epochs=10,         # k's and mu held fixed for the first 10 epochs of their stage (capped at half)
     lr_schedule="cosine",           # network lr decays to 0 over each stage (None = constant)
 
     # ---- stage 2: contact (near-wall windows, aero frozen) ----
-    contact_epochs=400, contact_lr=2e-4,
+    contact_epochs=300, contact_lr=1e-4,
     w_fric_dir=1.0, w_fric_mag=1.0, w_fric_cone=1.0,
     mu_init=0.3, learn_mu=True,
 
@@ -105,10 +105,10 @@ Visualize_model = True              # time-series PNGs and GIFs of the first few
 Save_run_report = True
 
 # Closed-loop evaluation: fresh scenarios flown with MuJoCo and with the model as the plant.
-N_closed_loop = 30
+N_closed_loop = 12
 closed_loop_kinds = ("tap", "push", "slide")   # cycled through; None = the generator's mix
 closed_loop_seed = 1234                         # same seed -> same scenarios across runs, so runs compare
-N_visualize = 9                                 # PNG + GIF for the first N closed-loop runs
+N_visualize = 6                                 # PNG + GIF for the first N closed-loop runs
 sanity_check = True                             # also fly the first push with the contact network off
 gif_stride = 3                                  # draw every 3rd frame (100 Hz data -> ~33 fps GIF)
 
@@ -124,6 +124,12 @@ if __name__ == "__main__":
         #   train_drone_force_model(drone, settings, train, val, save_model_path, stages=("contact",),
         #                           init_checkpoint=save_model_path.replace(".pt", "_aero_best.pt"))
         train_drone_force_model(drone, settings, train, val, save_model_path)
+
+    # The closed-loop scenarios always use the same wind as the training data: the
+    # generator's recorded wind_max, or (older data) the largest per-trajectory mean wind.
+    wind_max = max(float(d["wind"].mean(0).norm()) for d in train)
+    closed_loop_wind_max = meta.get("gen_settings", {}).get("wind_max", round(wind_max, 1))
+    print(f"training data mean wind up to {wind_max:.2f} m/s -> closed-loop scenarios use wind_max {closed_loop_wind_max:g} m/s")
 
     final_path = save_model_path.replace(".pt", "_final.pt")
     history_path = save_model_path.replace(".pt", "_history.pt")
@@ -142,7 +148,7 @@ if __name__ == "__main__":
             final_path, test, meta, os.path.join(model_folder_path, "figures"),
             n_closed_loop=N_closed_loop, closed_loop_kinds=closed_loop_kinds, closed_loop_seed=closed_loop_seed,
             n_visualize=N_visualize if Visualize_model else 0, make_gifs=Visualize_model, gif_stride=gif_stride,
-            sanity_check=sanity_check))
+            sanity_check=sanity_check, data_wind_max=closed_loop_wind_max))
 
     if Save_run_report:
         history = torch.load(history_path, weights_only=False)
@@ -150,7 +156,6 @@ if __name__ == "__main__":
         metrics.update(eval_metrics)
         # Every DroneTrainSettings field (contact_dist_clamp, gate, loss weights...) and
         # every DroneConfig field is written automatically. These add what the data was.
-        wind_max = max(float(d["wind"].norm(dim=1).max()) for d in train)
         save_drone_run_report(model_folder_path, run_name, master_csv, settings, drone, metrics,
                               extra_settings={"data.folder": trajectory_folder,
                                               "data.train_range": f"{train_range.start}-{train_range.stop - 1}",
@@ -162,4 +167,5 @@ if __name__ == "__main__":
                                               "data.wind_max_mps": round(wind_max, 3),
                                               "eval.n_closed_loop": N_closed_loop,
                                               "eval.closed_loop_kinds": ",".join(closed_loop_kinds or ()),
-                                              "eval.closed_loop_seed": closed_loop_seed})
+                                              "eval.closed_loop_seed": closed_loop_seed,
+                                              "eval.closed_loop_wind_max": closed_loop_wind_max})

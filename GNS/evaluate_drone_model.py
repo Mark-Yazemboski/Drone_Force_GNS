@@ -25,7 +25,8 @@ from visualize_drone_model import plot_closed_loop, animate_closed_loop
 
 def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
                        closed_loop_kinds=("tap", "push", "slide"), closed_loop_seed=1234,
-                       n_visualize=3, make_gifs=True, gif_stride=3, sanity_check=True, device="cpu"):
+                       n_visualize=3, make_gifs=True, gif_stride=3, sanity_check=True, device="cpu",
+                       data_wind_max=None):
     model, cfg, s, ck = load_checkpoint(model_path, device)
     phys = _make_phys(cfg, s).to(device)
     phys.load_state_dict(ck["phys"])
@@ -57,8 +58,14 @@ def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
             print(f"  aero force: RMSE {test['force_aero_err']:.4f} N (label RMS {test['force_aero_ref']:.4f} N)")
 
     if n_closed_loop:
-        gs = gen_settings_for(meta)
-        print(f"\nclosed loop: {n_closed_loop} scenarios, same controller with MuJoCo and with the model as plant")
+        # Closed-loop wind always matches the data: the caller passes the training
+        # data's wind; if not given, the largest per-trajectory mean wind in the test set.
+        if data_wind_max is None:
+            data_wind_max = round(max((float(d["wind"].mean(0).norm()) for d in test_data), default=0.0), 1)
+        gs = gen_settings_for(meta, wind_max=data_wind_max)
+        metrics["closed_loop_wind_max_mps"] = float(gs.wind_max)
+        print(f"\nclosed loop: {n_closed_loop} scenarios, same controller with MuJoCo and with the model as plant "
+              f"(mean wind up to {gs.wind_max:g} m/s)")
         results, avg = evaluate_closed_loop(model, cfg, gs, n_runs=n_closed_loop, seed=closed_loop_seed,
                                             kinds=closed_loop_kinds, device=device)
         metrics.update({f"closed_loop_{k}": v for k, v in avg.items()})

@@ -73,6 +73,9 @@ STABILITY NOTES (learned building this; they apply to hardware too)
     the yaw error), can out-torque it, so push forces are capped from a yaw budget.
 
 Run:  python mujoco_drone_generator.py --out data/mj_drone --n 300
+      python mujoco_drone_generator.py --out data/mj_drone_wind --n 500 --wind-max 5 --gust-std 0.4
+      (use the flags for wind; don't edit the GenSettings defaults, the closed-loop
+       test falls back to them for data generated before settings were recorded)
       python mujoco_drone_generator.py --out data/mj_drone --n 5 --verify
       python mujoco_drone_generator.py --replay data/mj_drone/3.pt   (viewer)
 On ROAR, split with --start (array task index * n) so seeds never overlap.
@@ -109,7 +112,7 @@ class GenSettings:
     # well under a degree. A larger time constant mimics a rubber pad, which
     # spreads load over several nodes. Match the real pad.
     pad_solref: tuple = (0.004, 1.0)
-    wind_max: float = 5             # m/s mean wind
+    wind_max: float = 0             # m/s mean wind
     gust_std: float = 0             # m/s
     excite_max: float = 0.04        # max relative rotor-command noise
     tilted_wall_prob: float = 0
@@ -615,7 +618,7 @@ def simulate_trajectory(model, cfg_true, gs, rng, pulse=None):
                         k_f=cfg_true.k_f, k_m=cfg_true.k_m, mu=gs.mu, k_rotor=gs.k_rotor,
                         scenario=kind, wind_mean=w_mean.tolist(), excitation=ex_sig,
                         wall_tilt_deg=math.degrees(beta), yaw_offset_deg=math.degrees(yo),
-                        aero_label_source=plant.qfrc_fluid, **ctrl.gains)
+                        aero_label_source=plant.qfrc_fluid, gen_settings=dataclasses.asdict(gs), **ctrl.gains)
     return traj
 
 
@@ -718,8 +721,15 @@ if __name__ == "__main__":
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--replay", default=None, help="path to a saved .pt to play back in the viewer")
     ap.add_argument("--speed", type=float, default=1.0)
+    ap.add_argument("--wind-max", type=float, default=None, help="mean wind, m/s (default: GenSettings.wind_max)")
+    ap.add_argument("--gust-std", type=float, default=None, help="gust std, m/s (default: GenSettings.gust_std)")
     a = ap.parse_args()
     if a.replay:
         replay(a.replay, a.speed)
     else:
-        generate(a.out, a.n, a.start, a.seed, verify=a.verify)
+        gs = GenSettings()
+        if a.wind_max is not None:
+            gs = dataclasses.replace(gs, wind_max=a.wind_max)
+        if a.gust_std is not None:
+            gs = dataclasses.replace(gs, gust_std=a.gust_std)
+        generate(a.out, a.n, a.start, a.seed, gs=gs, verify=a.verify)
