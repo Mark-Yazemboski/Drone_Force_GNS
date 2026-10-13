@@ -1,6 +1,7 @@
 """Figures and animations for closed-loop evaluation (see drone_closed_loop.py).
 
-plot_closed_loop()     time series for one scenario, phases shaded:
+plot_closed_loop()     time series for one scenario, phases shaded (also used for the
+                       open-loop runs, mode="open loop"):
                          1. closest pad node to the wall (MuJoCo vs model)
                          2. contact normal force: MuJoCo label, one-step model, closed-loop model
                          3. friction (tangential magnitude), with mu x normal for reference
@@ -37,6 +38,7 @@ PHASE_COLORS = {0: "white", 1: "#dbe9f6", 2: "#f6dbdb", 3: "#f6eedb", 4: "#e2f6d
 C_TRUE, C_ONE, C_CL = "#2C2C2A", "#378ADD", "#D85A30"         # MuJoCo, one-step model, closed-loop model
 C_NORMAL, C_FRIC, C_AERO = "#2ca02c", "#ff7f0e", "#d62798"
 C_DRONE_TRUE, C_DRONE_PRED = "#888780", "#185FA5"
+C_OFF = "#9a9890"                                                # model with the contact network off
 
 
 def _pad_nodes(cfg):
@@ -81,58 +83,88 @@ def _full_range(*traces, floor=1.0):
     return max(floor, 1.1 * float(vals.max())) if vals.size else floor
 
 
-def plot_closed_loop(res, cfg, path, title=None):
-    sc, true, pred, one = res["scenario"], res["true"], res["pred"], res["one_step"]
+def plot_closed_loop(res, cfg, path, title=None, mode="closed loop"):
+    """mode: "closed loop" or "open loop" (drone_open_loop.py). Optional entries of res:
+    one_step (one-step model forces along the MuJoCo run; None for open loop) and
+    contact_off (the same run with the contact network switched off). Open loop puts
+    the pad error on a log axis (the growth is exponential) with 1 cm / 5 cm lines."""
+    sc, true, pred = res["scenario"], res["true"], res["pred"]
+    one, off = res.get("one_step"), res.get("contact_off")
     n, wp = sc["n"], sc["wall_point"]
     dt = cfg.dt
     Tt, Tp = true["n_frames"], pred["n_frames"]
     tt, tp = np.arange(Tt) * dt, np.arange(Tp) * dt
     T = min(Tt, Tp)
-    m = res["metrics"]
+    lab = f"model, {mode}"
 
     fig, ax = plt.subplots(5, 1, figsize=(10, 11), sharex=True)
     for a in ax:
         _shade(a, true["phase"], dt)
 
     ax[0].plot(tt, 1e3 * _wall_dist(true, cfg, n, wp), color=C_TRUE, label="MuJoCo")
-    ax[0].plot(tp, 1e3 * _wall_dist(pred, cfg, n, wp), color=C_CL, label="model, closed loop")
+    ax[0].plot(tp, 1e3 * _wall_dist(pred, cfg, n, wp), color=C_CL, label=lab)
+    if off is not None:
+        ax[0].plot(np.arange(off["n_frames"]) * dt, 1e3 * _wall_dist(off, cfg, n, wp), color=C_OFF, lw=1.0,
+                   ls="--", label="model, contact network off")
     ax[0].axhline(1e3 * cfg.pad_contact_radius, color="k", lw=0.6, ls=":")
     ax[0].set_ylim(-5, 120)
     ax[0].set_ylabel("closest pad node\nto wall (mm)")
 
-    ax[1].plot(tt, true["F_contact"] @ n, color=C_TRUE, label="MuJoCo label")
-    ax[1].plot(tt, one["F_contact"] @ n, color=C_ONE, lw=1.0, label="model, one step")
-    ax[1].plot(tp, pred["F_contact"] @ n, color=C_CL, lw=1.0, label="model, closed loop")
+    Fn = [true["F_contact"] @ n, pred["F_contact"] @ n]
+    ax[1].plot(tt, Fn[0], color=C_TRUE, label="MuJoCo label")
+    if one is not None:
+        Fn.append(one["F_contact"] @ n)
+        ax[1].plot(tt, Fn[-1], color=C_ONE, lw=1.0, label="model, one step")
+    ax[1].plot(tp, Fn[1], color=C_CL, lw=1.0, label=lab)
     ax[1].set_ylabel("normal contact\nforce (N, symlog)")
-    _force_axis(ax[1], _full_range(true["F_contact"] @ n, one["F_contact"] @ n, pred["F_contact"] @ n))
+    _force_axis(ax[1], _full_range(*Fn))
 
-    ax[2].plot(tt, _tangential(true["F_contact"], n), color=C_TRUE)
-    ax[2].plot(tt, _tangential(one["F_contact"], n), color=C_ONE, lw=1.0)
-    ax[2].plot(tp, _tangential(pred["F_contact"], n), color=C_CL, lw=1.0)
+    Ft = [_tangential(true["F_contact"], n), _tangential(pred["F_contact"], n)]
+    ax[2].plot(tt, Ft[0], color=C_TRUE)
+    if one is not None:
+        Ft.append(_tangential(one["F_contact"], n))
+        ax[2].plot(tt, Ft[-1], color=C_ONE, lw=1.0)
+    ax[2].plot(tp, Ft[1], color=C_CL, lw=1.0)
     mu = res.get("mu_true")
     if mu:
         ax[2].plot(tt, mu * np.maximum(true["F_contact"] @ n, 0), ":", color=C_TRUE, lw=0.8, label=f"mu x normal (mu={mu:g})")
         ax[2].legend(loc="upper right", fontsize=8)
     ax[2].set_ylabel("friction (N, symlog)")
-    _force_axis(ax[2], _full_range(_tangential(true["F_contact"], n), _tangential(one["F_contact"], n),
-                                      _tangential(pred["F_contact"], n), floor=0.3))
+    _force_axis(ax[2], _full_range(*Ft, floor=0.3))
 
     ax[3].plot(tt, np.linalg.norm(true["F_aero"], axis=1), color=C_TRUE)
-    ax[3].plot(tt, np.linalg.norm(one["F_aero"], axis=1), color=C_ONE, lw=1.0)
+    if one is not None:
+        ax[3].plot(tt, np.linalg.norm(one["F_aero"], axis=1), color=C_ONE, lw=1.0)
     ax[3].plot(tp, np.linalg.norm(pred["F_aero"], axis=1), color=C_CL, lw=1.0)
     ax[3].set_ylabel("aero force (N)")
 
-    err = 1e3 * np.linalg.norm(pad_center_positions(true, cfg)[:T] - pad_center_positions(pred, cfg)[:T], axis=1)
-    ax[4].plot(tp[:T], err, color=C_CL)
-    ax[4].set_ylabel("pad position\nerror (mm)")
-    ax[4].set_xlabel("time (s)")
+    pc_true = pad_center_positions(true, cfg)
+    err = 1e3 * np.linalg.norm(pc_true[:T] - pad_center_positions(pred, cfg)[:T], axis=1)
+    ax[4].plot(tp[:T], np.maximum(err, 1e-3) if mode == "open loop" else err, color=C_CL)
+    if off is not None:
+        To = min(Tt, off["n_frames"])
+        e_off = 1e3 * np.linalg.norm(pc_true[:To] - pad_center_positions(off, cfg)[:To], axis=1)
+        ax[4].plot(np.arange(To) * dt, np.maximum(e_off, 1e-3), color=C_OFF, lw=1.0, ls="--")
+    if mode == "open loop":
+        ax[4].set_yscale("log")
+        for thr in (10, 50):
+            ax[4].axhline(thr, color="k", ls=":", lw=0.8)
+        ax[4].set_ylim(1e-2, 400)
+        ax[4].set_ylabel("pad position\nerror (mm, log)")
+    else:
+        ax[4].set_ylabel("pad position\nerror (mm)")
+    ax[4].set_xlabel("time since start (s)" if mode == "open loop" else "time (s)")
 
+    h0, l0 = ax[0].get_legend_handles_labels()
     h1, l1 = ax[1].get_legend_handles_labels()
-    ax[0].legend(h1, l1, loc="upper right", fontsize=8, ncol=3)
-    status = "" if pred["completed"] else f"  MODEL RUN STOPPED: {pred['crash']}"
-    fig.suptitle(title or (f"{sc['kind']} | pad err mean {m['pad_err_mean_mm']:.1f} mm, in contact "
-                           f"{m['pad_err_contact_mm']:.1f} mm | contact onset err {m['contact_onset_err_ms']:.0f} ms"
-                           + status), fontsize=10)
+    extra = [(h, l) for h, l in zip(h1, l1) if l == "model, one step"]
+    ax[0].legend(h0 + [h for h, _ in extra], l0 + [l for _, l in extra], loc="upper right", fontsize=8, ncol=2)
+    if title is None:
+        m = res["metrics"]
+        status = "" if pred.get("completed", True) else f"  MODEL RUN STOPPED: {pred.get('crash')}"
+        title = (f"{sc['kind']} | pad err mean {m['pad_err_mean_mm']:.1f} mm, in contact "
+                 f"{m['pad_err_contact_mm']:.1f} mm | contact onset err {m['contact_onset_err_ms']:.0f} ms" + status)
+    fig.suptitle(title, fontsize=10)
     fig.tight_layout()
     fig.savefig(path, dpi=110)
     plt.close(fig)

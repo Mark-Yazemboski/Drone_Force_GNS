@@ -20,7 +20,8 @@ Reported per start kind, contact on / off:
     pass it count as the full horizon, so the median is a lower bound), pad error at
     0.5 / 1 / 2 s (median), and the fraction of runs cut off by the crash limits.
 Figures: pad error vs time on a log axis (one panel per start kind; exponential
-growth is a straight line), and a GIF per start kind in the closed-loop style.
+growth is a straight line), and per start kind a time-series PNG and a GIF in the
+closed-loop style (the PNG also shows the contact-network-off run, dashed).
 
 All starts are rolled out together as one batch.
 """
@@ -155,7 +156,7 @@ def _time_to(err, thr, dt, horizon_s):
 
 
 def evaluate_open_loop(model, cfg, data, out_folder, horizon_s=2.0, n_gifs=4, gif_stride=3, device="cpu",
-                       max_pad_err_m=0.30, max_tilt_deg=60.0, verbose=True):
+                       max_pad_err_m=0.30, max_tilt_deg=60.0, verbose=True, mu_true=None):
     import matplotlib
     if not os.environ.get("DISPLAY") and os.name != "nt":
         matplotlib.use("Agg")
@@ -246,20 +247,37 @@ def evaluate_open_loop(model, cfg, data, out_folder, horizon_s=2.0, n_gifs=4, gi
     if verbose:
         print(f"  saved {os.path.basename(fig_path)}")
 
-    # ---- one GIF per start kind (the first test trajectory that has that start; same trajectories every run) ----
+    # ---- per start kind: a time-series PNG (like the closed-loop ones) and a GIF, ----
+    # ---- for the first test trajectory that has that start (same ones every run) ----
+    from visualize_drone_model import plot_closed_loop
     made = 0
     for kind in kinds:
-        if made >= n_gifs:
-            break
         i = next(i for i, r in enumerate(runs) if r["kind"] == kind)
-        r, pred = runs[i], res[True][i]
-        tr = _truth_slice(r["d"], r["start"], pred["n_frames"])
-        sc = dict(n=r["d"]["wall_n"].double().numpy(), wall_point=r["d"]["wall_c"].double().numpy(),
-                  kind=r["d"].get("scenario", "?"))
-        path = os.path.join(out_folder, f"open_loop_{kind}_traj{r['d'].get('traj_id', i)}.gif")
-        animate_closed_loop(dict(scenario=sc, true=tr, pred=pred, one_step=None), cfg, path, stride=gif_stride,
-                            mode="open loop")
-        made += 1
+        r, pred, off = runs[i], res[True][i], res[False][i]
+        d = r["d"]
+        sc = dict(n=d["wall_n"].double().numpy(), wall_point=d["wall_c"].double().numpy(),
+                  kind=d.get("scenario", "?"))
+        tid = d.get("traj_id", i)
+        stem = os.path.join(out_folder, f"open_loop_{kind}_traj{tid}")
+        tr_full = _truth_slice(d, r["start"], min(H + 1, d["T"] - r["start"]))   # MuJoCo over the whole horizon
+        err = _pad_error(pred, tr_full, cfg)
+        err_off = _pad_error(off, tr_full, cfg)
+        t1, t5 = _time_to(err, 0.01, dt, horizon_s)[0], _time_to(err, 0.05, dt, horizon_s)[0]
+        o1, o5 = _time_to(err_off, 0.01, dt, horizon_s)[0], _time_to(err_off, 0.05, dt, horizon_s)[0]
+        at = lambda e, ts: f"{1e3 * e[int(round(ts / dt))]:.1f}" if int(round(ts / dt)) < len(e) else "cut"
+        title = (f"open loop, start {kind.replace('_', ' ')} | trajectory {tid} ({sc['kind']}), frame {r['start']}\n"
+                 f"time to 1 cm / 5 cm: model {t1:.2f} / {t5:.2f} s, contact network off {o1:.2f} / {o5:.2f} s | "
+                 f"pad error at 0.5 / 1 s: {at(err, 0.5)} / {at(err, 1.0)} mm"
+                 + ("  | MODEL RUN STOPPED: crash limit" if pred["crashed"] else ""))
+        plot_closed_loop(dict(scenario=sc, true=tr_full, pred=pred, one_step=None, contact_off=off,
+                              mu_true=mu_true), cfg, stem + ".png", title=title, mode="open loop")
+        gif = made < n_gifs
+        if gif:
+            tr = _truth_slice(d, r["start"], pred["n_frames"])
+            animate_closed_loop(dict(scenario=sc, true=tr, pred=pred, one_step=None), cfg, stem + ".gif",
+                                stride=gif_stride, mode="open loop")
+            made += 1
         if verbose:
-            print(f"  saved {os.path.basename(path)}" + ("  (crash limit reached)" if pred["crashed"] else ""))
+            print(f"  saved {os.path.basename(stem)}.png" + (" and .gif" if gif else "")
+                  + ("  (crash limit reached)" if pred["crashed"] else ""))
     return metrics

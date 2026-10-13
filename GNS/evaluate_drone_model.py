@@ -118,5 +118,5 @@ def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
         from drone_open_loop import evaluate_open_loop
         metrics.update(evaluate_open_loop(model, cfg, test_data, out_folder, horizon_s=open_loop_horizon_s,
                                           n_gifs=n_open_loop_gifs if make_gifs else 0, gif_stride=gif_stride,
-                                          device=device))
+                                          device=device, mu_true=meta.get("mu") if meta else None))
     return metrics
