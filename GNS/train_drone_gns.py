@@ -309,7 +309,7 @@ def fit_drag_coefficients(model, data, index, s, device, target):
             A_rows.append(A_F)
             y_rows.append(torch.einsum('bji,bj->bi', R_h[-1], res_w))         # body frame
         else:
-            a = model.aero_forces(com_h[-2], com_h[-1], R_h[-2], R_h[-1], omega, wind, b["wall_n"], b["wall_c"])
+            a = model.aero_forces(com_h, R_h, omega, wind, b["wall_n"], b["wall_c"])
             A_T = torch.linalg.cross(r_b.unsqueeze(-1).expand_as(basis), basis, dim=2).sum(1) / L
             A_rows.append(torch.cat([A_F, A_T], 1))
             y_rows.append(torch.cat([a["f_drag"].sum(1), torch.linalg.cross(r_b.expand_as(a["f_drag"]),

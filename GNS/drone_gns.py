@@ -315,7 +315,10 @@ class DroneForceModel(nn.Module):
         u_b = torch.einsum('bji,bnj->bni', R_curr, wind.unsqueeze(1) - vel)
         return u_b, r
 
-    def aero_forces(self, com_prev, com_curr, R_prev, R_curr, omega, wind, wall_n, wall_c):
+    # Aero GNN. com_hist, R_hist: the last h+1 COM positions (B,3) and attitudes (B,3,3), oldest
+    # first (a list, or a tensor with history as the first dimension); only the last two are used.
+    def aero_forces(self, com_hist, R_hist, omega, wind, wall_n, wall_c):
+        com_prev, com_curr, R_prev, R_curr = com_hist[-2], com_hist[-1], R_hist[-2], R_hist[-1]
         B = com_curr.shape[0]
         u_b, r = self.aero_airspeed(com_prev, com_curr, R_prev, R_curr, wind)
         un = u_b.norm(dim=-1, keepdim=True)
@@ -388,7 +391,8 @@ class DroneForceModel(nn.Module):
     #   alpha_nc = J_w^-1 (tau_nc - w x J_w w),  J_w = R J R^T   angular, world frame
     # f_nc, tau_nc: thrust_wrench() + aero_forces()["F"/"tau"] (no gravity). All per-step
     # units (m/step^2, rad/step^2; multiply SI accelerations by dt^2).
-    def noncontact_com_accel(self, f_nc, tau_nc, R_prev, R_curr):
+    def noncontact_com_accel(self, f_nc, tau_nc, R_hist):
+        R_prev, R_curr = R_hist[-2], R_hist[-1]
         w_step = so3_log(R_curr @ R_prev.transpose(-1, -2))
         return f_nc + self.g_step, angular_accel(tau_nc, w_step, R_curr, self.J_body)
 
@@ -431,14 +435,14 @@ class DroneForceModel(nn.Module):
         com_prev, com_curr = com_hist[-2], com_hist[-1]
         R_prev, R_curr = R_hist[-2], R_hist[-1]
         f_thr, tau_thr = self.thrust_wrench(omega, R_curr)
-        aero = self.aero_forces(com_prev, com_curr, R_prev, R_curr, omega, wind, wall_n, wall_c)
+        aero = self.aero_forces(com_hist, R_hist, omega, wind, wall_n, wall_c)
         out = dict(f_thr=f_thr, tau_thr=tau_thr, aero=aero,
                    f_nc=f_thr + aero["F"], tau_nc=tau_thr + aero["tau"])
         if need_contact_inputs:
             w_step = so3_log(R_curr @ R_prev.transpose(-1, -2))
             r_c = torch.einsum('bij,nj->bni', R_curr, self.contact_rest)
             out["r_c"] = r_c
-            a_com, alpha = self.noncontact_com_accel(out["f_nc"], out["tau_nc"], R_prev, R_curr)
+            a_com, alpha = self.noncontact_com_accel(out["f_nc"], out["tau_nc"], R_hist)
             out["a_nc"] = node_accel_from_com_accel(a_com, alpha, w_step, r_c)
             out["hist"] = [nodes_from_state(c, R, self.contact_rest) for c, R in zip(com_hist, R_hist)]
         return out
