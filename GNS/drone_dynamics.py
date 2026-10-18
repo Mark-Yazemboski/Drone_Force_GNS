@@ -66,15 +66,20 @@ def angular_accel(tau, w, R, J_body):
     return world_inertia_solve(R, J_body, tau - gyro)
 
 
-# Acceleration of every node of the rigid body under a given wrench.
-# f must already include gravity. r: (B,N,3) node lever arms from the COM, world frame.
-# a_i = f + alpha x r_i + w x (w x r_i)
-def node_accel_from_wrench(f, tau, w, R, J_body, r):
-    alpha = angular_accel(tau, w, R, J_body).unsqueeze(1)       # (B,1,3)
+# Acceleration of every node of the rigid body from the COM's linear and angular
+# acceleration (rigid-body kinematics):  a_i = a + alpha x r_i + w x (w x r_i)
+# a, alpha, w: (B,3) world frame, per-step units. r: (B,N,3) node lever arms from the COM.
+def node_accel_from_com_accel(a, alpha, w, r):
+    al = alpha.unsqueeze(1).expand_as(r)
     w_ = w.unsqueeze(1).expand_as(r)
-    return (f.unsqueeze(1)
-            + torch.linalg.cross(alpha.expand_as(r), r, dim=-1)
+    return (a.unsqueeze(1)
+            + torch.linalg.cross(al, r, dim=-1)
             + torch.linalg.cross(w_, torch.linalg.cross(w_, r, dim=-1), dim=-1))
+
+
+# The same from a wrench: f (specific force, must already include gravity) and tau.
+def node_accel_from_wrench(f, tau, w, R, J_body, r):
+    return node_accel_from_com_accel(f, angular_accel(tau, w, R, J_body), w, r)
 
 
 # One Newton-Euler step of the drone in per-step units: Verlet on the COM (same

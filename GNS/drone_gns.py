@@ -29,7 +29,7 @@ import torch.nn.functional as Fnn
 
 from force_gns import contact_weight, so3_log, nodes_from_state
 from drone_config import rotor_and_inertia_tensors, build_aero_graph, build_contact_graph, N_AERO_TYPES
-from drone_dynamics import rotor_wrench_body, node_accel_from_wrench, rigid_step_drone
+from drone_dynamics import rotor_wrench_body, node_accel_from_com_accel, angular_accel, rigid_step_drone
 from drone_normalization import Normalizer
 
 
@@ -383,25 +383,34 @@ class DroneForceModel(nn.Module):
         d = x_flat[ei[0]] - x_flat[ei[1]]
         return dyn.reshape(B * N, -1), static.reshape(B * N, -1), torch.cat([d, d.norm(dim=-1, keepdim=True)], -1)
 
+    # Non-contact acceleration of the COM, from the non-contact wrench:
+    #   a_nc     = f_nc + g                                  linear, gravity included
+    #   alpha_nc = J_w^-1 (tau_nc - w x J_w w),  J_w = R J R^T   angular, world frame
+    # f_nc, tau_nc: thrust_wrench() + aero_forces()["F"/"tau"] (no gravity). All per-step
+    # units (m/step^2, rad/step^2; multiply SI accelerations by dt^2).
+    def noncontact_com_accel(self, f_nc, tau_nc, R_prev, R_curr):
+        w_step = so3_log(R_curr @ R_prev.transpose(-1, -2))
+        return f_nc + self.g_step, angular_accel(tau_nc, w_step, R_curr, self.J_body)
+
     # Contact GNN from the COM state, the same kind of input as aero_forces():
-    #   com_hist, R_hist  the last h+1 COM positions (B,3) and attitudes (B,3,3), oldest first
-    #   f_nc, tau_nc      non-contact force and torque about the COM WITHOUT gravity, per-step
-    #                     units: thrust_wrench() + aero_forces()["F"/"tau"]
-    #   wall_n, wall_c    wall normal and a point on the wall (B,3)
+    #   com_hist, R_hist   the last h+1 COM positions (B,3) and attitudes (B,3,3), oldest first
+    #   a_nc, alpha_nc     the COM's non-contact linear (gravity included) and angular
+    #                      acceleration, world frame, per-step units (noncontact_com_accel())
+    #   wall_n, wall_c     wall normal and a point on the wall (B,3)
     # Inside: the contact-node positions x_i = p + R r_i at every pose (their differences are
-    # the node velocities), and each node's non-contact acceleration
-    # a_i = a + alpha x r_i + w x (w x r_i) with gravity at the COM; then the GNN.
+    # the node velocities), and each node's non-contact acceleration from rigid-body
+    # kinematics a_i = a_nc + alpha_nc x r_i + w x (w x r_i); then the GNN.
     # Returns phi (B,N,3) per-node contact force, gate (B,N,1), F (B,3) and tau (B,3) the net
-    # contact force and torque about the COM, r (B,N,3) the node lever arms; all per-step units
-    # (to_newtons() converts).
-    def contact_forces(self, com_hist, R_hist, f_nc, tau_nc, wall_n, wall_c):
+    # contact force and torque about the COM, r (B,N,3) the node lever arms, a_node (B,N,3)
+    # the node non-contact accelerations; all per-step units (to_newtons() converts forces).
+    def contact_forces(self, com_hist, R_hist, a_nc, alpha_nc, wall_n, wall_c):
         R_prev, R_curr = R_hist[-2], R_hist[-1]
         w_step = so3_log(R_curr @ R_prev.transpose(-1, -2))
         r_c = torch.einsum('bij,nj->bni', R_curr, self.contact_rest)
-        a_nc = node_accel_from_wrench(f_nc + self.g_step, tau_nc, w_step, R_curr, self.J_body, r_c)
+        a_node = node_accel_from_com_accel(a_nc, alpha_nc, w_step, r_c)
         hist = [nodes_from_state(c, R, self.contact_rest) for c, R in zip(com_hist, R_hist)]
-        phi_c, c_w = self._contact_forces_nodes(hist, a_nc, wall_n, wall_c)
-        return dict(phi=phi_c, gate=c_w, F=phi_c.sum(1), tau=_cross(r_c, phi_c).sum(1), r=r_c)
+        phi_c, c_w = self._contact_forces_nodes(hist, a_node, wall_n, wall_c)
+        return dict(phi=phi_c, gate=c_w, F=phi_c.sum(1), tau=_cross(r_c, phi_c).sum(1), r=r_c, a_node=a_node)
 
     # The same contact GNN from node-level inputs (node position history and per-node a_nc).
     # Used by step(), which already has these from noncontact().
@@ -429,8 +438,8 @@ class DroneForceModel(nn.Module):
             w_step = so3_log(R_curr @ R_prev.transpose(-1, -2))
             r_c = torch.einsum('bij,nj->bni', R_curr, self.contact_rest)
             out["r_c"] = r_c
-            out["a_nc"] = node_accel_from_wrench(out["f_nc"] + self.g_step, out["tau_nc"], w_step,
-                                                 R_curr, self.J_body, r_c)
+            a_com, alpha = self.noncontact_com_accel(out["f_nc"], out["tau_nc"], R_prev, R_curr)
+            out["a_nc"] = node_accel_from_com_accel(a_com, alpha, w_step, r_c)
             out["hist"] = [nodes_from_state(c, R, self.contact_rest) for c, R in zip(com_hist, R_hist)]
         return out
 

@@ -75,7 +75,7 @@ settings = DroneTrainSettings(
     # ---- stage 1: aero (contact-free windows) ----
     # Training length is in OPTIMIZER STEPS (same for every N_train); each stage prints the
     # equivalent epochs. 23,200 / 38,800 = 200 / 400 epochs at 300 trajectories, batch 1024.
-    aero_steps=23_200, aero_lr=6e-4,
+    aero_steps=23200, aero_lr=6e-4,
     w_aero_anchor=0.1,              # each aero node toward its drag law (shapes the network)
     w_aero_coeff_fit=0.01,          # only used with drag_coeff_fit="gradient"
     w_aero_smooth=0.01,             # aero force smooth in time
@@ -86,7 +86,7 @@ settings = DroneTrainSettings(
     lr_schedule="cosine",           # network lr decays to 0 over each stage (None = constant)
 
     # ---- stage 2: contact (near-wall windows, aero frozen) ----
-    contact_steps=38_800, contact_lr=2e-4,
+    contact_steps=38800, contact_lr=2e-4,
     w_fric_dir=1.0, w_fric_mag=1.0, w_fric_cone=1.0,
     mu_init=0.3, learn_mu=True,
 
