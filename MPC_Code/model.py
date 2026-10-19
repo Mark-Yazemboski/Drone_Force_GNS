@@ -17,13 +17,13 @@ from utilities import so3_log, so3_exp, quat_to_rot_matrix, rot_matrix_to_quat, 
 class Drone_Dynamics:
 
     # Initialize the drone dynamics model with the given model path.
-    def __init__(self, model_path, wall_normal_vector=None, wall_center_point=None):
-
-        self.wall_normal_vector = torch.as_tensor(wall_normal_vector, dtype=torch.float32, device=self.device)
-        self.wall_center_point  = torch.as_tensor(wall_center_point,  dtype=torch.float32, device=self.device)  
+    def __init__(self, model_path, wall_normal_vector=None, wall_center_point=None, wind_vector=None):
 
         #Set up the device and load the model.
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.wall_normal_vector = torch.as_tensor(wall_normal_vector, dtype=torch.float32, device=self.device)
+        self.wall_center_point  = torch.as_tensor(wall_center_point,  dtype=torch.float32, device=self.device)  
+        self.wind_vector = torch.as_tensor(wind_vector, dtype=torch.float32, device=self.device)
         self.model, self.cfg, self.settings, _ = load_checkpoint(model_path, self.device)
         self.model.eval()
 
@@ -176,14 +176,11 @@ class Drone_Dynamics:
         return new_state_vector, R_new
 
 
-    def propagate_state(self, state_vector, rotor_speeds, wind_vector=None):
+    def propagate_state(self, state_vector, rotor_speeds):
         #Propagates the state of the drone given the current state vector, rotor speeds, wall information, and optional wind vector.
         #State_vector: [COM_position, COM_velocity, Quaternion, Angular_velocity, Previous_velocity, Previous_angular_velocity]: 19 states
         #Returns the new state vector and the new rotation matrix after applying the dynamics for one time step.
         
-        #Initialize the wind vector to zero if it is not provided.
-        if wind_vector is None:
-            wind_vector = torch.zeros(3, device=self.device)
 
         #Extract the current COM position, velocity, quaternion, angular velocity, and previous velocities from the state vector.
         COM_position = state_vector[0:3]
@@ -217,7 +214,7 @@ class Drone_Dynamics:
 
         #unpack inputs, wind, wall normal, and wall center point for the model
         u = rotor_speeds.unsqueeze(0)
-        wind = wind_vector.unsqueeze(0)
+        wind = self.wind_vector.unsqueeze(0)
         n = self.wall_normal_vector.unsqueeze(0)
         p_wall = (self.wall_center_point - anchor).unsqueeze(0)
 
@@ -327,12 +324,12 @@ class Drone_Dynamics:
         return torch.cat([x[0:3] - x_nom[0:3], x[3:6] - x_nom[3:6], dth, x[10:13] - x_nom[10:13], x[13:16] - x_nom[13:16], x[16:19] - x_nom[16:19]])
 
 
-    def linearize(self, state_vector, rotor_speeds, wind_vector=None):
+    def linearize(self, state_vector, rotor_speeds):
         #This function linearizes the system dynamics around the current state and input.
 
         #Calculates the nominal next state and normal force without any perturbations.
         with torch.no_grad():
-            x_next_nom, R_next_nom, info_nom = self.propagate_state(state_vector, rotor_speeds, wind_vector)
+            x_next_nom, R_next_nom, info_nom = self.propagate_state(state_vector, rotor_speeds)
             
             normal_force_nom = info_nom["F_n"]
             pad_position_global_nom, pad_velocity_global_nom, rod_unit_vector_global_nom = self.get_pad_values(state_vector)
@@ -350,7 +347,7 @@ class Drone_Dynamics:
             perturbed_input = rotor_speeds + du
 
             #Propagate the perturbed state and input through the system dynamics.
-            x_next, R_next, info = self.propagate_state(perturbed_state, perturbed_input, wind_vector)
+            x_next, R_next, info = self.propagate_state(perturbed_state, perturbed_input)
             normal_force = info["F_n"]
             
             pad_position_global, pad_velocity_global, rod_unit_vector_global = self.get_pad_values(perturbed_state)
@@ -386,12 +383,12 @@ class Drone_Dynamics:
         #Return state space matrices and nominal next state and normal force.
         return A, B, C, D, x_next_nom, nominal_output
 
-    def rollout(self, initial_state_vector, input_sequence):
-        states = [initial_state_vector]
-        infos = []
-        x = initial_state_vector
-        for u in input_sequence:
-            x, R, info = self.propagate_state(x, u, self.wind_vector)
-            states.append(x)
-            infos.append(info)
-        return torch.stack(states), infos
+    # def rollout(self, initial_state_vector, input_sequence):
+    #     states = [initial_state_vector]
+    #     infos = []
+    #     x = initial_state_vector
+    #     for u in input_sequence:
+    #         x, R, info = self.propagate_state(x, u)
+    #         states.append(x)
+    #         infos.append(info)
+    #     return torch.stack(states), infos

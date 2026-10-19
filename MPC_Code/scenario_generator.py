@@ -20,3 +20,7 @@ class Trajectory_Generator:
         Wall_normal_vector = np.array([-np.cos(Wall_tilt), -np.sin(Wall_tilt), 0]).T
         
         return wind_vector, Wall_normal_vector, Wall_center_point
+
+    def interpolate(self, dt):
+
+        
