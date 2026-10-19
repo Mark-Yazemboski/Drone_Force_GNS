@@ -17,7 +17,10 @@ from utilities import so3_log, so3_exp, quat_to_rot_matrix, rot_matrix_to_quat, 
 class Drone_Dynamics:
 
     # Initialize the drone dynamics model with the given model path.
-    def __init__(self, model_path):
+    def __init__(self, model_path, wall_normal_vector=None, wall_center_point=None):
+
+        self.wall_normal_vector = torch.as_tensor(wall_normal_vector, dtype=torch.float32, device=self.device)
+        self.wall_center_point  = torch.as_tensor(wall_center_point,  dtype=torch.float32, device=self.device)  
 
         #Set up the device and load the model.
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -34,9 +37,36 @@ class Drone_Dynamics:
         self.hist = None
         print("Model loaded successfully.")
 
+        #looks at the geometry of the drone to compute the pad offset and rod unit vector in the body frame.
+        self.com_location   = torch.tensor(self.cfg.com_offset, dtype=torch.float32, device=self.device)
+        self.tip_location  = torch.tensor(self.cfg.rod_tip,    dtype=torch.float32, device=self.device)
+        self.rod_base_location = torch.tensor(self.cfg.rod_base,   dtype=torch.float32, device=self.device)
+        self.rotor_locations   = torch.tensor(np.asarray(self.cfg.rotor_pos) - self.cfg.com_offset, dtype=torch.float32, device=self.device)
+        self.spin_dirs   = np.asarray(self.cfg.spin_dir, float)
+        self.motor_kf = float(self.model.params.k_f)
+        self.motor_km = float(self.model.params.k_m)
 
-    def make_tensor(self, a):
-        return torch.as_tensor(np.asarray(a), dtype=torch.float32, device=self.device)
+        #Computes the pad offset and rod unit vector in the body frame.
+        self.pad_offset = self.tip_location - self.com_location
+        self.rod_unit   = (self.tip_location - self.rod_base_location) / (self.tip_location - self.rod_base_location).norm()
+
+        self.u_hover = self.calculate_hover_inputs()
+
+
+    def calculate_hover_inputs(self):
+
+        #extracts the x and y coordinates of the rotor locations in the body frame.
+        rotor_xs = self.rotor_locations[:, 0]
+        rotor_ys = self.rotor_locations[:, 1]
+
+        #Builds the thrust to torque mapping matrix for the quadrotor.
+        A = np.vstack([np.ones(4), rotor_ys, -rotor_xs, -self.spin_dirs * self.motor_km / self.motor_kf])
+
+        #Solves for the individual rotor thrusts required to achieve hover.
+        T = np.linalg.solve(A, [self.mass * self.cfg.gravity, 0.0, 0.0, 0.0])
+
+        #Converts the thrusts to rotor speeds using the motor's thrust coefficient.
+        return torch.tensor(np.sqrt(T / self.motor_kf), dtype=torch.float32, device=self.device)
 
     #---------------------------------- Calculate Forces ----------------------------------------
 
@@ -146,7 +176,7 @@ class Drone_Dynamics:
         return new_state_vector, R_new
 
 
-    def propagate_state(self, state_vector, rotor_speeds, wall_normal_vector, wall_center_point, wind_vector=None):
+    def propagate_state(self, state_vector, rotor_speeds, wind_vector=None):
         #Propagates the state of the drone given the current state vector, rotor speeds, wall information, and optional wind vector.
         #State_vector: [COM_position, COM_velocity, Quaternion, Angular_velocity, Previous_velocity, Previous_angular_velocity]: 19 states
         #Returns the new state vector and the new rotation matrix after applying the dynamics for one time step.
@@ -188,8 +218,8 @@ class Drone_Dynamics:
         #unpack inputs, wind, wall normal, and wall center point for the model
         u = rotor_speeds.unsqueeze(0)
         wind = wind_vector.unsqueeze(0)
-        n = wall_normal_vector.unsqueeze(0)
-        p_wall = (wall_center_point - anchor).unsqueeze(0)
+        n = self.wall_normal_vector.unsqueeze(0)
+        p_wall = (self.wall_center_point - anchor).unsqueeze(0)
 
 
         #------------------- CALCULATE FORCES -----------------------------
@@ -236,6 +266,42 @@ class Drone_Dynamics:
         
         return new_state_vector, R_new, info
 
+    def get_pad_values(self, state_vector):
+        #Function to compute the global positions and velocities of the drone's pads and the global direction of the rods.
+        #This is used to get values for the cost function
+        
+        #Exttracts the necessary components from the state vector: 
+        #center of mass position, velocity, quaternion, and angular velocity.
+        COM_position = state_vector[0:3]
+        COM_velocity = state_vector[3:6]
+        Quaternion = state_vector[6:10]
+        rotation_matrix = quat_to_rot_matrix(Quaternion)
+        Angular_velocity = state_vector[10:13]
+
+        #Compute the global positions and velocities of the pads and the global direction of the rod.
+        pad_position_global = COM_position + rotation_matrix @ self.pad_offset
+        pad_velocity_global = COM_velocity + torch.linalg.cross(Angular_velocity, rotation_matrix @ self.pad_offset)
+        rod_unit_vector_global = rotation_matrix @ self.rod_unit
+
+        return pad_position_global, pad_velocity_global, rod_unit_vector_global
+
+    def get_wall_distances(self, state_vector):
+        p = state_vector[0:3]
+        R = quat_to_rot_matrix(state_vector[6:10])
+        pad_pts   = p + (R @ self.model.pad_rest.T).T       # (9, 3)  pad nodes
+        rotor_pts = p + (R @ self.model.rotor_pos.T).T      # (4, 3)  rotor hubs
+        d_pad = ((pad_pts - self.wall_center_point) @ self.wall_normal_vector).min()
+        d_rotor = (rotor_pts - self.wall_center_point) @ self.wall_normal_vector    # (4,)
+        return d_pad, d_rotor
+
+    def get_tilt(self, state_vector):
+        R = quat_to_rot_matrix(state_vector[6:10])
+        roll  = torch.atan2(R[2, 1], R[2, 2])
+        pitch = torch.asin(-R[2, 0].clamp(-1, 1))
+        return roll, pitch
+
+
+
     def perturb(self, x, dx):
         #Function to perturb the state vector based on small deviations.
 
@@ -261,13 +327,20 @@ class Drone_Dynamics:
         return torch.cat([x[0:3] - x_nom[0:3], x[3:6] - x_nom[3:6], dth, x[10:13] - x_nom[10:13], x[13:16] - x_nom[13:16], x[16:19] - x_nom[16:19]])
 
 
-    def linearize(self, state_vector, rotor_speeds, wall_normal_vector, wall_center_point, wind_vector=None):
+    def linearize(self, state_vector, rotor_speeds, wind_vector=None):
         #This function linearizes the system dynamics around the current state and input.
 
         #Calculates the nominal next state and normal force without any perturbations.
         with torch.no_grad():
-            x_next_nom, R_next_nom, info_nom = self.propagate_state(state_vector, rotor_speeds, wall_normal_vector, wall_center_point, wind_vector)
-
+            x_next_nom, R_next_nom, info_nom = self.propagate_state(state_vector, rotor_speeds, wind_vector)
+            
+            normal_force_nom = info_nom["F_n"]
+            pad_position_global_nom, pad_velocity_global_nom, rod_unit_vector_global_nom = self.get_pad_values(state_vector)
+            roll_nom, pitch_nom = self.get_tilt(state_vector)
+            pad_distance_nom, rotor_distance_nom = self.get_wall_distances(state_vector)
+            nominal_output = torch.cat([normal_force_nom, roll_nom, pitch_nom, pad_position_global_nom, pad_velocity_global_nom, rod_unit_vector_global_nom, pad_distance_nom, rotor_distance_nom])
+        
+        
         def g(dx, du):
             #This function computes the deviation of the next state and the normal force from their nominal values 
             #given small perturbations in the current state and input. Its used in making the jacobian for linearization.
@@ -277,15 +350,32 @@ class Drone_Dynamics:
             perturbed_input = rotor_speeds + du
 
             #Propagate the perturbed state and input through the system dynamics.
-            x_next, R_next, info = self.propagate_state(perturbed_state, perturbed_input, wall_normal_vector, wall_center_point, wind_vector)
+            x_next, R_next, info = self.propagate_state(perturbed_state, perturbed_input, wind_vector)
+            normal_force = info["F_n"]
             
-            state_error = self.state_error(x_next, x_next_nom, R_next, R_next_nom)
-            info_diff = (info["F_n"] - info_nom["F_n"]).reshape(1)
+            pad_position_global, pad_velocity_global, rod_unit_vector_global = self.get_pad_values(perturbed_state)
+            roll, pitch = self.get_tilt(perturbed_state)
+            pad_distance, rotor_distance = self.get_wall_distances(perturbed_state)
+
+            roll_diff = roll - roll_nom
+            pitch_diff = pitch - pitch_nom
+            pad_pos_diff = pad_position_global - pad_position_global_nom
+            pad_vel_diff = pad_velocity_global - pad_velocity_global_nom
+            rod_unit_diff = rod_unit_vector_global - rod_unit_vector_global_nom
+            pad_dist_diff = pad_distance - pad_distance_nom
+            rotor_dist_diff = rotor_distance - rotor_distance_nom
+
+            state_diff = self.state_error(x_next, x_next_nom, R_next, R_next_nom)
+            normal_force_diff = (normal_force - normal_force_nom).reshape(1)
+
+
+
+            output_diff = torch.cat([normal_force_diff, roll_diff, pitch_diff, pad_pos_diff, pad_vel_diff, rod_unit_diff, pad_dist_diff, rotor_dist_diff])
             
-            return torch.cat([state_error, info_diff])
+            return torch.cat([state_diff, output_diff])
 
         #Compute the Jacobians of the function g with respect to the state and input deviations.
-        Jx, Ju = torch.autograd.functional.jacobian(g, (torch.zeros(18, device=self.device), torch.zeros(4, device=self.device)))
+        Jx, Ju = torch.autograd.functional.jacobian(g, (torch.zeros(18, device=self.device), torch.zeros(4, device=self.device)),vectorize=True)
 
         #Convert the Jacobians into the standard state space form.
         A = Jx[:18]
@@ -294,4 +384,14 @@ class Drone_Dynamics:
         D = Ju[18:]
 
         #Return state space matrices and nominal next state and normal force.
-        return A, B, C, D, x_next_nom, info_nom
+        return A, B, C, D, x_next_nom, nominal_output
+
+    def rollout(self, initial_state_vector, input_sequence):
+        states = [initial_state_vector]
+        infos = []
+        x = initial_state_vector
+        for u in input_sequence:
+            x, R, info = self.propagate_state(x, u, self.wind_vector)
+            states.append(x)
+            infos.append(info)
+        return torch.stack(states), infos
