@@ -263,6 +263,19 @@ class Drone_Dynamics:
         
         return new_state_vector, R_new, info
 
+    def propagate_multi(self, state_vector, rotor_speeds, M):
+        #Runs the model M times with the same input (zero-order hold over one MPC step)
+        F_n_sum = 0
+
+        #Runs the propagation M times so the model can effectivly do one MPC step using its internal timestep
+        for _ in range(M):
+            state_vector, R, info = self.propagate_state(state_vector, rotor_speeds)
+            F_n_sum = F_n_sum + info["F_n"]
+
+        #Computes the average normal force over the M propagation steps
+        avg_normal_force = F_n_sum / M
+        return state_vector, R, dict(info, F_n=avg_normal_force)
+
     def get_pad_values(self, state_vector):
         #Function to compute the global positions and velocities of the drone's pads and the global direction of the rods.
         #This is used to get values for the cost function
@@ -297,6 +310,18 @@ class Drone_Dynamics:
         pitch = torch.asin(-R[2, 0].clamp(-1, 1))
         return roll, pitch
 
+    def outputs(self, state_vector, normal_force):
+        #Packs every output the MPC needs into one vector (17 values):
+        #[F_n(1), roll(1), pitch(1), pad_pos(3), pad_vel(3), rod_unit(3), min_pad_dist(1), rotor_dist(4)]
+        pad_position_global, pad_velocity_global, rod_unit_vector_global = self.get_pad_values(state_vector)
+        roll, pitch = self.get_tilt(state_vector)
+        pad_distance, rotor_distance = self.get_wall_distances(state_vector)
+
+        #Scalars are reshaped to (1,) so torch.cat can join them with the vectors
+        return torch.cat([normal_force.reshape(1), roll.reshape(1), pitch.reshape(1),
+                          pad_position_global, pad_velocity_global, rod_unit_vector_global,
+                          pad_distance.reshape(1), rotor_distance])
+
 
 
     def perturb(self, x, dx):
@@ -324,71 +349,34 @@ class Drone_Dynamics:
         return torch.cat([x[0:3] - x_nom[0:3], x[3:6] - x_nom[3:6], dth, x[10:13] - x_nom[10:13], x[13:16] - x_nom[13:16], x[16:19] - x_nom[16:19]])
 
 
-    def linearize(self, state_vector, rotor_speeds):
+    def linearize(self, state_vector, rotor_speeds, MPC_dt_multiple):
         #This function linearizes the system dynamics around the current state and input.
 
-        #Calculates the nominal next state and normal force without any perturbations.
+        #Calculates the nominal next state and nominal outputs without any perturbations.
         with torch.no_grad():
-            x_next_nom, R_next_nom, info_nom = self.propagate_state(state_vector, rotor_speeds)
-            
-            normal_force_nom = info_nom["F_n"]
-            pad_position_global_nom, pad_velocity_global_nom, rod_unit_vector_global_nom = self.get_pad_values(state_vector)
-            roll_nom, pitch_nom = self.get_tilt(state_vector)
-            pad_distance_nom, rotor_distance_nom = self.get_wall_distances(state_vector)
-            nominal_output = torch.cat([normal_force_nom, roll_nom, pitch_nom, pad_position_global_nom, pad_velocity_global_nom, rod_unit_vector_global_nom, pad_distance_nom, rotor_distance_nom])
-        
-        
+            x_next_nom, R_next_nom, info_nom = self.propagate_multi(state_vector, rotor_speeds, MPC_dt_multiple)
+            nominal_output = self.outputs(state_vector, info_nom["F_n"])
+
         def g(dx, du):
-            #This function computes the deviation of the next state and the normal force from their nominal values 
-            #given small perturbations in the current state and input. Its used in making the jacobian for linearization.
+            #Deviation of the next state and the outputs from their nominal values,
+            #given small perturbations in the current state and input.
 
             #Perturb the state and input based on the provided deviations.
             perturbed_state = self.perturb(state_vector, dx)
             perturbed_input = rotor_speeds + du
 
             #Propagate the perturbed state and input through the system dynamics.
-            x_next, R_next, info = self.propagate_state(perturbed_state, perturbed_input)
-            normal_force = info["F_n"]
-            
-            pad_position_global, pad_velocity_global, rod_unit_vector_global = self.get_pad_values(perturbed_state)
-            roll, pitch = self.get_tilt(perturbed_state)
-            pad_distance, rotor_distance = self.get_wall_distances(perturbed_state)
-
-            roll_diff = roll - roll_nom
-            pitch_diff = pitch - pitch_nom
-            pad_pos_diff = pad_position_global - pad_position_global_nom
-            pad_vel_diff = pad_velocity_global - pad_velocity_global_nom
-            rod_unit_diff = rod_unit_vector_global - rod_unit_vector_global_nom
-            pad_dist_diff = pad_distance - pad_distance_nom
-            rotor_dist_diff = rotor_distance - rotor_distance_nom
+            x_next, R_next, info = self.propagate_multi(perturbed_state, perturbed_input, MPC_dt_multiple)
 
             state_diff = self.state_error(x_next, x_next_nom, R_next, R_next_nom)
-            normal_force_diff = (normal_force - normal_force_nom).reshape(1)
-
-
-
-            output_diff = torch.cat([normal_force_diff, roll_diff, pitch_diff, pad_pos_diff, pad_vel_diff, rod_unit_diff, pad_dist_diff, rotor_dist_diff])
-            
+            output_diff = self.outputs(perturbed_state, info["F_n"]) - nominal_output
             return torch.cat([state_diff, output_diff])
 
         #Compute the Jacobians of the function g with respect to the state and input deviations.
-        Jx, Ju = torch.autograd.functional.jacobian(g, (torch.zeros(18, device=self.device), torch.zeros(4, device=self.device)),vectorize=True)
+        Jx, Ju = torch.autograd.functional.jacobian(g, (torch.zeros(18, device=self.device), torch.zeros(4, device=self.device)), vectorize=True)
 
         #Convert the Jacobians into the standard state space form.
-        A = Jx[:18]
-        B = Ju[:18]
-        C = Jx[18:]
-        D = Ju[18:]
+        A, B, C, D = Jx[:18], Ju[:18], Jx[18:], Ju[18:]
 
-        #Return state space matrices and nominal next state and normal force.
+        #Return state space matrices, nominal next state, and nominal outputs.
         return A, B, C, D, x_next_nom, nominal_output
-
-    # def rollout(self, initial_state_vector, input_sequence):
-    #     states = [initial_state_vector]
-    #     infos = []
-    #     x = initial_state_vector
-    #     for u in input_sequence:
-    #         x, R, info = self.propagate_state(x, u)
-    #         states.append(x)
-    #         infos.append(info)
-    #     return torch.stack(states), infos

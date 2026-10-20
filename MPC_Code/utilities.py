@@ -41,6 +41,11 @@ def quat_to_rot_matrix(q):
             2 * (x * z - w * y),     2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
     ], dim=-1).reshape(q.shape[:-1] + (3, 3))
 
+def quat_error_map(q_nom):
+    w, u = q_nom[0], q_nom[1:4]
+    u_cross = np.array([[0, -u[2], u[1]], [u[2], 0, -u[0]], [-u[1], u[0], 0]])
+    return 0.5 * np.vstack([-u[None, :], w * np.eye(3) - u_cross])
+
 
 def rot_matrix_to_quat(R):
     # R: (..., 3, 3) -> (..., 4) [w, x, y, z]. Branch-free Shepperd-style: uses the largest
