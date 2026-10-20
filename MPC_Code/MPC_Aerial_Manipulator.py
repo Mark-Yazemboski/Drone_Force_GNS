@@ -207,8 +207,12 @@ simulation_dt = 0.01
 #Sets the dt at which the reference trajectory plan is generated
 Trajectory_plan_dt = 0.1  
 
+#Defines the ranges for the wall yaw angle and wind speed magnitude
+wall_yaw_range = (-np.pi/6, np.pi/6)
+wind_range = (0, 10)
+
 #Generates the reference trajectory given a trajectory length (seconds), maximum wall tilt, wind range, and the trajectory plan dt
-trajectory_generator = Trajectory_Generator(Wind_range=(0,10), Trajectory_length=200, max_wall_tilt=np.pi/6, Trajectory_plan_dt=Trajectory_plan_dt)  # Example parameters
+trajectory_generator = Trajectory_Generator(wind_range, wall_yaw_range, Trajectory_plan_dt)
 
 #Generates a reference trajectory based on the previously defined trajectory generator, returns the wind vector, wall normal vector, and wall center point
 #aswell as the reference trajectory [end_effector_position, end_effector_velocity, normal_force, contact_flag]
@@ -229,6 +233,9 @@ d0, tau = model.model.contact_d0, model.model.contact_tau
 
 #Extracts the trained GNN's internal timestep this will be used so we can make the MPC dt a multiple of the GNN's internal timestep
 GNN_trained_dt = model.dt
+
+#Sets the pad offset in the trajectory generator based on the model's pad offset
+trajectory_generator.set_pad_offset(model.pad_offset)
 
 
 # ---------------------- INITIALIZE MPC VARIABLES ----------------------
