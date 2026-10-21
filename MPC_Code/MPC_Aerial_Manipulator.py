@@ -5,6 +5,7 @@ import numpy as np
 from model import Drone_Dynamics
 from scenario_generator import Trajectory_Generator
 from utilities import quat_error_map
+from mujoco_simulator import MujocoDroneSim
 
 
 MOTOR_MIN = 0.0 #Rad/s
@@ -43,6 +44,9 @@ def calculate_contact_gate(pad_dist, d0, tau):
 
 #Builds the full 19-number linearized state from the nominal state and the 18-number correction
 def linearize_state(x_nom, dx_k):
+
+    # Computes the quaternion error mapping matrix for the linearization
+    # Converts small changes in euler angles to a quaternion perturbation
     G = quat_error_map(x_nom[6:10])
     return [x_nom[0:3]   + dx_k[0:3],          # position
             x_nom[3:6]   + dx_k[3:6],          # velocity
@@ -51,6 +55,7 @@ def linearize_state(x_nom, dx_k):
             x_nom[13:16] + dx_k[12:15],        # previous velocity
             x_nom[16:19] + dx_k[15:18]]        # previous angular velocity
 
+#Converts a torch tensor or numpy array to a numpy array, ensuring compatibility with Gurobi and other numpy-based operations
 def to_np(v):
     return v.detach().cpu().numpy() if torch.is_tensor(v) else np.asarray(v)
 
@@ -237,6 +242,15 @@ GNN_trained_dt = model.dt
 #Sets the pad offset in the trajectory generator based on the model's pad offset
 trajectory_generator.set_pad_offset(model.pad_offset)
 
+hover_input = model.calculate_hover_inputs()
+
+
+#---------------------Initilize mujoco simulation ---------------------
+#Assuming you have a mujoco model file and a mujoco simulation object
+sim = MujocoDroneSim(model.cfg, wall_normal_vector, wall_center_point, wind_vector, show_viewer=False)
+state_vector_current = sim.reset(trajectory_generator.initial_state, hover_input.cpu().numpy())
+
+
 
 # ---------------------- INITIALIZE MPC VARIABLES ----------------------
 
@@ -264,11 +278,11 @@ t = np.linspace(0, trajectory_time_length, int(trajectory_time_length / simulati
 
 #Initializes the state vector for the simulation with the initial state from the trajectory generator
 state_vector = np.zeros((len(t)+1,STATE_SIZE))
-state_vector[0] = trajectory_generator.initial_state
+state_vector[0] = state_vector_current
 
 #Initializes the input vector for the simulation with the hover input as the current input
 input_vector = np.zeros((len(t)+1,INPUT_SIZE))
-hover_input = model.calculate_hover_inputs()
+
 input_vector[0] = hover_input
 input_vector_current = input_vector[0]
 
@@ -281,7 +295,7 @@ time_step_index = 0
 for time_step in t:
 
     #propigates the system dynamics through the mojoco simulation using the current input
-    state_vector[time_step_index+1] = mojoco_simulation_step(state_vector[time_step_index],input_vector_current, simulation_dt)
+    state_vector[time_step_index+1] = sim.step(input_vector_current, simulation_dt)
     state_vector_current = state_vector[time_step_index+1]
 
     #runs the mpc controller when the time since the last update exceeds the MPC timestep

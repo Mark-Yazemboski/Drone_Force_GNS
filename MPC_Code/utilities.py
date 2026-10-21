@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-
+import mujoco
 
 # Logarithm map for SO(3): rotation matrix -> rotation vector
 def so3_log(R):
@@ -68,3 +68,32 @@ def rot_matrix_to_quat(R):
 def orthonormalize(R):
     U, _, Vt = np.linalg.svd(R)
     return U @ np.diag([1.0, 1.0, np.linalg.det(U @ Vt)]) @ Vt
+
+def vec_to_str(x):
+    #Formats a vector for the MuJoCo XML
+    return " ".join(f"{float(a):.6g}" for a in x)
+
+
+def quat_to_rot_matrix_np(q):
+    #[w, x, y, z] quaternion -> rotation matrix
+    R = np.zeros(9)
+    mujoco.mju_quat2Mat(R, np.asarray(q, dtype=float))
+    return R.reshape(3, 3)
+
+
+def rot_matrix_to_quat_np(R):
+    #Rotation matrix -> [w, x, y, z] quaternion
+    q = np.zeros(4)
+    mujoco.mju_mat2Quat(q, np.asarray(R, dtype=float).reshape(-1))
+    return q
+
+
+def so3_log_np(R):
+    #Rotation matrix -> rotation vector (used for the finite-difference angular velocity)
+    cos_theta = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
+    theta = np.arccos(cos_theta)
+    vee = 0.5 * np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    if theta < 1e-6:
+        return vee
+    return theta / np.sin(theta) * vee
+
