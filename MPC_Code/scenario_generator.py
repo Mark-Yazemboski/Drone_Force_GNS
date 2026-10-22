@@ -202,9 +202,47 @@ class Trajectory_Generator:
     # ------------------------------------------------------------------
     # Full trajectory
     # ------------------------------------------------------------------
+    def generate_free_flight_trajectory(self, time_range=[2.0, 4.0]):
+        self.initial_state = self.initilize_state(distance_range=[0.5, 1.0], yaw_offset_range=[0.0, 0.0])
+    
+        num_steps = self.steps_for(time_range)
+        positions = np.array([self.initial_state[:3] for _ in range(num_steps)])
+        forces = np.zeros(num_steps)
+        contact_flags = np.zeros(num_steps)
+        self.reference_time = np.arange(num_steps) * self.Ref_traj_dt
+        trajectory_time_length = self.reference_time[-1]
+
+        self.reference_trajectory = self.make_segment(positions, forces, contact_flags)
+        return trajectory_time_length, self.reference_trajectory
 
     def generate_trajectory(self, wind_vector=None, Wall_yaw=None, Wall_center_point=None):
 
+        
+
+        #Initial state of the drone
+        self.initial_state = self.initilize_state(distance_range=[0.5, 1.0], yaw_offset_range=[-np.radians(10), np.radians(10)])
+
+        #Build the trajectory one segment at a time
+        hold_traj    = self.hold_mode(time_range=[1.0, 2.0])
+        move_traj    = self.move_to_wall(hold_traj, time_range=[3.0, 5.0])
+        push_traj    = self.push_ramp(move_traj, time_range=[0.5, 1.0], force_range=[.2, .5])
+        circle_traj  = self.draw_circle(push_traj, time_range=[6.0, 10.0], radius_range=[0.1, 0.2])
+        release_traj = self.release(circle_traj, time_range=[1.5, 2.5])
+
+        segments = [hold_traj, move_traj, push_traj, circle_traj, release_traj]
+        self.reference_trajectory = {
+            key: np.concatenate([segment[key] for segment in segments], axis=0)
+            for key in hold_traj
+        }
+
+        #Time of every reference point, and the total length of the trajectory
+        num_points = len(self.reference_trajectory["normal_force"])
+        self.reference_time = np.arange(num_points) * self.Ref_traj_dt
+        trajectory_time_length = self.reference_time[-1]
+
+        return trajectory_time_length, self.reference_trajectory
+
+    def generate_wall_and_wind(self, wind_vector=None, Wall_yaw=None, Wall_center_point=None):
         #One constant wind vector for the whole run (horizontal, random direction and speed)
         if wind_vector is None:
             wind_speed = np.random.uniform(self.Wind_min, self.Wind_max)
@@ -231,30 +269,7 @@ class Trajectory_Generator:
         #From inertial to wall frame (rows are the wall axes)
         self.Wall_rotation_matrix = np.vstack([self.Wall_normal_vector, along_wall, up_wall])
 
-        #Initial state of the drone
-        self.initial_state = self.initilize_state(distance_range=[0.5, 1.0], yaw_offset_range=[-np.radians(10), np.radians(10)])
-
-        #Build the trajectory one segment at a time
-        hold_traj    = self.hold_mode(time_range=[1.0, 2.0])
-        move_traj    = self.move_to_wall(hold_traj, time_range=[3.0, 5.0])
-        push_traj    = self.push_ramp(move_traj, time_range=[0.5, 1.0], force_range=[1.0, 3.0])
-        circle_traj  = self.draw_circle(push_traj, time_range=[6.0, 10.0], radius_range=[0.1, 0.2])
-        release_traj = self.release(circle_traj, time_range=[1.5, 2.5])
-
-        segments = [hold_traj, move_traj, push_traj, circle_traj, release_traj]
-        self.reference_trajectory = {
-            key: np.concatenate([segment[key] for segment in segments], axis=0)
-            for key in hold_traj
-        }
-
-        #Time of every reference point, and the total length of the trajectory
-        num_points = len(self.reference_trajectory["normal_force"])
-        self.reference_time = np.arange(num_points) * self.Ref_traj_dt
-        trajectory_time_length = self.reference_time[-1]
-
-        return self.wind_vector, self.Wall_normal_vector, self.Wall_center_point, trajectory_time_length, self.reference_trajectory
-
-
+        return self.wind_vector, self.Wall_normal_vector, self.Wall_center_point,
     # ------------------------------------------------------------------
     # Sampling the reference at other time steps
     # ------------------------------------------------------------------

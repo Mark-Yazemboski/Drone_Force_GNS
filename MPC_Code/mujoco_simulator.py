@@ -88,7 +88,6 @@ class MujocoDroneSim:
         #Optional live 3D view
         self.viewer = None
         if show_viewer:
-            import mujoco.viewer
             self.viewer = mujoco.viewer.launch_passive(self.mj_model, self.data)
 
 
@@ -249,7 +248,6 @@ class MujocoDroneSim:
         #Bookkeeping
         self.time = 0.0
         self.substep_count = 0
-        self.crashed = False
         self.crash_message = ""
         self.contact_force = np.zeros(3)
 
@@ -263,8 +261,6 @@ class MujocoDroneSim:
     def step(self, rotor_speeds, duration):
         #Holds the commanded rotor speeds for `duration` seconds of sim time and returns the new state.
         #duration should be a multiple of 0.01 s (for example, one MPC step).
-        if self.crashed:
-            return self.get_state()
 
         #Rotor speed command -> thrust command, inside the actuator range
         thrust_command = self.cfg.k_f * np.asarray(rotor_speeds, dtype=float) ** 2
@@ -279,20 +275,15 @@ class MujocoDroneSim:
             self.time += self.physics_dt
             self.substep_count += 1
 
-            #Contact force on the pad, and a crash check for anything else touching the wall
+            #Contact force on the pad (None means another part of the drone touched the wall)
             contact_force = self.read_contacts()
             if contact_force is None:
-                self.crashed = True
-                self.crash_message = f"part of the drone other than the pad hit the wall at t={self.time:.2f}s"
-                break
-            self.contact_force = contact_force
+                if not self.crash_message:
+                    self.crash_message = f"part of the drone other than the pad hit the wall at t={self.time:.2f}s"
+                    print("WARNING:", self.crash_message)
+            else:
+                self.contact_force = contact_force
 
-            #Stop if the drone flips over or the sim blows up numerically
-            _, R, _, _ = self.drone_pose()
-            if not np.all(np.isfinite(self.data.qpos)) or (R @ [0, 0, 1])[2] < 0.5:
-                self.crashed = True
-                self.crash_message = f"state left the envelope at t={self.time:.2f}s"
-                break
 
             #Every 0.01 s, record the pose for the finite-difference state
             if self.substep_count % self.substeps_per_frame == 0:

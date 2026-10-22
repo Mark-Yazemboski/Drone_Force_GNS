@@ -6,6 +6,8 @@ from model import Drone_Dynamics
 from scenario_generator import Trajectory_Generator
 from utilities import quat_error_map
 from mujoco_simulator import MujocoDroneSim
+import time
+from visualize import animate_flight, plot_tracking
 
 
 MOTOR_MIN = 0.0 #Rad/s
@@ -15,16 +17,21 @@ MOTOR_CHANGE_LIM = 100.0 #Rad/s per control step
 CONTACT_MAX_DIST = 0.005 # meters
 ROTOR_MIN_DIST = 0.05 # meters
 
-ROLL_LIM = np.pi / 6 # radians, 30 degrees
-PITCH_LIM = np.pi / 6 # radians, 30 degrees
+ROLL_LIM = np.pi / 4 # radians, 45 degrees
+PITCH_LIM = np.pi / 4 # radians, 45 degrees
 
-POSITION_WEIGHT = 1.0
-VELOCITY_WEIGHT = 1.0
-ROD_ORIENTATION_WEIGHT = 1.0
-ANG_VEL_WEIGHT = 1.0
-NORMAL_FORCE_WEIGHT = 1.0
-INPUT_WEIGHT = 1.0
-INPUT_CHANGE_WEIGHT = 1.0
+POSITION_WEIGHT        = 1 / 0.02**2   # 2 cm
+VELOCITY_WEIGHT        = 1 / 0.1**2    # 0.1 m/s
+ROD_ORIENTATION_WEIGHT = 1 / 0.3**2    # 0.3 rad (~17 deg)
+ANG_VEL_WEIGHT         = 1 / 0.5**2    # 0.5 rad/s
+NORMAL_FORCE_WEIGHT    = 1 / 0.3**2    # 0.3 N
+INPUT_WEIGHT           = 1 / 100**2    # 100 rad/s from hover
+INPUT_CHANGE_WEIGHT    = 1 / 20**2     # 20 rad/s per step
+
+SLACK_WEIGHT_ROLL = 100
+SLACK_WEIGHT_PITCH = 100
+SLACK_WEIGHT_CONTACT_DISTANCE = 100
+SLACK_WEIGHT_ROTOR_DISTANCE = 1000
 
 INPUT_TRUST_REGION = 100.0 # Rad/s per control step
 
@@ -59,6 +66,12 @@ def linearize_state(x_nom, dx_k):
 def to_np(v):
     return v.detach().cpu().numpy() if torch.is_tensor(v) else np.asarray(v)
 
+#Makes an error variable equal to the expression and returns its square.
+#This keeps the objective's Q matrix diagonal, so Gurobi always sees a convex QP
+def squared_error(mpc, expression, size):
+    error = mpc.addMVar(size, lb=-GRB.INFINITY)
+    mpc.addConstr(error == expression)
+    return error @ error
 
 #Performs MPC control using the Sequential Quadratic Programming (SQP) approach
 def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_current,reference_trajectory,hover_thrust_values,horizon_length,d0,tau):
@@ -75,10 +88,18 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     mpc = gp.Model("Aerial_Manipulator")
     mpc.Params.OutputFlag = 0
 
+    #Sets the time limit for the solver and specifies that the problem is non-convex
+    mpc.Params.TimeLimit = 1.0
+    mpc.Params.NonConvex = 0 
+
     #Creates the decision variables for the state and input deviations
     #Sets limits for the input deviations based on the motor constraints
     dx = mpc.addMVar((horizon_length + 1, STATE_SIZE - 1), lb=-GRB.INFINITY, name="dx")
     du = mpc.addMVar((horizon_length, INPUT_SIZE), lb=MOTOR_MIN - nominal_input, ub=MOTOR_MAX - nominal_input, name="du")
+    slack_roll = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_roll")
+    slack_pitch = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_pitch")
+    slack_contact_distance = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_contact_distance")
+    slack_rotor_distance = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_rotor_distance")
 
     #adds trust region constraints for the input deviations
     #this makes sure the solution stays within a reasonable bound so
@@ -128,7 +149,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
         #All terms related to the input, and use k = 0 .. N-1
         if k < horizon_length:
 
-            lin_normal_force = linearized_output[0]
+            lin_normal_force = linearized_output[0:1]
 
             #Computes the linearized input for the current time step
             linearized_input = nominal_input[k] + du[k]
@@ -139,12 +160,14 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
             #Adds the linearized system dynamics constraint for the current time step
             mpc.addConstr(dx[k + 1] == A[k] @ dx[k] + B[k] @ du[k])
 
+           
+
             #Input deviation cost
-            cost += (linearized_input - hover_thrust_values) @ (linearized_input - hover_thrust_values) * INPUT_WEIGHT
+            cost += INPUT_WEIGHT * squared_error(mpc, linearized_input - hover_thrust_values, 4)
             #Input change cost
-            cost += (linearized_input - previous_lin_input) @ (linearized_input - previous_lin_input) * INPUT_CHANGE_WEIGHT
+            cost += INPUT_CHANGE_WEIGHT * squared_error(mpc, linearized_input - previous_lin_input, 4)
             #Normal force error cost
-            cost += contact_sigma * (lin_normal_force - normal_force_ref[k]) * (lin_normal_force - normal_force_ref[k]) * NORMAL_FORCE_WEIGHT
+            cost += contact_sigma * NORMAL_FORCE_WEIGHT * squared_error(mpc, lin_normal_force - normal_force_ref[k], 1)
 
             #Adds the constraints related to motor change limits for each rotor
             mpc.addConstr(linearized_input - previous_lin_input <= MOTOR_CHANGE_LIM)
@@ -162,33 +185,39 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
             
 
             #Computes the rod orientation error with respect to the wall normal vector
-            e_rod = -(lin_rod_unit[0] * wall_normal_vector[1] - lin_rod_unit[1] * wall_normal_vector[0])
+            e_rod = -(lin_rod_unit[0:1] * wall_normal_vector[1] - lin_rod_unit[1:2] * wall_normal_vector[0])
 
             #Computes the tangent projection matrix based on the contact sigma and wall normal vector
             tangent_projection = np.eye(3) - contact_sigma * np.outer(wall_normal_vector, wall_normal_vector)
+
+             #Slack variable cost
+            cost += slack_roll[k]**2 * SLACK_WEIGHT_ROLL
+            cost += slack_pitch[k]**2 * SLACK_WEIGHT_PITCH
+            cost += slack_contact_distance[k]**2 * SLACK_WEIGHT_CONTACT_DISTANCE
+            cost += slack_rotor_distance[k]**2 * SLACK_WEIGHT_ROTOR_DISTANCE
             
             #Position error cost
-            cost += (tangent_projection @ (lin_pad_pos - pad_ref_position[k])) @ (tangent_projection @ (lin_pad_pos - pad_ref_position[k])) * POSITION_WEIGHT
+            cost += POSITION_WEIGHT * squared_error(mpc, tangent_projection @ (lin_pad_pos - pad_ref_position[k]), 3)
             #Velocity error cost
-            cost += (tangent_projection @ (lin_pad_vel - pad_ref_velocity[k])) @ (tangent_projection @ (lin_pad_vel - pad_ref_velocity[k])) * VELOCITY_WEIGHT
+            cost += VELOCITY_WEIGHT * squared_error(mpc, tangent_projection @ (lin_pad_vel - pad_ref_velocity[k]), 3)
             #Rod orientation error cost
-            cost += e_rod * e_rod * ROD_ORIENTATION_WEIGHT
+            cost += ROD_ORIENTATION_WEIGHT * squared_error(mpc, e_rod, 1)
             #Angular velocity error cost
-            cost += angular_velocity @ angular_velocity * ANG_VEL_WEIGHT
+            cost += ANG_VEL_WEIGHT * squared_error(mpc, angular_velocity, 3)
 
             #Addes constraints related to contact with the wall
             #and how the end effector should be within a certain distance from the wall during contact
             if contact_sigma >= 0.5:
-                mpc.addConstr(lin_pad_dist <= CONTACT_MAX_DIST)
+                mpc.addConstr(lin_pad_dist <= CONTACT_MAX_DIST + slack_contact_distance[k])
 
             #Adds the constraint related to the minimum distance of the rotors from the wall
-            mpc.addConstr(lin_rotor_dist >= ROTOR_MIN_DIST)
+            mpc.addConstr(lin_rotor_dist >= ROTOR_MIN_DIST - slack_rotor_distance[k])
 
             #Adds the constraints related to roll and pitch limits
-            mpc.addConstr(lin_roll <= ROLL_LIM)
-            mpc.addConstr(lin_roll >= -ROLL_LIM)
-            mpc.addConstr(lin_pitch <= PITCH_LIM)
-            mpc.addConstr(lin_pitch >= -PITCH_LIM)
+            mpc.addConstr(lin_roll <= ROLL_LIM + slack_roll[k])
+            mpc.addConstr(lin_roll >= -ROLL_LIM - slack_roll[k])
+            mpc.addConstr(lin_pitch <= PITCH_LIM + slack_pitch[k])
+            mpc.addConstr(lin_pitch >= -PITCH_LIM - slack_pitch[k])
 
 
 
@@ -196,12 +225,25 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     mpc.setObjective(cost, GRB.MINIMIZE)
 
     #Optimizes the MPC problem to find the optimal du input sequence
-    mpc.optimize()
+    try:
+        mpc.optimize()
+    except gp.GurobiError as error:
+        print("MPC solve error:", error, "- using the shifted previous plan")
+        return nominal_input
+
+    if mpc.Status == GRB.SUBOPTIMAL:
+        print("MPC solve suboptimal (numerical issues), using it anyway")
+    elif mpc.Status != GRB.OPTIMAL:
+        print(f"MPC solve failed (status {mpc.Status}), using the shifted previous plan")
+        return nominal_input
 
     #Takes the optimized du input sequence and adds it to the nominal input to get the actual input sequence
     input_sequence = du.X + nominal_input
 
     return input_sequence
+
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 
 #Sets the dt of the simulation our controller will be running inside
 simulation_dt = 0.01
@@ -214,14 +256,15 @@ Trajectory_plan_dt = 0.1
 
 #Defines the ranges for the wall yaw angle and wind speed magnitude
 wall_yaw_range = (-np.pi/6, np.pi/6)
-wind_range = (0, 10)
+wind_range = (0, 5)
 
 #Generates the reference trajectory given a trajectory length (seconds), maximum wall tilt, wind range, and the trajectory plan dt
 trajectory_generator = Trajectory_Generator(wind_range, wall_yaw_range, Trajectory_plan_dt)
 
 #Generates a reference trajectory based on the previously defined trajectory generator, returns the wind vector, wall normal vector, and wall center point
 #aswell as the reference trajectory [end_effector_position, end_effector_velocity, normal_force, contact_flag]
-wind_vector, wall_normal_vector, wall_center_point, trajectory_time_length, reference_trajectory = trajectory_generator.generate_trajectory()
+wind_vector, wall_normal_vector, wall_center_point = trajectory_generator.generate_wall_and_wind()
+
 
 
 
@@ -231,7 +274,7 @@ wind_vector, wall_normal_vector, wall_center_point, trajectory_time_length, refe
 Trained_model_path = r"C:\Users\myaze\Desktop\College\Grad\Grad Research\Drone_Force_GNS\MPC_Code\MPC_Model\Trained_Model.pt"
 
 #Initializes the drone dynamics model with the trained GNN and environment parameters
-model = Drone_Dynamics(Trained_model_path, wall_normal_vector=wall_normal_vector, wall_center_point=wall_center_point, wind_vector=wind_vector)
+model = Drone_Dynamics(device, Trained_model_path, wall_normal_vector=wall_normal_vector, wall_center_point=wall_center_point, wind_vector=wind_vector)
 
 #Pulls out the contact model parameters from the trained GNN to be used in the MPC controller for the contact determination
 d0, tau = model.model.contact_d0, model.model.contact_tau
@@ -240,15 +283,38 @@ d0, tau = model.model.contact_d0, model.model.contact_tau
 GNN_trained_dt = model.dt
 
 #Sets the pad offset in the trajectory generator based on the model's pad offset
-trajectory_generator.set_pad_offset(model.pad_offset)
+trajectory_generator.set_pad_offset(model.pad_offset.cpu().numpy())
 
-hover_input = model.calculate_hover_inputs()
+hover_input = model.calculate_hover_inputs().cpu().numpy()
+
+
+#Generates the reference trajectory based on the wall and wind conditions set above, this needed to
+#happen after model because we needed the pad offset from the model
+trajectory_time_length, reference_trajectory = trajectory_generator.generate_trajectory()
+
+# trajectory_time_length, reference_trajectory = trajectory_generator.generate_free_flight_trajectory(time_range=[3, 3])
+# print("Trajectory time length:", trajectory_time_length)
+# print("Reference trajectory keys:", reference_trajectory.keys())
+# for key in reference_trajectory:
+#     print(f"{key}: shape {reference_trajectory[key].shape}")
+
+# print("Initial state from trajectory generator:", trajectory_generator.initial_state)
+# for ref_pos in reference_trajectory["pad_position"]:
+#     print("Reference pad position:", ref_pos)
+
+# for ref_vel in reference_trajectory["pad_velocity"]:
+#     print("Reference pad velocity:", ref_vel)
+
+# for ref_force in reference_trajectory["normal_force"]:
+#     print("Reference normal force:", ref_force)
+
+# time.sleep(5)  # Pause for a moment to allow the user to see the printed trajectory information
 
 
 #---------------------Initilize mujoco simulation ---------------------
 #Assuming you have a mujoco model file and a mujoco simulation object
 sim = MujocoDroneSim(model.cfg, wall_normal_vector, wall_center_point, wind_vector, show_viewer=False)
-state_vector_current = sim.reset(trajectory_generator.initial_state, hover_input.cpu().numpy())
+state_vector_current = sim.reset(trajectory_generator.initial_state, hover_input)
 
 
 
@@ -257,11 +323,11 @@ state_vector_current = sim.reset(trajectory_generator.initial_state, hover_input
 #Sets the MPC timestep as a multiple of the GNN's internal timestep
 #it needs to be a multiple because the GNN model can only operate at its internal timestep
 #and we need to know how many times the GNN model will be called within one MPC timestep
-MPC_dt_multiple = 5
+MPC_dt_multiple = 1
 MPC_dt = GNN_trained_dt*MPC_dt_multiple
 
 #Sets the MPC horizon length
-Horizon_length = 10  
+Horizon_length = 50
 
 #Initializes the time since the last MPC update
 time_since_last_MPC_update = MPC_dt
@@ -274,7 +340,7 @@ ref_traj_interp = trajectory_generator.interpolate(MPC_dt)
 
 
 #Time vector for the simulation
-t = np.linspace(0, trajectory_time_length, int(trajectory_time_length / simulation_dt))
+t = np.arange(0, trajectory_time_length, simulation_dt)
 
 #Initializes the state vector for the simulation with the initial state from the trajectory generator
 state_vector = np.zeros((len(t)+1,STATE_SIZE))
@@ -291,19 +357,26 @@ input_sequence = np.array([input_vector_current for _ in range(Horizon_length)])
 #Initializes the time step index for the simulation loop
 time_step_index = 0
 
+normal_force_history = np.zeros(len(t) + 1)
+
+print("Starting simulation...")
+print("total simulation steps:", len(t))
 #Simulation loop for the aerial manipulator
 for time_step in t:
+    print("Time step:", time_step_index)
 
     #propigates the system dynamics through the mojoco simulation using the current input
     state_vector[time_step_index+1] = sim.step(input_vector_current, simulation_dt)
+    normal_force_history[time_step_index + 1] = sim.get_normal_force()
     state_vector_current = state_vector[time_step_index+1]
 
     #runs the mpc controller when the time since the last update exceeds the MPC timestep
     if time_since_last_MPC_update >= MPC_dt:
+        print("Running MPC update at time step:", time_step_index)
         time_since_last_MPC_update = 0.0
         
         #Obtains the reference trajectory window for the current MPC update
-        reference_window = trajectory_generator.get_reference_window(time_step_index, MPC_dt, Horizon_length)
+        reference_window = trajectory_generator.get_reference_window(time_step, MPC_dt, Horizon_length)
 
         #Rolls out the previous input sequence moved by one timestep, with the last input repeated at the end
         rollout_input_sequence = np.array(list(input_sequence[1:]) + [input_sequence[-1]])
@@ -314,13 +387,17 @@ for time_step in t:
         nom_outputs = []
         #Runs through the prediction horizon to linearize the system around the nominal trajectory
         nom_states.append(state_vector_current)
+        print("mpc dt:", MPC_dt_multiple)
         for i in range(Horizon_length):
             #Converts the current nominal state and input to torch tensors for linearization
-            torch_nom_state = torch.as_tensor(nom_states[-1], dtype=torch.float32)
-            torch_input = torch.as_tensor(rollout_input_sequence[i], dtype=torch.float32)
+            torch_nom_state = torch.as_tensor(nom_states[-1], dtype=torch.float32,device=device)
+            torch_input = torch.as_tensor(rollout_input_sequence[i], dtype=torch.float32,device=device)
 
             #Linearizes the system around the current nominal state and input
+            start_time = time.time()
+            
             A, B, C, D, x_next_nom, nominal_output = model.linearize(torch_nom_state, torch_input, MPC_dt_multiple)
+            print("Linearized step:", i, "in", time.time() - start_time, "seconds")
 
             #Saves the linearized system matrices and nominal states for the current step
             A_list.append(A.detach().cpu().numpy())
@@ -332,21 +409,22 @@ for time_step in t:
 
         
         #Converts the current nominal state and input to torch tensors for linearization
-        torch_nom_state = torch.as_tensor(nom_states[-1], dtype=torch.float32)
-        torch_input = torch.as_tensor(rollout_input_sequence[-1], dtype=torch.float32)
+        torch_nom_state = torch.as_tensor(nom_states[-1], dtype=torch.float32,device=device)
+        torch_input = torch.as_tensor(rollout_input_sequence[-1], dtype=torch.float32,device=device)
 
         #Runs linearizartion on the last state in the prediction horizon to obtain the output matrices and nominal output at the final state
-        _, _, C, D, _, nominal_output = model.linearize(torch_nom_state, torch_input, MPC_dt_multiple)
+        C, nominal_output = model.linearize_outputs(torch_nom_state)
         C_list.append(C.detach().cpu().numpy())
-        D_list.append(D.detach().cpu().numpy())
         nom_outputs.append(nominal_output)
 
         #Computes the MPC control input sequence based on the linearized system and nominal trajectory (SQP method)
         #Outputs the computed input sequence for the current MPC step
+        print("Computing MPC control input sequence...")
         input_sequence = mpc_control(A_list,B_list,C_list,D_list,nom_states,rollout_input_sequence,nom_outputs,input_vector_current, reference_window,hover_input,Horizon_length,d0,tau)
 
         #Sets the current input to the first element of the computed input sequence
         input_vector_current = input_sequence[0]
+        print("Selected input for current time step:", input_vector_current)
 
 
     #Stores the current input in the input vector for the current time step
@@ -355,3 +433,19 @@ for time_step in t:
     #Increments the time since the last MPC update and the time step index for the next iteration
     time_since_last_MPC_update += simulation_dt
     time_step_index += 1
+
+
+animate_flight(model.cfg, wall_normal_vector, wall_center_point, state_vector, dt=simulation_dt,
+               reference_positions=reference_trajectory["pad_position"],
+               pad_offset=model.pad_offset.cpu().numpy(),
+               save_path="first_flight.gif")
+
+times = np.arange(len(state_vector)) * simulation_dt
+plot_tracking(times, state_vector, trajectory_generator.sample(times),
+              model.pad_offset.cpu().numpy(), wall_normal_vector, wall_center_point,
+              normal_force_history=normal_force_history, input_history=input_vector,
+              save_path="tracking.png")
+
+print("wind disturbance applied")
+print("Wind vector:", wind_vector)
+print("Wind magnitude:", np.linalg.norm(wind_vector))

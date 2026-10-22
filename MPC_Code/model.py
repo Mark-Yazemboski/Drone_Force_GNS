@@ -10,17 +10,16 @@ import numpy as np
 from utilities import so3_log, so3_exp, quat_to_rot_matrix, rot_matrix_to_quat, orthonormalize
 
 
-
 #Drone dynamics wrapper class for MPC controller.
 #This will take in a trained drone dynamics model and provide an 
 #interface for the MPC controller to interact with it.
 class Drone_Dynamics:
 
     # Initialize the drone dynamics model with the given model path.
-    def __init__(self, model_path, wall_normal_vector=None, wall_center_point=None, wind_vector=None):
+    def __init__(self, device, model_path, wall_normal_vector=None, wall_center_point=None, wind_vector=None):
 
         #Set up the device and load the model.
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
         self.wall_normal_vector = torch.as_tensor(wall_normal_vector, dtype=torch.float32, device=self.device)
         self.wall_center_point  = torch.as_tensor(wall_center_point,  dtype=torch.float32, device=self.device)  
         self.wind_vector = torch.as_tensor(wind_vector, dtype=torch.float32, device=self.device)
@@ -53,11 +52,14 @@ class Drone_Dynamics:
         self.u_hover = self.calculate_hover_inputs()
 
 
+        self.I_body_inv = torch.linalg.inv(self.model.J_body * self.mass)
+
+
     def calculate_hover_inputs(self):
 
         #extracts the x and y coordinates of the rotor locations in the body frame.
-        rotor_xs = self.rotor_locations[:, 0]
-        rotor_ys = self.rotor_locations[:, 1]
+        rotor_xs = self.rotor_locations[:, 0].cpu().numpy()
+        rotor_ys = self.rotor_locations[:, 1].cpu().numpy()
 
         #Builds the thrust to torque mapping matrix for the quadrotor.
         A = np.vstack([np.ones(4), rotor_ys, -rotor_xs, -self.spin_dirs * self.motor_km / self.motor_kf])
@@ -97,11 +99,13 @@ class Drone_Dynamics:
 
         # Compute world-frame inertia from body-frame inertia
         I_body = self.model.J_body * self.mass                                                
-        J_w = R @ I_body @ R.T                                                                
+        J_w = R @ I_body @ R.T
+
+        
         
         # Compute non-contact linear and angular accelerations in the world frame
         a_nc = (F_thr_N + F_aero_N) / self.mass + self.g
-        alpha_nc = torch.linalg.solve(J_w, tau_thr_N + tau_aero_N - torch.linalg.cross(angular_velocity, J_w @ angular_velocity))
+        alpha_nc = R @ (self.I_body_inv @ (R.T @ (tau_thr_N + tau_aero_N - torch.linalg.cross(angular_velocity, J_w @ angular_velocity))))
         
         return a_nc, alpha_nc
 
@@ -380,3 +384,14 @@ class Drone_Dynamics:
 
         #Return state space matrices, nominal next state, and nominal outputs.
         return A, B, C, D, x_next_nom, nominal_output
+
+    def linearize_outputs(self, state_vector):
+        #Output rows only (no dynamics), for the final state of the horizon. No GNN involved.
+        with torch.no_grad():
+            nominal_output = self.outputs(state_vector, torch.zeros((), device=self.device))
+
+        def h(dx):
+            return self.outputs(self.perturb(state_vector, dx), torch.zeros((), device=self.device)) - nominal_output
+
+        C = torch.autograd.functional.jacobian(h, torch.zeros(18, device=self.device))
+        return C, nominal_output
