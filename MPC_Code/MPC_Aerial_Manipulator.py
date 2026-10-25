@@ -10,6 +10,14 @@ import time
 from visualize import animate_flight, plot_tracking
 import os
 
+from pathlib import Path
+
+#Folder this script lives in (MPC_Code), so the path works on any computer
+SCRIPT_FOLDER = Path(__file__).resolve().parent
+
+#path of the trained contact and fluid model GNN
+Trained_model_path = SCRIPT_FOLDER / "MPC_Model" / "Trained_Model.pt"
+
 #Number of CPU cores to use: what Slurm gave this job on Roar, or every core on a normal PC
 NUM_CORES = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count()))
 
@@ -282,8 +290,6 @@ wind_vector, wall_normal_vector, wall_center_point = trajectory_generator.genera
 
 #-------------------- INITIALIZE MODEL ---------------------------------------------
 
-#path of the trained contact and fluid model GNN
-Trained_model_path = r"C:\Users\myaze\Desktop\College\Grad\Grad Research\Drone_Force_GNS\MPC_Code\MPC_Model\Trained_Model.pt"
 
 #Initializes the drone dynamics model with the trained GNN and environment parameters
 model = Drone_Dynamics(device, Trained_model_path, wall_normal_vector=wall_normal_vector, wall_center_point=wall_center_point, wind_vector=wind_vector)
@@ -463,7 +469,7 @@ plot_tracking(times, state_vector, trajectory_generator.sample(times),
               normal_force_history=normal_force_history, input_history=input_vector,
               predicted_force_history=predicted_force_history,
               model_pad_distance_history=model_pad_distance_history,
-              contact_d0=float(d0), save_path="tracking.png")
+              contact_d0=float(d0), save_path="Figures/tracking.png")
 
 print("wind disturbance applied")
 print("Wind vector:", wind_vector)
