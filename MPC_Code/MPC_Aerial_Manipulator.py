@@ -8,7 +8,19 @@ from utilities import quat_error_map
 from mujoco_simulator import MujocoDroneSim
 import time
 from visualize import animate_flight, plot_tracking
+import os
 
+#Number of CPU cores to use: what Slurm gave this job on Roar, or every core on a normal PC
+NUM_CORES = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count()))
+
+#The linearization (torch) is the slow part, so it gets all the cores
+torch.set_num_threads(NUM_CORES)
+
+#The QP is small, so extra Gurobi threads don't help it
+gurobi_env = gp.Env(empty=True)
+gurobi_env.setParam("OutputFlag", 0)
+gurobi_env.setParam("Threads", 2)
+gurobi_env.start()
 
 MOTOR_MIN = 0.0 #Rad/s
 MOTOR_MAX = 1000.0 #Rad/s
@@ -85,7 +97,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
 
     
     #Initializes the MPC optimization model using Gurobi
-    mpc = gp.Model("Aerial_Manipulator")
+    mpc = gp.Model("Aerial_Manipulator", env=gurobi_env)
     mpc.Params.OutputFlag = 0
 
     #Sets the time limit for the solver and specifies that the problem is non-convex
@@ -358,6 +370,8 @@ input_sequence = np.array([input_vector_current for _ in range(Horizon_length)])
 time_step_index = 0
 
 normal_force_history = np.zeros(len(t) + 1)
+predicted_force_history = np.full(len(t) + 1, np.nan)
+model_pad_distance_history = np.full(len(t) + 1, np.nan)
 
 print("Starting simulation...")
 print("total simulation steps:", len(t))
@@ -416,6 +430,9 @@ for time_step in t:
         C, nominal_output = model.linearize_outputs(torch_nom_state)
         C_list.append(C.detach().cpu().numpy())
         nom_outputs.append(nominal_output)
+        predicted_now = nom_outputs[0].detach().cpu().numpy()
+        predicted_force_history[time_step_index + 1] = predicted_now[0]
+        model_pad_distance_history[time_step_index + 1] = predicted_now[12]
 
         #Computes the MPC control input sequence based on the linearized system and nominal trajectory (SQP method)
         #Outputs the computed input sequence for the current MPC step
@@ -444,7 +461,9 @@ times = np.arange(len(state_vector)) * simulation_dt
 plot_tracking(times, state_vector, trajectory_generator.sample(times),
               model.pad_offset.cpu().numpy(), wall_normal_vector, wall_center_point,
               normal_force_history=normal_force_history, input_history=input_vector,
-              save_path="tracking.png")
+              predicted_force_history=predicted_force_history,
+              model_pad_distance_history=model_pad_distance_history,
+              contact_d0=float(d0), save_path="tracking.png")
 
 print("wind disturbance applied")
 print("Wind vector:", wind_vector)

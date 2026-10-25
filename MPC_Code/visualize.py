@@ -152,11 +152,15 @@ def animate_flight(drone_cfg, wall_normal, wall_point, state_history, dt,
 
 
 def plot_tracking(times, state_history, reference, pad_offset, wall_normal, wall_point,
-                  normal_force_history=None, input_history=None, save_path=None):
-    #Reference vs what the drone actually did
+                  normal_force_history=None, input_history=None,
+                  predicted_force_history=None, model_pad_distance_history=None, contact_d0=None,
+                  save_path=None):
+    #Reference vs what the drone actually did (and, optionally, what the model thought)
     #times: (T,)   state_history: (T, 19)   reference: trajectory_generator.sample(times)
-    #normal_force_history: (T,) measured normal force (N), optional
-    #input_history: (T, 4) rotor speeds (rad/s), optional
+    #normal_force_history: (T,) MuJoCo normal force (N)
+    #predicted_force_history: (T,) GNN-predicted normal force at each MPC update (N)
+    #model_pad_distance_history: (T,) model's min pad-to-wall distance (m)
+    #contact_d0: contact gate distance (m), drawn on the distance plot
     wall_point = np.asarray(wall_point, dtype=float)
 
     #Actual and reference pad position in the wall frame (cm)
@@ -169,7 +173,9 @@ def plot_tracking(times, state_history, reference, pad_offset, wall_normal, wall
     #Contact phase, shaded gray on every plot
     contact = reference["contact_flag"] > 0.5
 
-    fig, axes = plt.subplots(6, 1, figsize=(9, 13), sharex=True)
+    show_distance = model_pad_distance_history is not None
+    num_rows = 7 if show_distance else 6
+    fig, axes = plt.subplots(num_rows, 1, figsize=(9, 2.2 * num_rows), sharex=True)
 
     #Pad position: out of wall, along wall, up wall
     labels = ["out of wall (cm)", "along wall (cm)", "up wall (cm)"]
@@ -180,24 +186,41 @@ def plot_tracking(times, state_history, reference, pad_offset, wall_normal, wall
     axes[0].axhline(0.0, color="black", linewidth=0.8)      # wall surface
     axes[0].legend(loc="upper right", fontsize=8)
 
-    #Normal force
-    axes[3].plot(times, reference["normal_force"], color=REFERENCE_COLOR, linestyle="--", label="reference")
+    #Normal force: reference, MuJoCo, and what the GNN predicted
+    ax = axes[3]
+    ax.plot(times, reference["normal_force"], color=REFERENCE_COLOR, linestyle="--", label="reference")
     if normal_force_history is not None:
-        axes[3].plot(times, normal_force_history, color=ACTUAL_COLOR, label="actual")
-    axes[3].set_ylabel("normal force (N)")
+        ax.plot(times, normal_force_history, color=ACTUAL_COLOR, label="actual (MuJoCo)")
+    if predicted_force_history is not None:
+        ax.plot(times, predicted_force_history, color="#2ca02c", linestyle=":", linewidth=1.5, label="model predicted")
+    ax.set_ylabel("normal force (N)")
+    ax.legend(loc="upper right", fontsize=8)
+
+    #Model's pad distance to the wall (mm), with the contact gate distance
+    row = 4
+    if show_distance:
+        ax = axes[row]
+        ax.plot(times, 1000 * model_pad_distance_history, color=ACTUAL_COLOR, label="model pad distance")
+        ax.axhline(0.0, color="black", linewidth=0.8)
+        if contact_d0 is not None:
+            ax.axhline(1000 * contact_d0, color="#e34948", linestyle="--", linewidth=1, label="gate d0")
+        ax.set_ylabel("pad dist (mm)")
+        ax.legend(loc="upper right", fontsize=8)
+        row += 1
 
     #Roll and pitch
-    axes[4].plot(times, roll, label="roll")
-    axes[4].plot(times, pitch, label="pitch")
-    axes[4].set_ylabel("tilt (deg)")
-    axes[4].legend(loc="upper right", fontsize=8)
+    axes[row].plot(times, roll, label="roll")
+    axes[row].plot(times, pitch, label="pitch")
+    axes[row].set_ylabel("tilt (deg)")
+    axes[row].legend(loc="upper right", fontsize=8)
+    row += 1
 
     #Rotor speeds
     if input_history is not None:
         for i in range(input_history.shape[1]):
-            axes[5].plot(times, input_history[:, i], linewidth=1, label=f"rotor {i + 1}")
-        axes[5].legend(loc="upper right", fontsize=8, ncol=4)
-    axes[5].set_ylabel("rotor speed (rad/s)")
+            axes[row].plot(times, input_history[:, i], linewidth=1, label=f"rotor {i + 1}")
+        axes[row].legend(loc="upper right", fontsize=8, ncol=4)
+    axes[row].set_ylabel("rotor speed (rad/s)")
 
     for ax in axes:
         ax.fill_between(times, 0, 1, where=contact, transform=ax.get_xaxis_transform(),
