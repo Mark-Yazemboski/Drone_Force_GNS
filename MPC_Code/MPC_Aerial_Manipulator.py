@@ -99,6 +99,13 @@ def linearize_state(x_nom, dx_k):
             x_nom[13:16] + dx_k[12:15],        # previous velocity
             x_nom[16:19] + dx_k[15:18]]        # previous angular velocity
 
+#Current time for timing sections. GPU calls return before the GPU has finished,
+#so it waits for the GPU first; otherwise the GPU time shows up in whatever runs next.
+def timer():
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
 #Converts a torch tensor or numpy array to a numpy array, ensuring compatibility with Gurobi and other numpy-based operations
 def to_np(v):
     return v.detach().cpu().numpy() if torch.is_tensor(v) else np.asarray(v)
@@ -151,6 +158,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
 
     
     #Initializes the MPC optimization model using Gurobi
+    build_start = timer()
     mpc = gp.Model("Aerial_Manipulator", env=gurobi_env)
     mpc.Params.OutputFlag = 0
 
@@ -291,11 +299,13 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     mpc.setObjective(cost, GRB.MINIMIZE)
 
     #Optimizes the MPC problem to find the optimal du input sequence
+    solve_start = timer()
     try:
         mpc.optimize()
     except gp.GurobiError as error:
         print("MPC solve error:", error, "- using the shifted previous plan")
         return nominal_input
+    print(f"  QP build: {solve_start - build_start:.3f} s | QP solve: {timer() - solve_start:.3f} s")
 
     if mpc.Status == GRB.SUBOPTIMAL:
         print("MPC solve suboptimal (numerical issues), using it anyway")
@@ -308,8 +318,8 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
 
     return input_sequence
 
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = torch.device("cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# device = torch.device("cpu")
 
 #Sets the dt of the simulation our controller will be running inside
 simulation_dt = 0.01
@@ -344,6 +354,10 @@ model = Drone_Dynamics(device, Trained_model_path, wall_normal_vector=wall_norma
 #Pulls out the contact model parameters from the trained GNN to be used in the MPC controller for the contact determination
 d0, tau = model.model.contact_d0, model.model.contact_tau
 
+#MPC contact gate: centered a bit outside the contact-sphere radius, so sigma ~ 1 when the pad is touching
+MPC_GATE_D0 = model.cfg.pad_contact_radius + 0.002   
+MPC_GATE_TAU = 0.0005
+
 #Extracts the trained GNN's internal timestep this will be used so we can make the MPC dt a multiple of the GNN's internal timestep
 GNN_trained_dt = model.dt
 
@@ -359,24 +373,6 @@ scenario = "push"  # Example scenario, can be changed to "push", "line_horizonta
 trajectory_time_length, reference_trajectory = trajectory_generator.generate_trajectory(scenario)
 # trajectory_time_length, reference_trajectory = trajectory_generator.generate_free_flight_trajectory(time_range = [0.5,0.5])
 
-
-# trajectory_time_length, reference_trajectory = trajectory_generator.generate_free_flight_trajectory(time_range=[3, 3])
-# print("Trajectory time length:", trajectory_time_length)
-# print("Reference trajectory keys:", reference_trajectory.keys())
-# for key in reference_trajectory:
-#     print(f"{key}: shape {reference_trajectory[key].shape}")
-
-# print("Initial state from trajectory generator:", trajectory_generator.initial_state)
-# for ref_pos in reference_trajectory["pad_position"]:
-#     print("Reference pad position:", ref_pos)
-
-# for ref_vel in reference_trajectory["pad_velocity"]:
-#     print("Reference pad velocity:", ref_vel)
-
-# for ref_force in reference_trajectory["normal_force"]:
-#     print("Reference normal force:", ref_force)
-
-# time.sleep(5)  # Pause for a moment to allow the user to see the printed trajectory information
 
 
 #---------------------Initilize mujoco simulation ---------------------
@@ -449,22 +445,35 @@ model_pad_distance_history = np.full(len(t) + 1, np.nan)
 mujoco_friction_history = np.full((len(t) + 1, 3), np.nan)
 predicted_friction_history = np.full((len(t) + 1, 3), np.nan)
 
+print("old sigma in steady contact:", calculate_contact_gate(0.004, d0, tau))
+print("new sigma in steady contact:", calculate_contact_gate(0.004, MPC_GATE_D0, MPC_GATE_TAU))
+
+
 print("Starting simulation...")
 print("total simulation steps:", len(t))
 #Simulation loop for the aerial manipulator
 for time_step in t:
     print("Time step:", time_step_index)
+    step_start = timer()
+
+    #What the model predicts the contact force will be over this step (for the plots)
     predicted_normal, predicted_friction = model.predict_contact_force(
         torch.as_tensor(state_vector_current, dtype=torch.float32, device=device),
         torch.as_tensor(input_vector_current, dtype=torch.float32, device=device))
     predicted_force_history[time_step_index + 1] = predicted_normal
     predicted_friction_history[time_step_index + 1] = predicted_friction
+    predict_time = timer() - step_start
+
+    #Stores the current input in the input vector for the current time step
+    input_vector[time_step_index] = input_vector_current
 
     #propigates the system dynamics through the mojoco simulation using the current input
+    section_start = timer()
     state_vector[time_step_index+1] = sim.step(input_vector_current, simulation_dt)
     normal_force_history[time_step_index + 1] = sim.get_normal_force()
     state_vector_current = state_vector[time_step_index+1]
     mujoco_friction_history[time_step_index + 1] = sim.get_friction_force()
+    print(f"  force prediction: {predict_time:.3f} s | MuJoCo step: {timer() - section_start:.3f} s")
 
     #runs the mpc controller when the time since the last update exceeds the MPC timestep
     if time_since_last_MPC_update >= MPC_dt:
@@ -477,31 +486,31 @@ for time_step in t:
         #Rolls out the previous input sequence moved by one timestep, with the last input repeated at the end
         rollout_input_sequence = np.array(list(input_sequence[1:]) + [input_sequence[-1]])
 
-        #initilizes the lists for storing linearized system matrices and nominal states
-        A_list, B_list, C_list, D_list = [], [], [], []
-        nom_states = []
-        nom_outputs = []
-        #Runs through the prediction horizon to linearize the system around the nominal trajectory
-        nom_states.append(state_vector_current)
-        print("mpc dt:", MPC_dt_multiple)
-        for i in range(Horizon_length):
-            #Converts the current nominal state and input to torch tensors for linearization
-            torch_nom_state = torch.as_tensor(nom_states[-1], dtype=torch.float32,device=device)
-            torch_input = torch.as_tensor(rollout_input_sequence[i], dtype=torch.float32,device=device)
+        #Nominal trajectory over the horizon from the shifted plan (sequential, but cheap: no gradients)
+        section_start = timer()
+        torch_state = torch.as_tensor(state_vector_current, dtype=torch.float32, device=device)
+        torch_inputs = torch.as_tensor(rollout_input_sequence, dtype=torch.float32, device=device)
+        nominal_states = model.rollout(torch_state, torch_inputs, MPC_dt_multiple)          # (N+1, 19)
+        rollout_time = timer() - section_start
 
-            #Linearizes the system around the current nominal state and input
-            start_time = time.time()
-            
-            A, B, C, D, x_next_nom, nominal_output = model.linearize(torch_nom_state, torch_input, MPC_dt_multiple)
-            print("Linearized step:", i, "in", time.time() - start_time, "seconds")
+        #Linearizes every step of the horizon at once (one batched Jacobian)
+        section_start = timer()
+        A_all, B_all, C_all, D_all, _, nominal_outputs = model.linearize_horizon(nominal_states[:-1], torch_inputs, MPC_dt_multiple)
+        linearize_time = timer() - section_start
 
-            #Saves the linearized system matrices and nominal states for the current step
-            A_list.append(A.detach().cpu().numpy())
-            B_list.append(B.detach().cpu().numpy())
-            C_list.append(C.detach().cpu().numpy())
-            D_list.append(D.detach().cpu().numpy())
-            nom_states.append(x_next_nom)
-            nom_outputs.append(nominal_output)
+        #Output rows for the final state of the horizon
+        section_start = timer()
+        C_last, output_last = model.linearize_outputs(nominal_states[-1])
+
+        #Lists of numpy arrays, one entry per horizon step, the way mpc_control expects them
+        A_list = list(to_np(A_all))
+        B_list = list(to_np(B_all))
+        C_list = list(to_np(C_all)) + [to_np(C_last)]
+        D_list = list(to_np(D_all))
+        nom_states = list(to_np(nominal_states))
+        nom_outputs = list(to_np(nominal_outputs)) + [to_np(output_last)]
+        print(f"  rollout: {rollout_time:.3f} s | linearize: {linearize_time:.3f} s | "
+              f"last-step outputs + copy to numpy: {timer() - section_start:.3f} s")
 
         #Find where the nominal rollout first goes non-finite (if it does)
         if not np.all(np.isfinite(state_vector_current)):
@@ -515,37 +524,29 @@ for time_step in t:
                 break
 
         
-        #Converts the current nominal state and input to torch tensors for linearization
-        torch_nom_state = torch.as_tensor(nom_states[-1], dtype=torch.float32,device=device)
-        torch_input = torch.as_tensor(rollout_input_sequence[-1], dtype=torch.float32,device=device)
-
-        #Runs linearizartion on the last state in the prediction horizon to obtain the output matrices and nominal output at the final state
-        C, nominal_output = model.linearize_outputs(torch_nom_state)
-        C_list.append(C.detach().cpu().numpy())
-        nom_outputs.append(nominal_output)
-        predicted_now = nom_outputs[0].detach().cpu().numpy()
-        predicted_force_history[time_step_index + 1] = predicted_now[0]
-        model_pad_distance_history[time_step_index + 1] = predicted_now[12]
+        
+        model_pad_distance_history[time_step_index + 1] = nom_outputs[0][12]
 
         #Computes the MPC control input sequence based on the linearized system and nominal trajectory (SQP method)
         #Outputs the computed input sequence for the current MPC step
         print("Computing MPC control input sequence...")
-        input_sequence = mpc_control(A_list,B_list,C_list,D_list,nom_states,rollout_input_sequence,nom_outputs,input_vector_current, reference_window,hover_input,Horizon_length,d0,tau)
+        input_sequence = mpc_control(A_list,B_list,C_list,D_list,nom_states,rollout_input_sequence,nom_outputs,input_vector_current, reference_window,hover_input,Horizon_length,MPC_GATE_D0,MPC_GATE_TAU)
 
         #Sets the current input to the first element of the computed input sequence
         input_vector_current = input_sequence[0]
         print("Selected input for current time step:", input_vector_current)
 
 
-    #Stores the current input in the input vector for the current time step
-    input_vector[time_step_index] = input_vector_current
+    
+
+    print(f"  TOTAL step: {timer() - step_start:.3f} s")
 
     #Increments the time since the last MPC update and the time step index for the next iteration
     time_since_last_MPC_update += simulation_dt
     time_step_index += 1
-    save_run_data(time_step_index)
+    
 
-
+save_run_data(time_step_index)
 steps_done = time_step_index
 times = np.arange(steps_done + 1) * simulation_dt
 
@@ -556,7 +557,7 @@ plot_tracking(times, state_vector[:steps_done + 1], trajectory_generator.sample(
               predicted_friction_history=predicted_friction_history[:steps_done + 1],
               predicted_force_history=predicted_force_history[:steps_done + 1],
               model_pad_distance_history=model_pad_distance_history[:steps_done + 1],
-              contact_d0=float(d0), save_path=RUN_FOLDER / "tracking.png")
+              contact_d0=float(MPC_GATE_D0), save_path=RUN_FOLDER / "tracking.png")
 
 animate_flight(model.cfg, wall_normal_vector, wall_center_point, state_vector[:steps_done + 1], dt=simulation_dt,
                reference_positions=reference_trajectory["pad_position"],
