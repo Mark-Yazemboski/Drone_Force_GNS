@@ -1,6 +1,5 @@
 from matplotlib.animation import FuncAnimation, PillowWriter
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-import time
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -154,13 +153,14 @@ def animate_flight(drone_cfg, wall_normal, wall_point, state_history, dt,
 def plot_tracking(times, state_history, reference, pad_offset, wall_normal, wall_point,
                   normal_force_history=None, input_history=None,
                   predicted_force_history=None, model_pad_distance_history=None, contact_d0=None,
-                  save_path=None):
+                  force_ylim=None, save_path=None):
     #Reference vs what the drone actually did (and, optionally, what the model thought)
     #times: (T,)   state_history: (T, 19)   reference: trajectory_generator.sample(times)
     #normal_force_history: (T,) MuJoCo normal force (N)
     #predicted_force_history: (T,) GNN-predicted normal force at each MPC update (N)
     #model_pad_distance_history: (T,) model's min pad-to-wall distance (m)
     #contact_d0: contact gate distance (m), drawn on the distance plot
+    #force_ylim: top of the force plot (N); default is 2.5x the largest reference force
     wall_point = np.asarray(wall_point, dtype=float)
 
     #Actual and reference pad position in the wall frame (cm)
@@ -186,13 +186,24 @@ def plot_tracking(times, state_history, reference, pad_offset, wall_normal, wall
     axes[0].axhline(0.0, color="black", linewidth=0.8)      # wall surface
     axes[0].legend(loc="upper right", fontsize=8)
 
-    #Normal force: reference, MuJoCo, and what the GNN predicted
+    #Normal force: reference, MuJoCo, and what the GNN predicted.
+    #The y-axis is capped so impact spikes don't hide the tracking; spikes above the cap
+    #are marked with a triangle at the top edge.
     ax = axes[3]
+    force_top = force_ylim if force_ylim is not None else max(2.5 * np.nanmax(reference["normal_force"]), 1.0)
+
     ax.plot(times, reference["normal_force"], color=REFERENCE_COLOR, linestyle="--", label="reference")
     if normal_force_history is not None:
         ax.plot(times, normal_force_history, color=ACTUAL_COLOR, label="actual (MuJoCo)")
+        off_scale = normal_force_history > force_top
+        if np.any(off_scale):
+            ax.plot(times[off_scale], np.full(off_scale.sum(), force_top), linestyle="none", marker="^",
+                    markersize=5, color=ACTUAL_COLOR, clip_on=False,
+                    label=f"off-scale (peak {np.nanmax(normal_force_history):.0f} N)")
     if predicted_force_history is not None:
         ax.plot(times, predicted_force_history, color="#2ca02c", linestyle=":", linewidth=1.5, label="model predicted")
+
+    ax.set_ylim(-0.1 * force_top, force_top)
     ax.set_ylabel("normal force (N)")
     ax.legend(loc="upper right", fontsize=8)
 
