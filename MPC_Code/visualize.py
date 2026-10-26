@@ -1,5 +1,6 @@
 from matplotlib.animation import FuncAnimation, PillowWriter
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,6 +11,7 @@ from utilities import quat_to_rot_matrix_np
 #Colors: actual = blue, reference = orange (dashed)
 ACTUAL_COLOR = "#2a78d6"
 REFERENCE_COLOR = "#eb6834"
+MODEL_COLOR = "#2ca02c"
 
 def to_wall_frame(points, wall_normal, wall_point):
     #World points (T, 3) -> wall frame [out of wall, along wall, up wall]
@@ -20,15 +22,6 @@ def to_wall_frame(points, wall_normal, wall_point):
     wall_rotation = np.vstack([wall_normal, along_wall, up_wall])
     return (np.asarray(points) - wall_point) @ wall_rotation.T
 
-
-def tilt_from_states(state_history):
-    #Roll and pitch (ZYX Euler) from the quaternions, in degrees
-    roll, pitch = [], []
-    for state in state_history:
-        R = quat_to_rot_matrix_np(state[6:10])
-        roll.append(np.arctan2(R[2, 1], R[2, 2]))
-        pitch.append(-np.arcsin(np.clip(R[2, 0], -1, 1)))
-    return np.degrees(roll), np.degrees(pitch)
 
 def pad_from_states(state_history, pad_offset):
     #Pad position and velocity from the drone states
@@ -151,16 +144,20 @@ def animate_flight(drone_cfg, wall_normal, wall_point, state_history, dt,
 
 
 def plot_tracking(times, state_history, reference, pad_offset, wall_normal, wall_point,
-                  normal_force_history=None, input_history=None,
-                  predicted_force_history=None, model_pad_distance_history=None, contact_d0=None,
+                  normal_force_history=None, predicted_force_history=None,
+                  mujoco_friction_history=None, predicted_friction_history=None,
+                  model_pad_distance_history=None, contact_d0=None,
                   force_ylim=None, save_path=None):
-    #Reference vs what the drone actually did (and, optionally, what the model thought)
+    #Reference vs what the drone actually did (and what the model thought), as two figures:
+    #   position figure: pad position in the wall frame, and the model's pad distance to the wall
+    #   force figure:    normal force and friction, MuJoCo vs model
     #times: (T,)   state_history: (T, 19)   reference: trajectory_generator.sample(times)
-    #normal_force_history: (T,) MuJoCo normal force (N)
-    #predicted_force_history: (T,) GNN-predicted normal force at each MPC update (N)
+    #normal_force_history / predicted_force_history: (T,) MuJoCo / model normal force (N)
+    #mujoco_friction_history / predicted_friction_history: (T, 3) MuJoCo / model friction, world frame (N)
     #model_pad_distance_history: (T,) model's min pad-to-wall distance (m)
     #contact_d0: contact gate distance (m), drawn on the distance plot
-    #force_ylim: top of the force plot (N); default is 2.5x the largest reference force
+    #force_ylim: top of the force plots (N); default is 2.5x the largest reference force
+    #save_path: e.g. run_folder / "tracking.png" saves tracking_position.png and tracking_force.png
     wall_point = np.asarray(wall_point, dtype=float)
 
     #Actual and reference pad position in the wall frame (cm)
@@ -168,14 +165,13 @@ def plot_tracking(times, state_history, reference, pad_offset, wall_normal, wall
     actual_wall = 100 * to_wall_frame(pad_positions, wall_normal, wall_point)
     reference_wall = 100 * to_wall_frame(reference["pad_position"], wall_normal, wall_point)
 
-    roll, pitch = tilt_from_states(state_history)
-
     #Contact phase, shaded gray on every plot
     contact = reference["contact_flag"] > 0.5
 
-    show_distance = model_pad_distance_history is not None
-    num_rows = 7 if show_distance else 6
-    fig, axes = plt.subplots(num_rows, 1, figsize=(9, 2.2 * num_rows), sharex=True)
+
+    # ---------------- Position figure ----------------
+    position_fig, axes = plt.subplots(4, 1, figsize=(9, 9), sharex=True)
+    position_fig.suptitle("Pad position")
 
     #Pad position: out of wall, along wall, up wall
     labels = ["out of wall (cm)", "along wall (cm)", "up wall (cm)"]
@@ -186,59 +182,81 @@ def plot_tracking(times, state_history, reference, pad_offset, wall_normal, wall
     axes[0].axhline(0.0, color="black", linewidth=0.8)      # wall surface
     axes[0].legend(loc="upper right", fontsize=8)
 
-    #Normal force: reference, MuJoCo, and what the GNN predicted.
-    #The y-axis is capped so impact spikes don't hide the tracking; spikes above the cap
-    #are marked with a triangle at the top edge.
+    #Model's pad distance to the wall (mm), zoomed in near the wall, with the contact gate distance
     ax = axes[3]
+    if model_pad_distance_history is not None:
+        ax.plot(times, 1000 * model_pad_distance_history, color=ACTUAL_COLOR, label="model pad distance")
+    ax.axhline(0.0, color="black", linewidth=0.8)
+    distance_top = 20.0
+    if contact_d0 is not None:
+        ax.axhline(1000 * contact_d0, color="#e34948", linestyle="--", linewidth=1, label="gate d0")
+        distance_top = max(distance_top, 4 * 1000 * contact_d0)
+    ax.set_ylim(-5.0, distance_top)
+    ax.set_ylabel("pad dist (mm)")
+    ax.legend(loc="upper right", fontsize=8)
+
+    shade_contact(axes, times, contact)
+    position_fig.tight_layout()
+
+
+    # ---------------- Force figure ----------------
+    #Force plots are capped so impact spikes don't hide the tracking
     force_top = force_ylim if force_ylim is not None else max(2.5 * np.nanmax(reference["normal_force"]), 1.0)
 
+    force_fig, axes = plt.subplots(3, 1, figsize=(9, 7), sharex=True)
+    force_fig.suptitle("Contact force")
+
+    #Normal force: reference, MuJoCo, and what the model predicted (spikes above the cap marked with a triangle)
+    ax = axes[0]
     ax.plot(times, reference["normal_force"], color=REFERENCE_COLOR, linestyle="--", label="reference")
     if normal_force_history is not None:
-        ax.plot(times, normal_force_history, color=ACTUAL_COLOR, label="actual (MuJoCo)")
-        off_scale = normal_force_history > force_top
-        if np.any(off_scale):
-            ax.plot(times[off_scale], np.full(off_scale.sum(), force_top), linestyle="none", marker="^",
-                    markersize=5, color=ACTUAL_COLOR, clip_on=False,
-                    label=f"off-scale (peak {np.nanmax(normal_force_history):.0f} N)")
+        ax.plot(times, normal_force_history, color=ACTUAL_COLOR, label="MuJoCo")
+        mark_off_scale(ax, times, normal_force_history, force_top)
     if predicted_force_history is not None:
-        ax.plot(times, predicted_force_history, color="#2ca02c", linestyle=":", linewidth=1.5, label="model predicted")
-
+        ax.plot(times, predicted_force_history, color=MODEL_COLOR, linestyle=":", linewidth=1.5, label="model")
     ax.set_ylim(-0.1 * force_top, force_top)
     ax.set_ylabel("normal force (N)")
     ax.legend(loc="upper right", fontsize=8)
 
-    #Model's pad distance to the wall (mm), with the contact gate distance
-    row = 4
-    if show_distance:
-        ax = axes[row]
-        ax.plot(times, 1000 * model_pad_distance_history, color=ACTUAL_COLOR, label="model pad distance")
+    #Friction along and up the wall: MuJoCo vs model (no reference, friction isn't commanded)
+    friction_labels = ["friction along (N)", "friction up (N)"]
+    for i in range(2):
+        ax = axes[1 + i]
+        if mujoco_friction_history is not None:
+            mujoco_wall = to_wall_frame(mujoco_friction_history, wall_normal, np.zeros(3))
+            ax.plot(times, mujoco_wall[:, i + 1], color=ACTUAL_COLOR, label="MuJoCo")
+            mark_off_scale(ax, times, mujoco_wall[:, i + 1], force_top)
+            mark_off_scale(ax, times, -mujoco_wall[:, i + 1], force_top, bottom=True)
+        if predicted_friction_history is not None:
+            predicted_wall = to_wall_frame(predicted_friction_history, wall_normal, np.zeros(3))
+            ax.plot(times, predicted_wall[:, i + 1], color=MODEL_COLOR, linestyle=":", linewidth=1.5, label="model")
         ax.axhline(0.0, color="black", linewidth=0.8)
-        if contact_d0 is not None:
-            ax.axhline(1000 * contact_d0, color="#e34948", linestyle="--", linewidth=1, label="gate d0")
-        ax.set_ylabel("pad dist (mm)")
-        ax.legend(loc="upper right", fontsize=8)
-        row += 1
+        ax.set_ylim(-force_top, force_top)
+        ax.set_ylabel(friction_labels[i])
+    axes[1].legend(loc="upper right", fontsize=8)
 
-    #Roll and pitch
-    axes[row].plot(times, roll, label="roll")
-    axes[row].plot(times, pitch, label="pitch")
-    axes[row].set_ylabel("tilt (deg)")
-    axes[row].legend(loc="upper right", fontsize=8)
-    row += 1
+    shade_contact(axes, times, contact)
+    force_fig.tight_layout()
 
-    #Rotor speeds
-    if input_history is not None:
-        for i in range(input_history.shape[1]):
-            axes[row].plot(times, input_history[:, i], linewidth=1, label=f"rotor {i + 1}")
-        axes[row].legend(loc="upper right", fontsize=8, ncol=4)
-    axes[row].set_ylabel("rotor speed (rad/s)")
+    if save_path is not None:
+        save_path = Path(save_path)
+        position_fig.savefig(save_path.with_name(save_path.stem + "_position.png"), dpi=150)
+        force_fig.savefig(save_path.with_name(save_path.stem + "_force.png"), dpi=150)
+    plt.show()
 
+
+def shade_contact(axes, times, contact):
+    #Shades the contact phase gray and labels the time axis
     for ax in axes:
         ax.fill_between(times, 0, 1, where=contact, transform=ax.get_xaxis_transform(),
                         color="gray", alpha=0.15, linewidth=0)
     axes[-1].set_xlabel("time (s)")
-    fig.tight_layout()
 
-    if save_path is not None:
-        fig.savefig(save_path, dpi=150)
-    plt.show()
+
+def mark_off_scale(ax, times, values, limit, bottom=False):
+    #Marks values beyond the plot's limit with a triangle at the edge (top, or bottom for negatives)
+    off_scale = values > limit
+    if np.any(off_scale):
+        edge = -limit if bottom else limit
+        ax.plot(times[off_scale], np.full(off_scale.sum(), edge), linestyle="none",
+                marker="v" if bottom else "^", markersize=5, color=ACTUAL_COLOR, clip_on=False)
