@@ -2,6 +2,7 @@ import gurobipy as gp
 from gurobipy import GRB
 import torch
 import numpy as np
+import scipy.sparse as sp
 from model import Drone_Dynamics
 from scenario_generator import Trajectory_Generator
 from utilities import quat_error_map
@@ -39,8 +40,9 @@ Trained_model_path = SCRIPT_FOLDER / "MPC_Model" / "Trained_Model.pt"
 #Number of CPU cores to use: what Slurm gave this job on Roar, or every core on a normal PC
 NUM_CORES = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count()))
 
-#The linearization (torch) is the slow part, so it gets all the cores
-torch.set_num_threads(NUM_CORES)
+#CPU threads for torch. The CPU only does the small, one-at-a-time work (rollout, force prediction),
+#which often runs faster with a few threads than with all of them; try changing this and compare.
+torch.set_num_threads(min(NUM_CORES, 4))
 
 #The QP is small, so extra Gurobi threads don't help it
 gurobi_env = gp.Env(empty=True)
@@ -318,6 +320,209 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
 
     return input_sequence
 
+#Batched QP builder: the same MPC problem as mpc_control, but every cost and constraint is added
+#for the whole horizon at once using stacked (block) matrices, instead of one horizon step at a time.
+#The math is identical; it just makes a handful of big Gurobi calls instead of hundreds of small ones.
+#
+#Stacked variables:
+#   dx: (N+1)*18 numbers  [dx_0, dx_1, ..., dx_N]
+#   du:  N*4     numbers  [du_0, du_1, ..., du_{N-1}]
+#Stacked outputs (17 per step, k = 0..N):   y = y_nominal + C_big @ dx + D_big @ du
+
+
+#Sum of weight * (Mx @ dx + Mu @ du + c)^2 over every row, through one error variable per row.
+#Each row is scaled by sqrt(weight) so the objective's Q matrix stays the identity (always convex).
+def stacked_squared_error(mpc, weights, Mx, dx, Mu, du, c):
+    scale = sp.diags(np.sqrt(weights))
+    error = mpc.addMVar(len(c), lb=-GRB.INFINITY)
+    mpc.addConstr(error == (scale @ Mx) @ dx + (scale @ Mu) @ du + scale @ c)
+    return error @ error
+
+
+def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output, input_vector_current,
+                        reference_trajectory, hover_thrust_values, horizon_length, d0, tau):
+
+    #Converts any torch tensors to numpy, since Gurobi only works with numpy
+    nominal_state = [to_np(x) for x in nominal_state]
+    nominal_output = [to_np(y) for y in nominal_output]
+    nominal_input = to_np(nominal_input)
+    hover_thrust_values = to_np(hover_thrust_values)
+    input_vector_current = to_np(input_vector_current)
+
+    #If the linearization produced NaN/inf anywhere, don't build the QP, fall back to the shifted plan
+    for name, matrices in [("A", A), ("B", B), ("C", C), ("D", D), ("output", nominal_output), ("state", nominal_state)]:
+        for k, matrix in enumerate(matrices):
+            if not np.all(np.isfinite(matrix)):
+                print(f"NaN/inf in {name}[{k}], using the shifted previous plan")
+                return nominal_input
+
+    build_start = timer()
+    N = horizon_length
+    nx, nu, ny = STATE_SIZE - 1, INPUT_SIZE, len(nominal_output[0])     # 18, 4, 17
+    n = np.asarray(wall_normal_vector, dtype=float)
+
+
+    # ---------------- Stacked linear model ----------------
+
+    #Outputs at every step k = 0..N. The last step has no input, so its D block is zeros.
+    C_big = sp.block_diag(C[:N + 1], format="csr")                                          # ((N+1)*17, (N+1)*18)
+    D_big = sp.vstack([sp.block_diag(D[:N]), sp.csr_matrix((ny, N * nu))], format="csr")     # ((N+1)*17, N*4)
+    y_nominal = np.concatenate(nominal_output[:N + 1])                                       # ((N+1)*17,)
+
+    def output_rows(output_indices, steps):
+        #Row numbers in the stacked output for the given output entries at the given steps (step-major)
+        return np.array([k * ny + j for k in steps for j in output_indices])
+
+    #Contact gate at every step, from the nominal pad distance (output 12), times the contact flag
+    pad_distance = y_nominal[output_rows([12], range(N + 1))]
+    contact_sigma = reference_trajectory["contact_flag"][:N + 1] / (1.0 + np.exp(-(d0 - pad_distance) / tau))
+
+    #Steps 1..N carry the state and output costs (dx_0 = 0, so step 0 is a constant)
+    later_steps = range(1, N + 1)
+
+
+    # ---------------- Variables ----------------
+
+    #State and input deviations. The input bounds combine the motor limits and the trust region.
+    mpc = gp.Model("Aerial_Manipulator_batched", env=gurobi_env)
+    mpc.Params.OutputFlag = 0
+    mpc.Params.TimeLimit = 1.0
+    mpc.Params.NonConvex = 0
+
+    nominal_input_flat = nominal_input[:N].reshape(-1)
+    du_lower = np.maximum(MOTOR_MIN - nominal_input_flat, -INPUT_TRUST_REGION)
+    du_upper = np.minimum(MOTOR_MAX - nominal_input_flat, INPUT_TRUST_REGION)
+    dx = mpc.addMVar((N + 1) * nx, lb=-GRB.INFINITY, name="dx")
+    du = mpc.addMVar(N * nu, lb=du_lower, ub=du_upper, name="du")
+
+    #Slacks for the softened constraints, one per step k = 1..N
+    slack_roll = mpc.addMVar(N, lb=0, name="slack_roll")
+    slack_pitch = mpc.addMVar(N, lb=0, name="slack_pitch")
+    slack_contact_distance = mpc.addMVar(N, lb=0, name="slack_contact_distance")
+    slack_rotor_distance = mpc.addMVar(N, lb=0, name="slack_rotor_distance")
+
+    zeros_du = lambda rows: sp.csr_matrix((rows, N * nu))
+    zeros_dx = lambda rows: sp.csr_matrix((rows, (N + 1) * nx))
+
+
+    # ---------------- Dynamics ----------------
+
+    #Initial state deviation is zero
+    mpc.addConstr(dx[:nx] == 0)
+
+    #dx_{k+1} = A_k dx_k + B_k du_k for every k, as one block equation:
+    #   [ -A_0  I              ]          [ -B_0             ]
+    #   [       -A_1  I        ] @ dx  +  [       -B_1       ] @ du  = 0
+    #   [             ...  ... ]          [             ...  ]
+    next_state = sp.kron(sp.eye(N, N + 1, k=1), sp.eye(nx))
+    current_state = sp.hstack([sp.block_diag(A[:N]), sp.csr_matrix((N * nx, nx))])
+    mpc.addConstr((next_state - current_state).tocsr() @ dx - sp.block_diag(B[:N], format="csr") @ du == 0)
+
+
+    # ---------------- Input costs and constraints (k = 0..N-1) ----------------
+
+    #Input deviation from hover
+    cost = INPUT_WEIGHT * stacked_squared_error(
+        mpc, np.ones(N * nu), zeros_dx(N * nu), dx, sp.eye(N * nu, format="csr"), du,
+        nominal_input_flat - np.tile(hover_thrust_values, N))
+
+    #Input change from one step to the next (step 0 is compared with the input applied right now).
+    #The motor change limit is the bound on this variable.
+    previous_nominal_input = np.concatenate([input_vector_current, nominal_input_flat[:-nu]])
+    input_difference = sp.eye(N * nu) - sp.eye(N * nu, k=-nu)
+    input_change = mpc.addMVar(N * nu, lb=-MOTOR_CHANGE_LIM, ub=MOTOR_CHANGE_LIM, name="input_change")
+    mpc.addConstr(input_change == input_difference.tocsr() @ du + (nominal_input_flat - previous_nominal_input))
+    cost += INPUT_CHANGE_WEIGHT * (input_change @ input_change)
+
+    #Normal force error, weighted by the contact gate
+    rows = output_rows([0], range(N))
+    cost += stacked_squared_error(
+        mpc, NORMAL_FORCE_WEIGHT * contact_sigma[:N], C_big[rows], dx, D_big[rows], du,
+        y_nominal[rows] - reference_trajectory["normal_force"][:N])
+
+
+    # ---------------- State and output costs (k = 1..N) ----------------
+
+    #Tangent projection at each step: removes the normal direction during contact
+    projection = sp.block_diag([np.eye(3) - contact_sigma[k] * np.outer(n, n) for k in later_steps], format="csr")
+
+    #Pad position and velocity errors, projected into the wall plane during contact
+    for output_indices, reference_key, weight in [([3, 4, 5], "pad_position", POSITION_WEIGHT),
+                                                  ([6, 7, 8], "pad_velocity", VELOCITY_WEIGHT)]:
+        rows = output_rows(output_indices, later_steps)
+        reference = reference_trajectory[reference_key][1:N + 1].reshape(-1)
+        cost += stacked_squared_error(
+            mpc, weight * np.ones(len(rows)), projection @ C_big[rows], dx, projection @ D_big[rows], du,
+            projection @ (y_nominal[rows] - reference))
+
+    #Rod yaw error: e_rod = -(rod_x * n_y - rod_y * n_x)
+    rod_x, rod_y = output_rows([9], later_steps), output_rows([10], later_steps)
+    cost += stacked_squared_error(
+        mpc, ROD_ORIENTATION_WEIGHT * np.ones(N),
+        -n[1] * C_big[rod_x] + n[0] * C_big[rod_y], dx,
+        -n[1] * D_big[rod_x] + n[0] * D_big[rod_y], du,
+        -n[1] * y_nominal[rod_x] + n[0] * y_nominal[rod_y])
+
+    #Angular velocity (state entries 10:13, error-state entries 9:12)
+    angular_velocity_entries = [k * nx + i for k in later_steps for i in range(9, 12)]
+    select_angular_velocity = sp.csr_matrix((np.ones(3 * N), (np.arange(3 * N), angular_velocity_entries)),
+                                            shape=(3 * N, (N + 1) * nx))
+    cost += stacked_squared_error(
+        mpc, ANG_VEL_WEIGHT * np.ones(3 * N), select_angular_velocity, dx, zeros_du(3 * N), du,
+        np.concatenate([nominal_state[k][10:13] for k in later_steps]))
+
+    #Slack costs
+    cost += SLACK_WEIGHT_ROLL * (slack_roll @ slack_roll)
+    cost += SLACK_WEIGHT_PITCH * (slack_pitch @ slack_pitch)
+    cost += SLACK_WEIGHT_CONTACT_DISTANCE * (slack_contact_distance @ slack_contact_distance)
+    cost += SLACK_WEIGHT_ROTOR_DISTANCE * (slack_rotor_distance @ slack_rotor_distance)
+
+
+    # ---------------- Output constraints (k = 1..N) ----------------
+
+    #Pad within CONTACT_MAX_DIST of the wall, only at steps where the gate says contact
+    contact_steps = [k for k in later_steps if contact_sigma[k] >= 0.5]
+    if contact_steps:
+        rows = output_rows([12], contact_steps)
+        select_slack = sp.csr_matrix((np.ones(len(contact_steps)), (np.arange(len(contact_steps)), [k - 1 for k in contact_steps])),
+                                     shape=(len(contact_steps), N))
+        mpc.addConstr(C_big[rows] @ dx + D_big[rows] @ du - select_slack @ slack_contact_distance
+                      <= CONTACT_MAX_DIST - y_nominal[rows])
+
+    #Rotors at least ROTOR_MIN_DIST from the wall (one slack per step, shared by the 4 rotors)
+    rows = output_rows([13, 14, 15, 16], later_steps)
+    each_rotor = sp.kron(sp.eye(N), np.ones((4, 1)), format="csr")
+    mpc.addConstr(C_big[rows] @ dx + D_big[rows] @ du + each_rotor @ slack_rotor_distance
+                  >= ROTOR_MIN_DIST - y_nominal[rows])
+
+    #Roll and pitch limits
+    for output_index, limit, slack in [(1, ROLL_LIM, slack_roll), (2, PITCH_LIM, slack_pitch)]:
+        rows = output_rows([output_index], later_steps)
+        mpc.addConstr(C_big[rows] @ dx + D_big[rows] @ du - slack <= limit - y_nominal[rows])
+        mpc.addConstr(C_big[rows] @ dx + D_big[rows] @ du + slack >= -limit - y_nominal[rows])
+
+
+    # ---------------- Solve ----------------
+
+    mpc.setObjective(cost, GRB.MINIMIZE)
+
+    solve_start = timer()
+    try:
+        mpc.optimize()
+    except gp.GurobiError as error:
+        print("MPC solve error:", error, "- using the shifted previous plan")
+        return nominal_input
+    print(f"  QP build: {solve_start - build_start:.3f} s | QP solve: {timer() - solve_start:.3f} s")
+
+    if mpc.Status == GRB.SUBOPTIMAL:
+        print("MPC solve suboptimal (numerical issues), using it anyway")
+    elif mpc.Status != GRB.OPTIMAL:
+        print(f"MPC solve failed (status {mpc.Status}), using the shifted previous plan")
+        return nominal_input
+
+    #Optimized input sequence = nominal + deviation
+    return du.X.reshape(N, nu) + nominal_input[:N]
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # device = torch.device("cpu")
 
@@ -350,6 +555,15 @@ wind_vector, wall_normal_vector, wall_center_point = trajectory_generator.genera
 
 #Initializes the drone dynamics model with the trained GNN and environment parameters
 model = Drone_Dynamics(device, Trained_model_path, wall_normal_vector=wall_normal_vector, wall_center_point=wall_center_point, wind_vector=wind_vector)
+
+#A CPU copy of the model for the small, one-at-a-time work (rollout, last-step outputs, force prediction).
+#The GPU is slow at batch size 1 because every call waits on launch overhead;
+#it's only worth it for the big batched linearization.
+if device.type == "cuda":
+    model_cpu = Drone_Dynamics(torch.device("cpu"), Trained_model_path, wall_normal_vector=wall_normal_vector,
+                               wall_center_point=wall_center_point, wind_vector=wind_vector)
+else:
+    model_cpu = model
 
 #Pulls out the contact model parameters from the trained GNN to be used in the MPC controller for the contact determination
 d0, tau = model.model.contact_d0, model.model.contact_tau
@@ -457,9 +671,9 @@ for time_step in t:
     step_start = timer()
 
     #What the model predicts the contact force will be over this step (for the plots)
-    predicted_normal, predicted_friction = model.predict_contact_force(
-        torch.as_tensor(state_vector_current, dtype=torch.float32, device=device),
-        torch.as_tensor(input_vector_current, dtype=torch.float32, device=device))
+    predicted_normal, predicted_friction = model_cpu.predict_contact_force(
+        torch.as_tensor(state_vector_current, dtype=torch.float32),
+        torch.as_tensor(input_vector_current, dtype=torch.float32))
     predicted_force_history[time_step_index + 1] = predicted_normal
     predicted_friction_history[time_step_index + 1] = predicted_friction
     predict_time = timer() - step_start
@@ -486,21 +700,22 @@ for time_step in t:
         #Rolls out the previous input sequence moved by one timestep, with the last input repeated at the end
         rollout_input_sequence = np.array(list(input_sequence[1:]) + [input_sequence[-1]])
 
-        #Nominal trajectory over the horizon from the shifted plan (sequential, but cheap: no gradients)
+        #Nominal trajectory over the horizon from the shifted plan (on the CPU: sequential, batch of 1, no gradients)
         section_start = timer()
-        torch_state = torch.as_tensor(state_vector_current, dtype=torch.float32, device=device)
-        torch_inputs = torch.as_tensor(rollout_input_sequence, dtype=torch.float32, device=device)
-        nominal_states = model.rollout(torch_state, torch_inputs, MPC_dt_multiple)          # (N+1, 19)
+        torch_state = torch.as_tensor(state_vector_current, dtype=torch.float32)
+        torch_inputs = torch.as_tensor(rollout_input_sequence, dtype=torch.float32)
+        nominal_states = model_cpu.rollout(torch_state, torch_inputs, MPC_dt_multiple)          # (N+1, 19)
         rollout_time = timer() - section_start
 
-        #Linearizes every step of the horizon at once (one batched Jacobian)
+        #Linearizes every step of the horizon at once (on the GPU: one big batched Jacobian)
         section_start = timer()
-        A_all, B_all, C_all, D_all, _, nominal_outputs = model.linearize_horizon(nominal_states[:-1], torch_inputs, MPC_dt_multiple)
+        A_all, B_all, C_all, D_all, _, nominal_outputs = model.linearize_horizon(
+            nominal_states[:-1].to(device), torch_inputs.to(device), MPC_dt_multiple)
         linearize_time = timer() - section_start
 
-        #Output rows for the final state of the horizon
+        #Output rows for the final state of the horizon (on the CPU, no GNN involved)
         section_start = timer()
-        C_last, output_last = model.linearize_outputs(nominal_states[-1])
+        C_last, output_last = model_cpu.linearize_outputs(nominal_states[-1])
 
         #Lists of numpy arrays, one entry per horizon step, the way mpc_control expects them
         A_list = list(to_np(A_all))
@@ -530,7 +745,8 @@ for time_step in t:
         #Computes the MPC control input sequence based on the linearized system and nominal trajectory (SQP method)
         #Outputs the computed input sequence for the current MPC step
         print("Computing MPC control input sequence...")
-        input_sequence = mpc_control(A_list,B_list,C_list,D_list,nom_states,rollout_input_sequence,nom_outputs,input_vector_current, reference_window,hover_input,Horizon_length,MPC_GATE_D0,MPC_GATE_TAU)
+        #mpc_control builds the same QP one step at a time (easier to read); the batched version is much faster
+        input_sequence = mpc_control_batched(A_list,B_list,C_list,D_list,nom_states,rollout_input_sequence,nom_outputs,input_vector_current, reference_window,hover_input,Horizon_length,MPC_GATE_D0,MPC_GATE_TAU)
 
         #Sets the current input to the first element of the computed input sequence
         input_vector_current = input_sequence[0]
