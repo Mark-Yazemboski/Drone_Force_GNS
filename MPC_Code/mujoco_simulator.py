@@ -313,3 +313,7 @@ class MujocoDroneSim:
     def get_normal_force(self):
         #Normal force the wall pushes on the pad with (N), from the last substep
         return float(self.contact_force @ self.wall_normal_vector)
+
+    def get_friction_force(self):
+        #Friction the wall applies to the pad (N): the part of the contact force in the wall plane, world frame
+        return self.contact_force - (self.contact_force @ self.wall_normal_vector) * self.wall_normal_vector

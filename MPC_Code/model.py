@@ -109,6 +109,17 @@ class Drone_Dynamics:
         
         return a_nc, alpha_nc
 
+    def predict_contact_force(self, state_vector, rotor_speeds):
+        #Contact force the model predicts over the next step (no gradients):
+        #normal force (N, scalar) and friction (N, world-frame vector in the wall plane)
+        #used for plotting the models predicted force line for debugging and analysis
+        with torch.no_grad():
+            _, _, info = self.propagate_state(state_vector, rotor_speeds)
+        F_contact = info["F_contact"]
+        normal_force = F_contact @ self.wall_normal_vector
+        friction = F_contact - normal_force * self.wall_normal_vector
+        return normal_force.item(), friction.cpu().numpy()
+
 
     def get_contact_forces(self, com_h, R_h, a_nc, alpha_nc, wall_normal_vector, wall_center_point):
         #Takes in the COM position and rotation history, the COM's non-contact linear and angular

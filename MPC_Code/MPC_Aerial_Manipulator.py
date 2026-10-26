@@ -127,6 +127,8 @@ def save_run_data(steps_done):
              wall_center_point=wall_center_point,
              simulation_dt=simulation_dt,
              reference_time=trajectory_generator.reference_time,
+             mujoco_friction=mujoco_friction_history[:steps_done + 1],
+             predicted_friction=predicted_friction_history[:steps_done + 1],
              **{"reference_" + key: value for key, value in reference_trajectory.items()})
     print(f"Saved run data ({steps_done} steps) to {RUN_FOLDER / 'run_data.npz'}")
 
@@ -444,17 +446,25 @@ time_step_index = 0
 normal_force_history = np.zeros(len(t) + 1)
 predicted_force_history = np.full(len(t) + 1, np.nan)
 model_pad_distance_history = np.full(len(t) + 1, np.nan)
+mujoco_friction_history = np.full((len(t) + 1, 3), np.nan)
+predicted_friction_history = np.full((len(t) + 1, 3), np.nan)
 
 print("Starting simulation...")
 print("total simulation steps:", len(t))
 #Simulation loop for the aerial manipulator
 for time_step in t:
     print("Time step:", time_step_index)
+    predicted_normal, predicted_friction = model.predict_contact_force(
+        torch.as_tensor(state_vector_current, dtype=torch.float32, device=device),
+        torch.as_tensor(input_vector_current, dtype=torch.float32, device=device))
+    predicted_force_history[time_step_index + 1] = predicted_normal
+    predicted_friction_history[time_step_index + 1] = predicted_friction
 
     #propigates the system dynamics through the mojoco simulation using the current input
     state_vector[time_step_index+1] = sim.step(input_vector_current, simulation_dt)
     normal_force_history[time_step_index + 1] = sim.get_normal_force()
     state_vector_current = state_vector[time_step_index+1]
+    mujoco_friction_history[time_step_index + 1] = sim.get_friction_force()
 
     #runs the mpc controller when the time since the last update exceeds the MPC timestep
     if time_since_last_MPC_update >= MPC_dt:
@@ -542,7 +552,8 @@ times = np.arange(steps_done + 1) * simulation_dt
 plot_tracking(times, state_vector[:steps_done + 1], trajectory_generator.sample(times),
               model.pad_offset.cpu().numpy(), wall_normal_vector, wall_center_point,
               normal_force_history=normal_force_history[:steps_done + 1],
-              input_history=input_vector[:steps_done + 1],
+              mujoco_friction_history=mujoco_friction_history[:steps_done + 1],
+              predicted_friction_history=predicted_friction_history[:steps_done + 1],
               predicted_force_history=predicted_force_history[:steps_done + 1],
               model_pad_distance_history=model_pad_distance_history[:steps_done + 1],
               contact_d0=float(d0), save_path=RUN_FOLDER / "tracking.png")
