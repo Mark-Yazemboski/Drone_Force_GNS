@@ -18,8 +18,6 @@ Trained_model_path = SCRIPT_FOLDER / "MPC_Model" / "Trained_Model.pt"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("name", help="name of the run's folder in MPC_runs")
-parser.add_argument("--force_max", type=float, default=None, help="top of the force plot (N)")
-parser.add_argument("--gif", action="store_true", help="also remake the flight GIF")
 args = parser.parse_args()
 
 #Loads the saved run
@@ -53,10 +51,9 @@ plot_tracking(times, states, trajectory_generator.sample(times), pad_offset, wal
               mujoco_friction_history=saved("mujoco_friction"),
               predicted_friction_history=saved("predicted_friction"),
               model_pad_distance_history=data["model_pad_distance"],
-              contact_d0=float(model.model.contact_d0), force_ylim=args.force_max,
+              contact_d0=float(model.model.contact_d0), force_ylim=None,
               save_path=run_folder / "tracking.png")
 
-if args.gif:
-    animate_flight(model.cfg, wall_normal_vector, wall_center_point, states, dt=simulation_dt,
-                   reference_positions=trajectory_generator.reference_trajectory["pad_position"],
-                   pad_offset=pad_offset, save_path=run_folder / "flight.gif")
+animate_flight(model.cfg, wall_normal_vector, wall_center_point, states, dt=simulation_dt,
+                reference_positions=trajectory_generator.reference_trajectory["pad_position"],
+                pad_offset=pad_offset, save_path=run_folder / "flight.gif")
