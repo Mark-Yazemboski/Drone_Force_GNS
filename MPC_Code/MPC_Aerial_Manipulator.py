@@ -353,7 +353,8 @@ hover_input = model.calculate_hover_inputs().cpu().numpy()
 
 #Generates the reference trajectory based on the wall and wind conditions set above, this needed to
 #happen after model because we needed the pad offset from the model
-trajectory_time_length, reference_trajectory = trajectory_generator.generate_trajectory()
+scenario = "push"  # Example scenario, can be changed to "push", "line_horizontal", "line_vertical", or "circle"
+trajectory_time_length, reference_trajectory = trajectory_generator.generate_trajectory(scenario)
 # trajectory_time_length, reference_trajectory = trajectory_generator.generate_free_flight_trajectory(time_range = [0.5,0.5])
 
 
@@ -378,7 +379,7 @@ trajectory_time_length, reference_trajectory = trajectory_generator.generate_tra
 
 #---------------------Initilize mujoco simulation ---------------------
 #Assuming you have a mujoco model file and a mujoco simulation object
-sim = MujocoDroneSim(model.cfg, wall_normal_vector, wall_center_point, wind_vector, show_viewer=False)
+sim = MujocoDroneSim(model.cfg, wall_normal_vector, wall_center_point, wind_vector, motor_tau=0.0005, show_viewer=False)
 state_vector_current = sim.reset(trajectory_generator.initial_state, hover_input)
 
 

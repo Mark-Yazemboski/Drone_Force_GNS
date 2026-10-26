@@ -6,6 +6,7 @@ GNS/models/*
 GNS/data/pytorch_datasets/*
 /figure_assets/*
 !/GNS/data/pytorch_datasets/.gitkeep
+/MPC_Code/MPC_runs/*
 
 __pycache__/
 *.py[cod]
