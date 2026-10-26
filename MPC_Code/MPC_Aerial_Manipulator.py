@@ -9,6 +9,7 @@ from mujoco_simulator import MujocoDroneSim
 import time
 from visualize import animate_flight, plot_tracking
 import os
+import json
 
 import warnings
 
@@ -18,6 +19,19 @@ from pathlib import Path
 
 #Folder this script lives in (MPC_Code), so the path works on any computer
 SCRIPT_FOLDER = Path(__file__).resolve().parent
+
+
+Run_Name = "testing_freeflight"
+
+#Seeds the random scenario so this exact run can be regenerated later
+seed =  int(np.random.SeedSequence().entropy % 2**32)
+np.random.seed(seed)
+
+#Folder for this run's results: MPC_runs/<name>
+RUN_FOLDER = SCRIPT_FOLDER / "MPC_runs" / Run_Name
+RUN_FOLDER.mkdir(parents=True, exist_ok=True)
+print("Run name:", Run_Name, "| seed:", seed)
+print("Saving results to:", RUN_FOLDER)
 
 #path of the trained contact and fluid model GNN
 Trained_model_path = SCRIPT_FOLDER / "MPC_Model" / "Trained_Model.pt"
@@ -70,7 +84,6 @@ INPUT_SIZE = 4 #Input: [Rotor1rpm, Rotor2rpm, Rotor3rpm, Rotor4rpm]
 def calculate_contact_gate(pad_dist, d0, tau):
     return torch.sigmoid(torch.tensor((d0 - pad_dist) / tau)).item()
 
-#Maps the 3-number rotation error onto the 4-number quaternion (first order, world-frame perturbation)
 
 
 #Builds the full 19-number linearized state from the nominal state and the 18-number correction
@@ -97,6 +110,26 @@ def squared_error(mpc, expression, size):
     mpc.addConstr(error == expression)
     return error @ error
 
+def save_run_data(steps_done):
+    #Saves everything needed to look at or replay this run
+    #inputs[i] is the input applied between states[i] and states[i+1]
+    np.savez(RUN_FOLDER / "run_data.npz",
+             times=np.arange(steps_done + 1) * simulation_dt,
+             states=state_vector[:steps_done + 1],
+             inputs=input_vector[:steps_done],
+             normal_force=normal_force_history[:steps_done + 1],
+             predicted_force=predicted_force_history[:steps_done + 1],
+             model_pad_distance=model_pad_distance_history[:steps_done + 1],
+             initial_state=trajectory_generator.initial_state,
+             hover_input=hover_input,
+             wind_vector=wind_vector,
+             wall_normal_vector=wall_normal_vector,
+             wall_center_point=wall_center_point,
+             simulation_dt=simulation_dt,
+             reference_time=trajectory_generator.reference_time,
+             **{"reference_" + key: value for key, value in reference_trajectory.items()})
+    print(f"Saved run data ({steps_done} steps) to {RUN_FOLDER / 'run_data.npz'}")
+
 #Performs MPC control using the Sequential Quadratic Programming (SQP) approach
 def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_current,reference_trajectory,hover_thrust_values,horizon_length,d0,tau):
 
@@ -106,6 +139,13 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     nominal_input = to_np(nominal_input)
     hover_thrust_values = to_np(hover_thrust_values)
     input_vector_current = to_np(input_vector_current)
+
+    #If the linearization produced NaN/inf anywhere, don't build the QP, fall back to the shifted plan
+    for name, matrices in [("A", A), ("B", B), ("C", C), ("D", D), ("output", nominal_output), ("state", nominal_state)]:
+        for k, matrix in enumerate(matrices):
+            if not np.all(np.isfinite(matrix)):
+                print(f"NaN/inf in {name}[{k}], using the shifted previous plan")
+                return nominal_input
 
     
     #Initializes the MPC optimization model using Gurobi
@@ -292,6 +332,7 @@ wind_vector, wall_normal_vector, wall_center_point = trajectory_generator.genera
 
 
 
+
 #-------------------- INITIALIZE MODEL ---------------------------------------------
 
 
@@ -312,7 +353,9 @@ hover_input = model.calculate_hover_inputs().cpu().numpy()
 
 #Generates the reference trajectory based on the wall and wind conditions set above, this needed to
 #happen after model because we needed the pad offset from the model
-trajectory_time_length, reference_trajectory = trajectory_generator.generate_trajectory()
+# trajectory_time_length, reference_trajectory = trajectory_generator.generate_trajectory()
+trajectory_time_length, reference_trajectory = trajectory_generator.generate_free_flight_trajectory(time_range = [0.5,0.5])
+
 
 # trajectory_time_length, reference_trajectory = trajectory_generator.generate_free_flight_trajectory(time_range=[3, 3])
 # print("Trajectory time length:", trajectory_time_length)
@@ -351,6 +394,24 @@ MPC_dt = GNN_trained_dt*MPC_dt_multiple
 #Sets the MPC horizon length
 Horizon_length = 50
 
+#Saves the settings this run used, so the results can be matched to them later
+settings = dict(
+    name=Run_Name, seed=seed,
+    simulation_dt=simulation_dt, MPC_dt_multiple=MPC_dt_multiple, horizon_length=Horizon_length,
+    weights=dict(position=POSITION_WEIGHT, velocity=VELOCITY_WEIGHT, rod_orientation=ROD_ORIENTATION_WEIGHT,
+                 angular_velocity=ANG_VEL_WEIGHT, normal_force=NORMAL_FORCE_WEIGHT,
+                 input=INPUT_WEIGHT, input_change=INPUT_CHANGE_WEIGHT),
+    slack_weights=dict(roll=SLACK_WEIGHT_ROLL, pitch=SLACK_WEIGHT_PITCH,
+                       contact_distance=SLACK_WEIGHT_CONTACT_DISTANCE, rotor_distance=SLACK_WEIGHT_ROTOR_DISTANCE),
+    limits=dict(motor_min=MOTOR_MIN, motor_max=MOTOR_MAX, motor_change=MOTOR_CHANGE_LIM,
+                trust_region=INPUT_TRUST_REGION, contact_max_dist=CONTACT_MAX_DIST,
+                rotor_min_dist=ROTOR_MIN_DIST, roll_lim=ROLL_LIM, pitch_lim=PITCH_LIM),
+    wind_vector=wind_vector.tolist(), wall_normal_vector=wall_normal_vector.tolist(),
+    wall_center_point=wall_center_point.tolist())
+
+with open(RUN_FOLDER / "settings.json", "w") as file:
+    json.dump(settings, file, indent=2)
+
 #Initializes the time since the last MPC update
 time_since_last_MPC_update = MPC_dt
 
@@ -369,7 +430,7 @@ state_vector = np.zeros((len(t)+1,STATE_SIZE))
 state_vector[0] = state_vector_current
 
 #Initializes the input vector for the simulation with the hover input as the current input
-input_vector = np.zeros((len(t)+1,INPUT_SIZE))
+input_vector = np.full((len(t)+1, INPUT_SIZE), np.nan)
 
 input_vector[0] = hover_input
 input_vector_current = input_vector[0]
@@ -431,6 +492,17 @@ for time_step in t:
             nom_states.append(x_next_nom)
             nom_outputs.append(nominal_output)
 
+        #Find where the nominal rollout first goes non-finite (if it does)
+        if not np.all(np.isfinite(state_vector_current)):
+            print("MuJoCo state is non-finite:", state_vector_current)
+        for i in range(1, len(nom_states)):
+            if not np.all(np.isfinite(to_np(nom_states[i]))):
+                print(f"Nominal rollout went non-finite at step {i}")
+                print("  state before:", to_np(nom_states[i - 1]))
+                print("  input used:  ", rollout_input_sequence[i - 1])
+                print("  model pad distance before:", to_np(nom_outputs[i - 1])[12])
+                break
+
         
         #Converts the current nominal state and input to torch tensors for linearization
         torch_nom_state = torch.as_tensor(nom_states[-1], dtype=torch.float32,device=device)
@@ -460,20 +532,24 @@ for time_step in t:
     #Increments the time since the last MPC update and the time step index for the next iteration
     time_since_last_MPC_update += simulation_dt
     time_step_index += 1
+    save_run_data(time_step_index)
 
 
-animate_flight(model.cfg, wall_normal_vector, wall_center_point, state_vector, dt=simulation_dt,
+steps_done = time_step_index
+times = np.arange(steps_done + 1) * simulation_dt
+
+plot_tracking(times, state_vector[:steps_done + 1], trajectory_generator.sample(times),
+              model.pad_offset.cpu().numpy(), wall_normal_vector, wall_center_point,
+              normal_force_history=normal_force_history[:steps_done + 1],
+              input_history=input_vector[:steps_done + 1],
+              predicted_force_history=predicted_force_history[:steps_done + 1],
+              model_pad_distance_history=model_pad_distance_history[:steps_done + 1],
+              contact_d0=float(d0), save_path=RUN_FOLDER / "tracking.png")
+
+animate_flight(model.cfg, wall_normal_vector, wall_center_point, state_vector[:steps_done + 1], dt=simulation_dt,
                reference_positions=reference_trajectory["pad_position"],
                pad_offset=model.pad_offset.cpu().numpy(),
-               save_path="first_flight.gif")
-
-times = np.arange(len(state_vector)) * simulation_dt
-plot_tracking(times, state_vector, trajectory_generator.sample(times),
-              model.pad_offset.cpu().numpy(), wall_normal_vector, wall_center_point,
-              normal_force_history=normal_force_history, input_history=input_vector,
-              predicted_force_history=predicted_force_history,
-              model_pad_distance_history=model_pad_distance_history,
-              contact_d0=float(d0), save_path="Figures/tracking.png")
+               save_path=RUN_FOLDER / "flight.gif")
 
 print("wind disturbance applied")
 print("Wind vector:", wind_vector)
