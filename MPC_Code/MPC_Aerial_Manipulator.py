@@ -10,6 +10,10 @@ import time
 from visualize import animate_flight, plot_tracking
 import os
 
+import warnings
+
+warnings.filterwarnings("ignore", message=".*np.chararray.*")
+
 from pathlib import Path
 
 #Folder this script lives in (MPC_Code), so the path works on any computer
