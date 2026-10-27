@@ -1,3 +1,4 @@
+import time
 import torch
 import numpy as np
 import mujoco
@@ -96,4 +97,20 @@ def so3_log_np(R):
     if theta < 1e-6:
         return vee
     return theta / np.sin(theta) * vee
+
+#Converts a torch tensor or numpy array to a numpy array, ensuring compatibility with Gurobi and other numpy-based operations
+def to_np(v):
+    return v.detach().cpu().numpy() if torch.is_tensor(v) else np.asarray(v)
+
+#Calculates the contact gate using a sigmoid function based on the pad distance, reference distance, and a smoothing factor tau
+def calculate_contact_gate(pad_dist, d0, tau):
+    return torch.sigmoid(torch.tensor((d0 - pad_dist) / tau)).item()
+
+#Current time, for timing sections of code. GPU calls return before the GPU has finished,
+#so when a CUDA device is given it waits for the GPU first; otherwise the GPU time would
+#show up in whatever runs next. With no device (CPU-only code like the QP), it just reads the clock.
+def timer(device=None):
+    if device is not None and device.type == "cuda":
+        torch.cuda.synchronize()
+    return time.perf_counter()
 
