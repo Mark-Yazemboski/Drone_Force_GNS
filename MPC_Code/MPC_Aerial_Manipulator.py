@@ -151,7 +151,7 @@ trajectory_time_length, reference_trajectory = trajectory_generator.generate_tra
 
 #---------------------Initilize mujoco simulation ---------------------
 #Assuming you have a mujoco model file and a mujoco simulation object
-sim = MujocoDroneSim(model.cfg, wall_normal_vector, wall_center_point, wind_vector, motor_tau=0.0005, show_viewer=False)
+sim = MujocoDroneSim(model.cfg, wall_normal_vector, wall_center_point, wind_vector, motor_tau=0.025, show_viewer=False)
 state_vector_current = sim.reset(trajectory_generator.initial_state, hover_input)
 
 
