@@ -46,19 +46,6 @@ torch.set_num_threads(min(NUM_CORES, 4))
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 def save_run_data(steps_done):
     #Saves everything needed to look at or replay this run
     #inputs[i] is the input applied between states[i] and states[i+1]
@@ -97,7 +84,7 @@ Trajectory_plan_dt = 0.1
 
 #Defines the ranges for the wall yaw angle and wind speed magnitude
 wall_yaw_range = (-np.pi/6, np.pi/6)
-wind_range = (0, 5)
+wind_range = (0, 0)
 
 #Generates the reference trajectory given a trajectory length (seconds), maximum wall tilt, wind range, and the trajectory plan dt
 trajectory_generator = Trajectory_Generator(wind_range, wall_yaw_range, Trajectory_plan_dt)
