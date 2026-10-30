@@ -436,5 +436,5 @@ class Drone_Dynamics:
         def h(dx):
             return (self.outputs(self.perturb(state_batch, dx.unsqueeze(0)), no_force) - nominal_output)[0]
 
-        C = torch.autograd.functional.jacobian(h, torch.zeros(18, device=self.device))
+        C = torch.autograd.functional.jacobian(h, torch.zeros(18, device=self.device), vectorize=True)
         return C, nominal_output[0]
