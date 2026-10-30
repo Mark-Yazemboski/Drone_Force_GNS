@@ -84,7 +84,7 @@ def sample_eval_scenario(cfg_true, gs, rng, kind=None):
         kind = str(rng.choice(kinds, p=np.asarray(probs) / sum(probs)))
     lever = float(np.linalg.norm((np.asarray(cfg_true.rod_tip) - c_off)[:2]))
     yaw_cap = lambda c_h: gs.yaw_torque_budget / (lever * (gs.mu * c_h + abs(math.sin(yo))) + 1e-9)
-    s0, seg = MG.make_scenario(kind, rng, cfg_true.pad_contact_radius, rng.uniform(*gs.duration), yaw_cap)
+    s0, seg = MG.make_scenario(kind, rng, cfg_true.pad_contact_radius, rng.uniform(*gs.duration), gs, yaw_cap)
     T_frames = int(MG.Reference(s0, seg).T / dt) + 1
 
     w_mean = np.zeros(3)
@@ -128,7 +128,7 @@ def _reference(sc, cfg_true):
 
     def p_com_ref(t):
         r, ph = ref(t)
-        return wp + r["d"] * n + r["a"] * t1 + r["b"] * t2 - tip_off, r["F"], ph
+        return wp + r["d"] * n + r["a"] * t1 + r["b"] * t2 - tip_off, MG.push_force_vector(r, n, t1, t2), ph
 
     return p_com_ref, R_h
 
@@ -163,7 +163,7 @@ def _run(sc, cfg_true, gs, start_plant, step_plant):
         p_d, F_push, ph = p_com_ref(t)
         v_d = (p_com_ref(t + eps)[0] - p_com_ref(t - eps)[0]) / (2 * eps)
         a_d = (p_com_ref(t + eps)[0] - 2 * p_d + p_com_ref(t - eps)[0]) / eps ** 2
-        T_cmd = ctrl(com, v, R, w_b, p_d, v_d, a_d, -sc["n"] * F_push, sc["heading"])
+        T_cmd = ctrl(com, v, R, w_b, p_d, v_d, a_d, F_push, sc["heading"])
         u = np.clip(T_cmd * (1.0 + sc["ex"][k]), 0.0, ctrl.t_max)
         phase.append(ph)
         cmds.append(u)

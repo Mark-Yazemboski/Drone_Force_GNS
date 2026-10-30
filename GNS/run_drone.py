@@ -22,10 +22,10 @@ trajectory_folder = os.path.join(script_dir, "data/mj_drone_100hz")
 # Val and test never change, so every run (and every ablation) is scored on the same
 # data. N_train picks how much of the pool to train on; smaller runs use the first
 # N_train, so a 75-trajectory run's data is a subset of a 150-trajectory run's.
-N_train = 300
+N_train = 900
 train_range = range(0, N_train)
-val_range = range(300, 400)
-test_range = range(400, 500)
+val_range = range(900, 1050)
+test_range = range(1050, 1200)
 rotor_speed_in_rpm = False          # True if hardware logs are in RPM rather than rad/s
 rotor_speed_hold = None             # None -> read from each file's meta ("aligned" for MuJoCo)
 
@@ -63,7 +63,7 @@ settings = DroneTrainSettings(
     k_pad_init=0.05,                # pad drag    k_pad * |u| u
 
     # ---- windows / batches ----
-    multistep=4, batch_size=1024,
+    multistep=8, batch_size=1024,
     eval_batch_size=2048,           # no-grad passes only (stats, refit, validation): speed, not results
     pred_loss="mse",                # prediction loss, both stages: "mse" or "huber" (linear beyond huber_delta)
     huber_delta=1.0,                # normalized units: 1 = RMS of the signal the stage learns
@@ -74,8 +74,7 @@ settings = DroneTrainSettings(
 
     # ---- stage 1: aero (contact-free windows) ----
     # Training length is in OPTIMIZER STEPS (same for every N_train); each stage prints the
-    # equivalent epochs. 23,200 / 38,800 = 200 / 400 epochs at 300 trajectories, batch 1024.
-    aero_steps=23200, aero_lr=6e-4,
+    aero_steps=46400, aero_lr=6e-4,
     w_aero_anchor=0.1,              # each aero node toward its drag law (shapes the network)
     w_aero_coeff_fit=0.01,          # only used with drag_coeff_fit="gradient"
     w_aero_smooth=0.01,             # aero force smooth in time
@@ -86,7 +85,7 @@ settings = DroneTrainSettings(
     lr_schedule="cosine",           # network lr decays to 0 over each stage (None = constant)
 
     # ---- stage 2: contact (near-wall windows, aero frozen) ----
-    contact_steps=38800, contact_lr=2e-4,
+    contact_steps=77600, contact_lr=2e-4,
     w_fric_dir=1.0, w_fric_mag=1.0, w_fric_cone=1.0,
     mu_init=0.3, learn_mu=True,
 
@@ -110,7 +109,7 @@ Save_run_report = True
 
 # Closed-loop evaluation: fresh scenarios flown with MuJoCo and with the model as the plant.
 N_closed_loop = 30
-closed_loop_kinds = ("tap", "push", "slide")   # cycled through; None = the generator's mix
+closed_loop_kinds = ("tap", "push", "slide", "arc")   # cycled through; None = the generator's mix
 closed_loop_seed = 1234                         # same seed -> same scenarios across runs, so runs compare
 N_visualize = 9                                 # PNG + GIF for the first N closed-loop runs
 sanity_check = True                             # also fly the first push with the contact network off

@@ -27,7 +27,7 @@ inputs. So any controller that reliably makes the contacts we want is fine.
 
 PHYSICS IN THE SIM
   rotor thrust + yaw reaction: site actuators, gear = [0 0 1 0 0 -s*k_m/k_f]
-  body aero:  MuJoCo ellipsoid fluid model with opt.wind (gusts via OU process)
+  body aero:  MuJoCo ellipsoid fluid model with opt.wind (OU gusts, off by default)
   rotor drag: per rotor, k_rotor * m * omega_i * u_perp_i at that rotor's hub,
               where u_perp_i is the hub's local airspeed (wind minus hub velocity,
               including rotation) with the rotor-axis component removed. Applied
@@ -72,10 +72,14 @@ STABILITY NOTES (learned building this; they apply to hardware too)
     Horizontal friction, and the normal force on a yawed rod (which grows with
     the yaw error), can out-torque it, so push forces are capped from a yaw budget.
 
-Run:  python mujoco_drone_generator.py --out data/mj_drone --n 300
-      python mujoco_drone_generator.py --out data/mj_drone_wind --n 500 --wind-max 5 --gust-std 0.4
-      (use the flags for wind; don't edit the GenSettings defaults, the closed-loop
-       test falls back to them for data generated before settings were recorded)
+SCENARIO SETTINGS
+  Every scenario range (push force, approach speeds, hover distances, slide and
+  arc speeds, sideways loads, scenario mix, wind) is a GenSettings field at the
+  top of this file. Each trajectory saves them in meta["gen_settings"], and the
+  closed-loop test rebuilds its scenarios from that, so it always matches the data.
+
+Run:  python mujoco_drone_generator.py --out data/mj_drone_wind --n 1200
+      python mujoco_drone_generator.py --out data/mj_drone_wind --n 1200 --wind-max 3   (override wind)
       python mujoco_drone_generator.py --out data/mj_drone --n 5 --verify
       python mujoco_drone_generator.py --replay data/mj_drone/3.pt   (viewer)
 On ROAR, split with --start (array task index * n) so seeds never overlap.
@@ -112,15 +116,54 @@ class GenSettings:
     # well under a degree. A larger time constant mimics a rubber pad, which
     # spreads load over several nodes. Match the real pad.
     pad_solref: tuple = (0.004, 1.0)
-    wind_max: float = 0             # m/s mean wind
-    gust_std: float = 0             # m/s
-    excite_max: float = 0.04        # max relative rotor-command noise
+
+    # ---- wind ----
+    wind_max: float = 5.0           # m/s; 70% of trajectories get a mean wind U(0, wind_max), 30% none
+    gust_std: float = 0.0           # m/s, OU gusts (off)
+    # The controller has no integral term, so wind holds it 1-2 cm off its target,
+    # which swamps the few-mm hover gaps. True: cancel last substep's aero force
+    # in the feedforward (the wind still shows in the motion and rotor speeds).
+    aero_feedforward: bool = True
+
+    # ---- excitation / wall / heading ----
+    excite_max: float = 0.1         # max relative rotor-command noise
     tilted_wall_prob: float = 0
     wall_tilt_max_deg: float = 0
     yaw_offset_max_deg: float = 10.0
     yaw_torque_budget: float = 0.15 # N m of yaw torque the pad's moments may use (see make_scenario)
-    scenario_probs: tuple = (("free", 0.10), ("hover_near", 0.15), ("tap", 0.20),
-                             ("push", 0.25), ("slide", 0.30))
+
+    # ---- scenario mix ----
+    scenario_probs: tuple = (("free", 0.05), ("hover_near", 0.15), ("tap", 0.10),
+                             ("push", 0.25), ("slide", 0.30), ("arc", 0.15))
+
+    # ---- push force (push, slide, arc) ----
+    push_force: tuple = (0.2, 3.0)              # N, log-uniform; the top is also capped by the yaw budget
+    push_approach_speed: tuple = (0.03, 0.3)    # m/s, log-uniform
+
+    # ---- hover_near ----
+    hover_near_gap: tuple = (0.001, 0.008)      # m above touching (pad-center d = r_c + gap): where the gate is partly open
+    hover_near_count: int = 2                   # hovers per trajectory in that band
+    hover_far_dist: tuple = (0.012, 0.15)       # m, pad-center distance for the farther hovers
+    hover_far_max: int = 1                      # 0 to this many farther hovers per trajectory
+
+    # ---- tap ----
+    tap_approach_speed: tuple = (0.05, 0.5)     # m/s
+
+    # ---- straight slides ----
+    slide_speed: tuple = (0.01, 0.2)            # m/s, log-uniform (slip gate is at 0.03 m/s)
+    slide_dist: tuple = (0.05, 0.25)            # m
+    slide_max_time: float = 4.0                 # s, caps the distance of slow slides
+    slide_count_max: int = 2                    # 1 to this many slides per trajectory
+
+    # ---- arc slides ----
+    arc_radius: tuple = (0.05, 0.15)            # m
+    arc_laps: tuple = (0.5, 1.0)                # fraction of a full circle
+    arc_speed: tuple = (0.03, 0.15)             # m/s, mean speed along the arc
+
+    # ---- sideways-loaded static holds (push, slide, arc) ----
+    side_load_prob: float = 0.5                 # fraction of push/slide/arc trajectories that get one
+    side_load_frac: tuple = (0.3, 1.2)          # tangential push as a fraction of mu * F (>1 creeps / breaks away)
+    side_load_time: tuple = (0.5, 1.5)          # s to ramp the sideways push in
 
 
 # ======================================================================
@@ -302,13 +345,18 @@ class GeometricController:
 
 class Reference:
     """Segments of (duration, target, phase); targets are d (pad-center distance
-    from the wall along n), a/b (along-wall coordinates), F (push force, N).
-    Each segment is a min-jerk move from the previous target."""
+    from the wall along n), a/b (along-wall coordinates), F (push force, N),
+    Fa/Fb (sideways push along t1/t2, N). Each segment is a min-jerk move from
+    the previous target. A target with an "arc" entry (center_a, center_b,
+    radius, start angle, swept angle) moves a/b along that circle instead of a
+    straight line, with the same min-jerk timing."""
 
     def __init__(self, start, segments):
         self.start = dict(start)
-        self.t, self.vals, self.phase = [0.0], [dict(start)], []
+        self.t, self.vals, self.phase, self.arcs = [0.0], [dict(start)], [], []
         for dur, tgt, ph in segments:
+            tgt = dict(tgt)
+            self.arcs.append(tgt.pop("arc", None))
             v = dict(self.vals[-1])
             v.update(tgt)
             self.t.append(self.t[-1] + dur)
@@ -322,15 +370,21 @@ class Reference:
         tau = (t - self.t[k]) / (self.t[k + 1] - self.t[k])
         s = tau ** 3 * (10 - 15 * tau + 6 * tau ** 2)
         a, b = self.vals[k], self.vals[k + 1]
-        return {key: a[key] + (b[key] - a[key]) * s for key in a}, self.phase[k]
+        out = {key: a[key] + (b[key] - a[key]) * s for key in a}
+        if self.arcs[k] is not None:
+            ca, cb, radius, th0, dth = self.arcs[k]
+            th = th0 + dth * s
+            out["a"], out["b"] = ca + radius * math.cos(th), cb + radius * math.sin(th)
+        return out, self.phase[k]
 
 
 # Builds a randomized scenario. r_c = pad contact-sphere radius: a pad-center
 # distance of r_c means the pad is just touching (if it is flat to the wall).
-# Returns the start values and the list of segments.
-def make_scenario(kind, rng, r_c, duration, yaw_force_cap=None):
+# All ranges come from gs (GenSettings). Returns the start values and the list of segments.
+def make_scenario(kind, rng, r_c, duration, gs, yaw_force_cap=None):
     U = rng.uniform
-    start = dict(d=U(0.25, 0.6), a=U(-0.3, 0.3), b=U(-0.3, 0.3), F=0.0)
+    logU = lambda lo, hi: math.exp(U(math.log(lo), math.log(hi)))     # log-uniform
+    start = dict(d=U(0.25, 0.6), a=U(-0.3, 0.3), b=U(-0.3, 0.3), F=0.0, Fa=0.0, Fb=0.0)
     cur, seg = dict(start), []
 
     def add(dur, phase, **tgt):
@@ -345,37 +399,71 @@ def make_scenario(kind, rng, r_c, duration, yaw_force_cap=None):
         while sum(sg[0] for sg in seg) < duration:
             add(U(0.8, 2.0), "free", d=U(0.4, 1.2), a=U(-0.6, 0.6), b=U(-0.4, 0.4))
     elif kind == "hover_near":
-        # Graded standoff distances with the gate provably off (data-plan stage 2).
-        for d in sorted(U(r_c + 0.005, 0.15, size=int(rng.integers(2, 4))), reverse=True):
+        # Dense hovering just off the wall (gate partly open, no force), plus a
+        # few farther standoffs. d is the pad-center distance, so with a yaw
+        # offset a ring node can touch on the closest hovers; that is fine.
+        near = r_c + U(*gs.hover_near_gap, size=gs.hover_near_count)
+        far = U(*gs.hover_far_dist, size=int(rng.integers(0, gs.hover_far_max + 1)))
+        for d in sorted(np.r_[near, far], reverse=True):
             add(U(0.6, 1.2), "approach", d=d)
             add(U(0.8, 1.5), "hover_near")
         add(U(0.6, 1.0), "release", d=U(0.3, 0.6))
     elif kind == "tap":
-        # Impacts: fly in at speed with no push, touch briefly, back off.
+        # Impacts: fly in with no push, touch briefly, back off.
         for _ in range(int(rng.integers(1, 3))):
-            approach(r_c - U(0.0, 0.01), U(0.15, 0.6))
+            approach(r_c - U(0.0, 0.01), U(*gs.tap_approach_speed))
             add(U(0.1, 0.4), "hold")
             add(U(0.5, 1.0), "release", d=U(0.15, 0.4))
-    elif kind in ("push", "slide"):
+    elif kind in ("push", "slide", "arc"):
         # Pushing is limited by yaw authority. Horizontal friction at the pad,
         # and the normal force when the rod is yawed off the wall normal, act
         # on the rod's ~0.4 m lever arm, and a quad's yaw torque is only
         # k_m/k_f ~ 1.6 cm times the thrust differential. The yawed-rod moment
         # also grows with the yaw error (pushing a stick against a wall), so
-        # once yaw saturates it runs away. yaw_force_cap(|cos ang|) is the
-        # largest push that keeps both inside the yaw budget.
-        slides = [(U(0, 2 * math.pi), U(0.1, 0.4), U(0.05, 0.25))
-                  for _ in range(int(rng.integers(1, 3)))] if kind == "slide" else []
-        f_max = 6.0
+        # once yaw saturates it runs away. yaw_force_cap(c) is the largest push
+        # that keeps both inside the yaw budget when the horizontal tangential
+        # load is c * mu * F.
+        slides = []
+        if kind == "slide":
+            for _ in range(int(rng.integers(1, gs.slide_count_max + 1))):
+                speed = logU(*gs.slide_speed)
+                slides.append((U(0, 2 * math.pi), min(U(*gs.slide_dist), gs.slide_max_time * speed), speed))
+        # Sideways-loaded hold: (direction in the wall plane, load as a fraction of mu * F)
+        side = (U(0, 2 * math.pi), U(*gs.side_load_frac)) if U() < gs.side_load_prob else None
+
+        f_max = gs.push_force[1]
         if yaw_force_cap is not None:
-            f_max = min([f_max, yaw_force_cap(0.0)] + [yaw_force_cap(abs(math.cos(a))) for a, _, _ in slides])
-        f_min = min(1.0, 0.5 * f_max)
-        approach(r_c - U(0.0, 0.005), U(0.1, 0.4))
-        add(U(0.3, 0.6), "hold", F=U(f_min, f_max))                   # ramp the push in
-        add(U(0.5, 1.5), "hold", F=U(f_min, f_max))                   # vary it while holding
+            caps = [yaw_force_cap(0.0)] + [yaw_force_cap(abs(math.cos(a))) for a, _, _ in slides]
+            if kind == "arc":
+                caps.append(yaw_force_cap(1.0))                       # friction turns through every direction
+            if side is not None:
+                caps.append(yaw_force_cap(side[1] * abs(math.cos(side[0]))))
+            f_max = min([f_max] + caps)
+        f_min = min(gs.push_force[0], 0.5 * f_max)
+
+        approach(r_c - U(0.0, 0.005), logU(*gs.push_approach_speed))
+        add(U(0.3, 0.6), "hold", F=logU(f_min, f_max))                # ramp the push in
+        add(U(0.5, 1.5), "hold", F=logU(f_min, f_max))                # vary it while holding
+
+        # Load the friction sideways without (or barely) sliding, then unload.
+        if side is not None:
+            ang, frac = side
+            f_t = frac * gs.mu * cur["F"]
+            add(U(*gs.side_load_time), "hold", Fa=f_t * math.cos(ang), Fb=f_t * math.sin(ang))
+            add(U(0.3, 0.6), "hold", Fa=0.0, Fb=0.0)
+
         for ang, dist, speed in slides:
             add(dist / speed, "slide", a=cur["a"] + dist * math.cos(ang),
                 b=cur["b"] + dist * math.sin(ang))
+
+        if kind == "arc":
+            radius, speed = U(*gs.arc_radius), U(*gs.arc_speed)
+            th0 = U(0, 2 * math.pi)                                   # angle of the current point on the circle
+            dth = rng.choice([-1.0, 1.0]) * 2 * math.pi * U(*gs.arc_laps)
+            ca, cb = cur["a"] - radius * math.cos(th0), cur["b"] - radius * math.sin(th0)
+            end = dict(a=ca + radius * math.cos(th0 + dth), b=cb + radius * math.sin(th0 + dth))
+            add(abs(dth) * radius / speed, "slide", arc=(ca, cb, radius, th0, dth), **end)
+
         add(U(0.3, 0.6), "release", F=0.0)
         add(U(0.6, 1.0), "release", d=U(0.2, 0.5))
     else:
@@ -489,6 +577,12 @@ def wall_tangents(n):
     return t1, np.cross(t1, n)
 
 
+# Feedforward force the controller adds for the reference r: F into the wall,
+# plus the sideways load (Fa along t1, Fb along t2) of the loaded holds.
+def push_force_vector(r, n, t1, t2):
+    return -n * r["F"] + t1 * r["Fa"] + t2 * r["Fb"]
+
+
 # Places the wall (a mocap box) so its surface passes through wall_point with
 # outward normal n. MuJoCo does not re-pose static worldbody geoms when
 # model.geom_pos changes, which is why the wall lives on a mocap body.
@@ -534,14 +628,14 @@ def simulate_trajectory(model, cfg_true, gs, rng, pulse=None):
     kind = str(rng.choice(kinds, p=np.asarray(probs) / sum(probs)))
     lever = float(np.linalg.norm((np.asarray(cfg_true.rod_tip) - c_off)[:2]))
     yaw_cap = lambda c_h: gs.yaw_torque_budget / (lever * (gs.mu * c_h + abs(math.sin(yo))) + 1e-9)
-    s0, seg = make_scenario(kind, rng, cfg_true.pad_contact_radius, rng.uniform(*gs.duration), yaw_cap)
+    s0, seg = make_scenario(kind, rng, cfg_true.pad_contact_radius, rng.uniform(*gs.duration), gs, yaw_cap)
     ref = Reference(s0, seg)
     T_frames = int(ref.T / dt) + 1
 
     def p_com_ref(t):
         r, ph = ref(t)
         p_tip = wall_point + r["d"] * n + r["a"] * t1 + r["b"] * t2
-        return p_tip - tip_off, r["F"], ph
+        return p_tip - tip_off, push_force_vector(r, n, t1, t2), ph
 
     # ---- wind: mean + OU gusts ----
     w_mean = np.zeros(3)
@@ -589,7 +683,9 @@ def simulate_trajectory(model, cfg_true, gs, rng, pulse=None):
             p_d, F_push, _ = p_com_ref(t)
             v_d = (p_com_ref(t + eps)[0] - p_com_ref(t - eps)[0]) / (2 * eps)
             a_d = (p_com_ref(t + eps)[0] - 2 * p_d + p_com_ref(t - eps)[0]) / eps ** 2
-            T_cmd = ctrl(com, v_com, R, w_b, p_d, v_d, a_d, -n * F_push, heading)
+            if gs.aero_feedforward and j > 0:
+                F_push = F_push - log_Fa[j - 1]                        # aero force of the last substep
+            T_cmd = ctrl(com, v_com, R, w_b, p_d, v_d, a_d, F_push, heading)
             hc = gs.ctrl_every * h
             ex += -ex * hc / ex_tau + ex_sig * math.sqrt(2 * hc / ex_tau) * rng.normal(size=M)
             data.ctrl[:] = np.clip(T_cmd * (1.0 + ex), 0.0, ctrl.t_max)
