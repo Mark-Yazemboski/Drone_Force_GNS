@@ -14,6 +14,7 @@ ONE STEP, IN ORDER
      distance, the non-contact acceleration, the wall normal, and node type.
      Outputs per node: tangential (projected into the wall plane) + softplus
      normal, multiplied by a distance gate that is computed, not predicted.
+     Optionally (friction_cap) each node's friction is held inside a cone.
   5. Rigid-body integrator: Verlet on the COM, angular-momentum update on SO(3).
 
 Units: positions in m; everything the integrator consumes is a specific force
@@ -202,11 +203,18 @@ class ContactGNN(_GNN):
 
 # Contact force per node: tangential part projected into the wall plane,
 # softplus normal part along n, times the gate. n_hat is per sample (B,1,3).
-def assemble_contact_forces(contact_raw, c_w, n_hat, scale_vec):
+# friction_cap: if set, each node's friction is smoothly saturated at
+# friction_cap * (its normal force):  F_t <- F_t / sqrt(1 + (|F_t| / (cap F_n))^2)
+# (unchanged for small F_t, never above the cone).
+def assemble_contact_forces(contact_raw, c_w, n_hat, scale_vec, friction_cap=None):
     t_scaled = contact_raw[..., 0:3] * scale_vec
     t_vec = t_scaled - (t_scaled * n_hat).sum(-1, keepdim=True) * n_hat
     s_n = (scale_vec * n_hat).norm(dim=-1, keepdim=True)
-    return c_w * (t_vec + Fnn.softplus(contact_raw[..., 3:4]) * s_n * n_hat)
+    f_n = Fnn.softplus(contact_raw[..., 3:4]) * s_n
+    if friction_cap is not None:
+        ratio = t_vec.norm(dim=-1, keepdim=True) / (friction_cap * f_n + 1e-12)
+        t_vec = t_vec / torch.sqrt(1.0 + ratio ** 2)
+    return c_w * (t_vec + f_n * n_hat)
 
 
 def _cross(a, b):
@@ -227,6 +235,7 @@ class DroneForceModel(nn.Module):
         self.contact_d0, self.contact_tau = s.contact_d0, s.contact_tau
         self.dist_clamp = tuple(s.contact_dist_clamp)
         self.aero_dist_max = s.aero_dist_max
+        self.friction_cap = s.friction_cap
 
         # Rotor layout and inertia.
         for k, v in rotor_and_inertia_tensors(cfg).items():
@@ -426,7 +435,7 @@ class DroneForceModel(nn.Module):
         n_ = wall_n.unsqueeze(1)
         dist = ((hist[-1] - wall_c.unsqueeze(1)) * n_).sum(-1, keepdim=True)
         c_w = contact_weight(dist, self.contact_d0, self.contact_tau) * self.contact_mask
-        return assemble_contact_forces(raw, c_w, n_, self.contact_scale), c_w
+        return assemble_contact_forces(raw, c_w, n_, self.contact_scale, self.friction_cap), c_w
 
     # ---------------- non-contact part of a step ----------------
     # Thrust + aero, and (if contact will run) the contact-graph node history and

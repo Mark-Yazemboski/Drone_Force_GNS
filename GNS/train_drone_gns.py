@@ -56,6 +56,9 @@ class DroneTrainSettings:
     contact_d0: float = 0.006       # gate center: pad sphere radius (4 mm) + margin
     contact_tau: float = 0.0015
     aero_dist_max: float = 1.0      # rotor-to-wall distance is clamped/scaled by this (m)
+    # Hard friction cone per contact node: |F_t| <= friction_cap * F_n (smooth saturation).
+    # None = off. A fixed, conservative bound (above the true mu), not the learned mu.
+    friction_cap: float = None
     contact_dist_clamp: tuple = (-0.05, 0.5)   # contact-GNN wall-distance feature clamped to this range (m),
                                                # as in the cube; a tighter range (e.g. (-0.01, 0.02)) spends
                                                # more of the normalized feature on the last few mm
@@ -110,6 +113,10 @@ class DroneTrainSettings:
     # noise_frac x that stage's median residual (the typical size of the signal
     # it learns); rotation noise gives the same displacement at the pad.
     noise_frac: float = 0.2
+    # Stage-2 override (None = noise_frac). The contact GNN only sees non-zero slip
+    # velocity during stick if noise puts it there: MuJoCo's stuck pad has v_t = 0 exactly,
+    # so without noise the response to slip-velocity errors is never trained.
+    contact_noise_frac: float = None
     com_noise: float = None         # m/step, explicit override
     rot_noise: float = None         # rad/step, explicit override
     rotate_aug: bool = True
@@ -190,9 +197,12 @@ def _batches(data, index, s, device, K, train, noise=(0.0, 0.0)):
 # an RMS-based level is set by taps and drowns the 1-5 N pushes.
 def _stage_noise(model, s, stage):
     scale = float(model.noise_ref_contact if stage == "contact" else model.noise_ref_aero)
-    com = s.com_noise if s.com_noise is not None else s.noise_frac * scale
+    frac = s.noise_frac
+    if stage == "contact" and s.contact_noise_frac is not None:
+        frac = s.contact_noise_frac
+    com = s.com_noise if s.com_noise is not None else frac * scale
     lever = float(model.aero_rest.norm(dim=1).max())
-    rot = s.rot_noise if s.rot_noise is not None else s.noise_frac * scale / lever
+    rot = s.rot_noise if s.rot_noise is not None else frac * scale / lever
     return com, rot
 
 

@@ -27,6 +27,34 @@ from drone_closed_loop import evaluate_closed_loop, gen_settings_for
 from visualize_drone_model import plot_closed_loop, animate_closed_loop
 
 
+# Friction chatter in one closed-loop run, during sustained contact (MuJoCo force
+# 0.05-10 N on two consecutive frames): RMS frame-to-frame change of the friction
+# vector (N per 10 ms step) for MuJoCo, the one-step model and the closed-loop model,
+# and the fraction of closed-loop frames whose friction exceeds mu x normal.
+def friction_jitter(r, mu):
+    true, pred, one, n = r["true"], r["pred"], r["one_step"], r["scenario"]["n"]
+    T = min(true["n_frames"], pred["n_frames"])
+    mag = np.linalg.norm(true["F_contact"][:T], axis=1)
+    sustained = (mag > 0.05) & (mag < 10.0)
+    both = sustained[1:] & sustained[:-1]
+    if not both.any():
+        return {}
+
+    def tangential(F):
+        return F - (F @ n)[:, None] * n
+
+    out = {}
+    for name, F in (("label", true["F_contact"][:T]), ("one_step", one["F_contact"][:T]),
+                    ("closed_loop", pred["F_contact"][:T])):
+        dF = np.linalg.norm(np.diff(tangential(F), axis=0), axis=1)[both]
+        out[f"ft_jitter_{name}_N"] = float(np.sqrt((dF ** 2).mean()))
+    if mu:
+        F = pred["F_contact"][:T][sustained]
+        F_n = np.maximum(F @ n, 0.0)
+        out["ft_over_cone_frac"] = float((np.linalg.norm(tangential(F), axis=1) > mu * F_n + 0.02).mean())
+    return out
+
+
 def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
                        closed_loop_kinds=("tap", "push", "slide"), closed_loop_seed=1234,
                        n_visualize=3, make_gifs=True, gif_stride=3, sanity_check=True, device="cpu",
@@ -81,6 +109,21 @@ def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
                       "closed_loop_sustained_contact_rmse_N", "one_step_sustained_contact_rmse_N"):
                 metrics[f"closed_loop_{kind}_{k}"] = float(np.nanmean([m.get(k, np.nan) for m in sel]))
         mu_true = meta.get("mu") if meta else None
+        jit = [dict(kind=r["scenario"]["kind"], **friction_jitter(r, mu_true)) for r in results]
+        jit_keys = ("ft_jitter_label_N", "ft_jitter_one_step_N", "ft_jitter_closed_loop_N", "ft_over_cone_frac")
+        for kind in [None] + sorted({j["kind"] for j in jit}):
+            sel = [j for j in jit if kind is None or j["kind"] == kind]
+            tag = "closed_loop" if kind is None else f"closed_loop_{kind}"
+            for k in jit_keys:
+                vals = [j[k] for j in sel if k in j]
+                if vals:
+                    metrics[f"{tag}_{k}"] = float(np.mean(vals))
+        if "closed_loop_ft_jitter_label_N" in metrics:
+            print(f"  friction chatter (RMS change per step, sustained contact): MuJoCo "
+                  f"{metrics['closed_loop_ft_jitter_label_N']:.3f} N, one step {metrics['closed_loop_ft_jitter_one_step_N']:.3f} N, "
+                  f"closed loop {metrics['closed_loop_ft_jitter_closed_loop_N']:.3f} N"
+                  + (f" | closed-loop friction above the cone in {100 * metrics['closed_loop_ft_over_cone_frac']:.0f}% of frames"
+                     if "closed_loop_ft_over_cone_frac" in metrics else ""))
         for i, r in enumerate(results[:n_visualize]):
             r["mu_true"] = mu_true
             stem = os.path.join(out_folder, f"closed_loop_{i}_{r['scenario']['kind']}")
