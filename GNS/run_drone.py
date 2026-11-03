@@ -88,6 +88,8 @@ settings = DroneTrainSettings(
     contact_steps=77600, contact_lr=2e-4,
     w_fric_dir=1.0, w_fric_mag=1.0, w_fric_cone=1.0,
     mu_init=0.3, learn_mu=True,
+    contact_noise_frac=None,
+    friction_cap=None,
 
     # ---- validation ----
     val_horizon=20,                 # steps rolled forward per window (match the MPC horizon)
@@ -96,7 +98,7 @@ settings = DroneTrainSettings(
     best_metric="val_loss",         # checkpoint kept: "val_loss" (MSE), "val_huber", or "pad_err" (pad error after val_horizon)
 )
 
-run_name = "drone_two_stage"
+run_name = "noisestuff"
 model_folder_path = os.path.join(script_dir, "models", run_name)
 save_model_path = os.path.join(model_folder_path, run_name + ".pt")
 
