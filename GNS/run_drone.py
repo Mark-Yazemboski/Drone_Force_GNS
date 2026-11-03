@@ -95,7 +95,7 @@ settings = DroneTrainSettings(
     val_horizon=20,                 # steps rolled forward per window (match the MPC horizon)
     val_stride=5,                   # start a validation window every 5 frames
     val_interval_steps=1000,        # validate about every 1000 optimizer steps
-    best_metric="val_loss",         # checkpoint kept: "val_loss" (MSE), "val_huber", or "pad_err" (pad error after val_horizon)
+    best_metric="val_huber",         # checkpoint kept: "val_loss" (MSE), "val_huber", or "pad_err" (pad error after val_horizon)
 )
 
 run_name = "noisestuff"
