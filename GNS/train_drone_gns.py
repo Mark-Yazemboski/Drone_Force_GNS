@@ -145,6 +145,8 @@ class DroneTrainSettings:
     w_fric_dir: float = 1.0
     w_fric_mag: float = 1.0
     w_fric_cone: float = 1.0
+    w_contact_reversal: float = 0.0  # high-low-high penalty on the net contact wrench over the unroll
+                                     # (see contact_reversal); 0 = off. Needs multistep >= 4.
     mu_init: float = 0.3
     learn_mu: bool = True
     slip_v0: float = 3e-4           # m/step (0.03 m/s at dt = 0.01 s); slides are 0.05-0.25 m/s
@@ -341,6 +343,21 @@ def _fmt_k(k):
 # Loss
 # ======================================================================
 
+# High-low-high penalty on the predicted net contact wrench over one unroll.
+# Per component, a reversal at step k is relu(-d_k * d_{k+1}) with d_k the step-to-step
+# change; the penalty is the smaller of two CONSECUTIVE reversals, so it is zero for
+# contact turning on or off (no reversal) and for a single impact peak (one reversal),
+# and positive only for a sustained up-down-up pattern. Force is normalized by the
+# contact output scale and torque by that scale times the pad's lever arm.
+def contact_reversal(f_series, tau_series, model):
+    lever = model.contact_rest.norm(dim=-1).max()
+    z = torch.stack([torch.cat([f / model.contact_scale, t / (model.contact_scale * lever)], -1)
+                     for f, t in zip(f_series, tau_series)])             # (K, B, 6)
+    d = z[1:] - z[:-1]
+    rev = torch.relu(-d[1:] * d[:-1])                                     # (K-2, B, 6)
+    return torch.minimum(rev[1:], rev[:-1]).sum(-1).mean()
+
+
 PRED_LOSSES = ("mse", "huber")
 BEST_METRICS = ("val_loss", "val_huber", "pad_err")
 
@@ -363,9 +380,10 @@ def unroll_loss(model, phys, batch, s, stage, pred_kind=None):
     loss_scale = model.loss_scale_contact if use_contact else model.loss_scale_aero
     com_h, R_h = _window(batch, h)
     n_b1 = batch["wall_n"].unsqueeze(1)
-    fric_w = dict(w_fric_dir=s.w_fric_dir, w_fric_mag=s.w_fric_mag, w_fric_cone=s.w_fric_cone)
+    fric_w = dict(w_fric_dir=s.w_fric_dir, w_fric_mag=s.w_fric_mag, w_fric_cone=s.w_fric_cone,
+                  w_contact_reversal=s.w_contact_reversal)
 
-    pred_terms, raws, F_series = [], {}, []
+    pred_terms, raws, F_series, T_series = [], {}, [], []
     for k in range(K):
         com_n, R_n, aux = model.step(com_h, R_h, batch["omega"][:, k], batch["wind"][:, k],
                                      batch["wall_n"], batch["wall_c"], use_contact=use_contact)
@@ -402,6 +420,8 @@ def unroll_loss(model, phys, batch, s, stage, pred_kind=None):
             for name, v in phys.compute_step_terms(aux["phi_c"], aux["c_w"], aux["v_node"], n_b1,
                                                    zeros, zeros, fric_w).items():
                 raws[name] = raws.get(name, 0.0) + v / K
+            F_series.append(aux["f_c"])
+            T_series.append(aux["tau_c"])
 
         com_h = com_h[1:] + [com_n]
         R_h = R_h[1:] + [R_n]
@@ -416,6 +436,8 @@ def unroll_loss(model, phys, batch, s, stage, pred_kind=None):
                        aero_smooth=s.w_aero_smooth)
         total = total + sum(weights[n] * v for n, v in raws.items()) + s.w_prior * model.params.prior_loss()
     else:
+        if s.w_contact_reversal > 0 and K >= 4:
+            raws["contact_reversal"] = contact_reversal(F_series, T_series, model)
         total = total + PhysicsLosses.weighted_total(raws, fric_w)
     return total, pred.detach(), {n: float(torch.as_tensor(v).detach()) for n, v in raws.items()}
 
