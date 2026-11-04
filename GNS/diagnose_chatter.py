@@ -3,13 +3,12 @@
     python diagnose_chatter.py --data data/MPC_mj_drone_wind --range 1050 1200 \
         --models models/New_Data_For_MPC/New_Data_For_MPC_final.pt models/fric_cap/fric_cap_final.pt
 
-1. STEP STABILITY at sustained contact (MuJoCo force 0.2-10 N), from true states.
-   The model's next COM position along a direction u depends on the last three:
-       x[k+1] = a0 x[k] + a1 x[k-1] + a2 x[k-2]   (linearized, a = finite differences of model.step)
-   A free body has a = (2, -1, 0), eigenvalues (1, 1, 0). An eigenvalue near -1 means the
-   step overcorrects and flips sign every step (period-2 chatter); beyond -1 it grows.
-   Reported along the wall normal and along the friction direction, split into stuck
-   (pad slip below slip_v0) and sliding frames.
+1. STEP STABILITY at sustained contact (MuJoCo force 0.2-10 N), from true states: one
+   model step linearized in all 6 DOF of each history pose (see step_stability). A free
+   body has eigenvalues of modulus 1 (printed for reference: the same frames with the
+   contact net off); an eigenvalue near -1 means the step overcorrects and
+   flips sign every step (period-2 chatter), beyond -1 it grows. Also reports whether that
+   most-negative mode is rotation or translation. Split into stuck and sliding frames.
 2. OPEN-LOOP CHATTER from mid-contact starts (recorded rotor speeds, no controller):
    RMS step-to-step change and RMS second difference of the normal and friction force,
    model vs MuJoCo, during sustained contact over the first 0.5 s.
@@ -35,64 +34,90 @@ def load_data(folder, rng, cfg):
 
 
 # ---------------------------------------------------------------- 1. step stability
+# Linearizes one model step about a true state in all 6 DOF of each of the h+1 history
+# poses (state ordered newest first, pose = [position (3), rotation (3)], rotations
+# perturbed as R <- exp(d) R in the world frame, as in the MPC's linearize):
+#     dz[k+1] = A dz[k],  A = [[A_new], [I 0 0], [0 I 0]]   (18 x 18 for h = 2)
+# A free body has eigenvalues of modulus 1 (and 0). For the eigenvalue with the most
+# negative real part, rot_share says whether that mode lives in rotation or translation:
+# the rotation part of its eigenvector (newest pose) times the pad lever arm, as a share
+# of rotation + translation, i.e. which one moves the pad.
+# use_contact=False gives the reference: the same frames with the contact net off, i.e.
+# thrust + aero only (about 1.00). Runs in float64: eigenvalue 1 is a repeated root, so
+# float32 rounding in A would show up magnified in the eigenvalues.
 @torch.no_grad()
-def step_stability(model, data, device, eps=2e-5, stride=2, max_frames=20000):
+def step_stability(model, data, device, eps=1e-6, stride=2, max_frames=6000, use_contact=True):
+    import copy
+    from force_gns import so3_exp, so3_log
+    model = copy.deepcopy(model).double()
     h = model.h
+    n_hist = h + 1
+    lever = float(model.contact_rest.norm(dim=-1).max())
+    eps_r = eps / lever                                                # same displacement at the pad
     idx = build_chain_index(data, h, 1, stride=stride)
     rows = []
-    for b in iterate_drone_chains(data, idx, 2048, h, 1, device, shuffle=False):
+    for b in iterate_drone_chains(data, idx, 1024, h, 1, device, shuffle=False):
         F = b["F_contact"][:, 0]
         n = b["wall_n"]
         Fn = (F * n).sum(-1)
-        Ft = F - Fn.unsqueeze(-1) * n
-        keep = (F.norm(dim=-1) > 0.2) & (F.norm(dim=-1) < 10.0) & (Fn > 0.2) & (Ft.norm(dim=-1) > 0.02)
+        keep = (F.norm(dim=-1) > 0.2) & (F.norm(dim=-1) < 10.0) & (Fn > 0.2)
         if not keep.any():
             continue
-        sel = lambda x: x[keep]
+        sel = lambda x: x[keep].double()
         com_h = [sel(c) for c in _window(b, h)[0]]
         R_h = [sel(R) for R in _window(b, h)[1]]
         om, wind, wn, wc = sel(b["omega"][:, 0]), sel(b["wind"][:, 0]), sel(n), sel(b["wall_c"])
-        t_hat = Ft[keep] / Ft[keep].norm(dim=-1, keepdim=True)
+        B = len(om)
 
         # pad slip speed over the last step (stuck vs sliding)
         pad = model.pad_rest
         p1 = com_h[-1].unsqueeze(1) + torch.einsum('bij,nj->bni', R_h[-1], pad)
         p0 = com_h[-2].unsqueeze(1) + torch.einsum('bij,nj->bni', R_h[-2], pad)
         v = (p1 - p0).mean(1)
-        v_t = (v - (v * wn).sum(-1, keepdim=True) * wn).norm(dim=-1)
-        stuck = v_t < 3e-4                                            # slip gate, 0.03 m/s
+        stuck = (v - (v * wn).sum(-1, keepdim=True) * wn).norm(dim=-1) < 3e-4      # slip gate, 0.03 m/s
 
-        for name, u in (("normal", wn), ("friction", t_hat)):
-            a = []
-            for j in (2, 1, 0):                                       # x[k], x[k-1], x[k-2]
-                out = []
-                for sgn in (1.0, -1.0):
-                    ch = list(com_h)
-                    ch[j] = ch[j] + sgn * eps * u
-                    com_n, _, _ = model.step(ch, R_h, om, wind, wn, wc)
-                    out.append((com_n * u).sum(-1))
-                a.append((out[0] - out[1]) / (2 * eps))
-            A = torch.zeros(len(u), 3, 3, device=u.device)
-            A[:, 0, 0], A[:, 0, 1], A[:, 0, 2] = a
-            A[:, 1, 0] = 1.0
-            A[:, 2, 1] = 1.0
-            ev = torch.linalg.eigvals(A.double().cpu())
-            rows.append(dict(dir=name, stuck=stuck.cpu().numpy(),
-                             radius=ev.abs().max(-1).values.numpy(),
-                             most_negative=ev.real.min(-1).values.numpy()))
-        if sum(len(r["radius"]) for r in rows) >= 2 * max_frames:
+        com_nom, R_nom, _ = model.step(com_h, R_h, om, wind, wn, wc, use_contact=use_contact)
+        A_new = torch.zeros(B, 6, 6 * n_hist, device=om.device, dtype=om.dtype)
+        for col in range(6 * n_hist):
+            age, dof = divmod(col, 6)                                  # age 0 = newest pose
+            j = n_hist - 1 - age
+            out = []
+            for sgn in (1.0, -1.0):
+                ch, Rh = list(com_h), list(R_h)
+                e = torch.zeros(B, 3, device=om.device, dtype=om.dtype)
+                if dof < 3:
+                    e[:, dof] = sgn * eps
+                    ch[j] = ch[j] + e
+                else:
+                    e[:, dof - 3] = sgn * eps_r
+                    Rh[j] = so3_exp(e) @ Rh[j]
+                com_n, R_n, _ = model.step(ch, Rh, om, wind, wn, wc, use_contact=use_contact)
+                out.append(torch.cat([com_n - com_nom, so3_log(R_n @ R_nom.transpose(-1, -2))], -1))
+            A_new[:, :, col] = (out[0] - out[1]) / (2 * (eps if dof < 3 else eps_r))
+        A = torch.zeros(B, 6 * n_hist, 6 * n_hist, device=om.device, dtype=om.dtype)
+        A[:, :6] = A_new
+        A[:, 6:, :-6] = torch.eye(6 * (n_hist - 1), device=om.device, dtype=om.dtype)
+        ev, vec = torch.linalg.eig(A.cpu())
+        i_neg = ev.real.argmin(-1)
+        v_neg = vec[torch.arange(B), :, i_neg]                         # eigenvector of that eigenvalue
+        t_part = v_neg[:, 0:3].abs().norm(dim=-1)
+        r_part = v_neg[:, 3:6].abs().norm(dim=-1) * lever
+        rows.append(dict(stuck=stuck.cpu().numpy(), radius=ev.abs().max(-1).values.numpy(),
+                         most_negative=ev.real.min(-1).values.numpy(),
+                         rot_share=(r_part / (t_part + r_part + 1e-30)).numpy()))
+        if sum(len(r["radius"]) for r in rows) >= max_frames:
             break
 
     out = {}
-    for name in ("normal", "friction"):
-        for regime, pick in (("stuck", True), ("sliding", False)):
-            rad = np.concatenate([r["radius"][r["stuck"] == pick] for r in rows if r["dir"] == name])
-            neg = np.concatenate([r["most_negative"][r["stuck"] == pick] for r in rows if r["dir"] == name])
-            if rad.size:
-                out[(name, regime)] = dict(n=rad.size, radius_median=np.median(rad),
-                                           frac_unstable=np.mean(rad > 1.02),
-                                           frac_period2=np.mean(neg < -0.9),
-                                           most_negative_median=np.median(neg))
+    cat = lambda key, pick: np.concatenate([r[key][r["stuck"] == pick] for r in rows])
+    for regime, pick in (("stuck", True), ("sliding", False)):
+        rad, neg, rot = cat("radius", pick), cat("most_negative", pick), cat("rot_share", pick)
+        if rad.size:
+            p2 = neg < -0.9
+            out[regime] = dict(n=rad.size, radius_median=np.median(rad), frac_unstable=np.mean(rad > 1.02),
+                               frac_period2=np.mean(p2), most_negative_median=np.median(neg),
+                               rot_share_period2=np.median(rot[p2]) if p2.any() else float("nan"),
+                               rot_share_all=np.median(rot))
     return out
 
 
@@ -179,11 +204,15 @@ def main():
         data = load_data(a.data, a.range, cfg)
         print("\n" + "=" * 78 + f"\n{path}   (friction_cap={s.friction_cap}, contact_noise_frac={s.contact_noise_frac})")
 
-        print("1. step stability at sustained contact (eigenvalues of the linearized step)")
-        for (name, regime), v in step_stability(model, data, a.device).items():
-            print(f"   {name:8s} {regime:7s} ({v['n']:5d} frames)  spectral radius median {v['radius_median']:.3f} | "
+        print("1. step stability at sustained contact, full 6-DOF linearization of one step from true states")
+        ref = step_stability(model, data, a.device, use_contact=False)
+        for regime, v in step_stability(model, data, a.device).items():
+            print(f"   {regime:7s} ({v['n']:5d} frames)  spectral radius median {v['radius_median']:.3f} "
+                  f"(contact net off: {ref[regime]['radius_median']:.3f}) | "
                   f"unstable (>1.02) {100 * v['frac_unstable']:4.1f}% | period-2 (eig < -0.9) {100 * v['frac_period2']:4.1f}% | "
                   f"most negative eig median {v['most_negative_median']:+.2f}")
+            print(f"            most-negative mode lives in rotation: {100 * v['rot_share_all']:.0f}% (all frames), "
+                  f"{100 * v['rot_share_period2']:.0f}% (period-2 frames)")
 
         print("2. open-loop chatter, mid-contact starts, first 0.5 s, sustained contact "
               "(RMS change per step / RMS second difference, N)")
