@@ -11,6 +11,8 @@
      recorded rotor speeds with no controller, from 4 start points each, with the
      contact network on and off. Time to 1 cm / 5 cm pad error, error-growth
      figure, one GIF per start kind.
+  5. Chatter (see diagnose_chatter.py) on the test set: step stability at sustained
+     contact, open-loop force chatter vs MuJoCo, reversal penalty size (chatter_* keys).
 
 Returns one flat dict of metrics for the run report.
 """
@@ -58,7 +60,8 @@ def friction_jitter(r, mu):
 def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
                        closed_loop_kinds=("tap", "push", "slide"), closed_loop_seed=1234,
                        n_visualize=3, make_gifs=True, gif_stride=3, sanity_check=True, device="cpu",
-                       data_wind_max=None, open_loop=True, open_loop_horizon_s=2.0, n_open_loop_gifs=4):
+                       data_wind_max=None, open_loop=True, open_loop_horizon_s=2.0, n_open_loop_gifs=4,
+                       chatter=True):
     model, cfg, s, ck = load_checkpoint(model_path, device)
     phys = _make_phys(cfg, s).to(device)
     phys.load_state_dict(ck["phys"])
@@ -162,4 +165,11 @@ def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
         metrics.update(evaluate_open_loop(model, cfg, test_data, out_folder, horizon_s=open_loop_horizon_s,
                                           n_gifs=n_open_loop_gifs if make_gifs else 0, gif_stride=gif_stride,
                                           device=device, mu_true=meta.get("mu") if meta else None))
+
+    if chatter and test_data:
+        from diagnose_chatter import chatter_metrics, print_chatter
+        print("\nchatter diagnostic (test set)")
+        m = chatter_metrics(model_path, test_data, "cuda" if torch.cuda.is_available() else device)
+        print_chatter(m)
+        metrics.update(m)
     return metrics

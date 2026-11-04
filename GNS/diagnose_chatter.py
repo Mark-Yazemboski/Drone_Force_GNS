@@ -14,10 +14,18 @@
    model vs MuJoCo, during sustained contact over the first 0.5 s.
 3. REVERSAL PENALTY SIZE: the w_contact_reversal term and the prediction loss on
    stage-2 windows of this data, and the weight at which the penalty is 10% / 30% of it.
-Nothing is trained or saved.
+Nothing is trained. With --master_csv the numbers are also written into each model's
+row of the master tracker (run name = the model's folder name), as metrics.chatter_*
+columns. evaluate_drone_model.py calls chatter_metrics() itself, so new runs get these
+columns automatically; this flag is for runs that were evaluated before that.
+
+    python diagnose_chatter.py --data data/MPC_mj_drone_wind --range 1050 1200 \
+        --models models/*/*_final.pt --master_csv models/drone_master_tracker.csv
 """
 
 import argparse
+import csv
+import os
 
 import numpy as np
 import torch
@@ -174,6 +182,7 @@ def penalty_size(model, s, cfg, data, device, max_batches=20):
     idx = filter_chain_index(data, build_chain_index(data, s.h, K, stride=3), s.h, K, max_dist=s.contact_max_pad_dist)
     pred = rev = 0.0
     nb = 0
+    torch.manual_seed(0)                                   # same batches for every model
     for b in iterate_drone_chains(data, idx, 1024, s.h, K, device, shuffle=True):
         _, p, _ = unroll_loss(model, phys, b, s, "contact")
         com_h, R_h = _window(b, s.h)
@@ -191,41 +200,104 @@ def penalty_size(model, s, cfg, data, device, max_batches=20):
     return pred / nb, rev / nb
 
 
+# ---------------------------------------------------------------- all three, flat
+# One flat dict of every number above (keys chatter_*), for the run report / master CSV.
+def chatter_metrics(model_path, data, device):
+    model, cfg, s, _ = load_checkpoint(model_path, device)
+    out = {}
+    ref = step_stability(model, data, device, use_contact=False)
+    for regime, v in step_stability(model, data, device).items():
+        t = f"chatter_{regime}_"
+        out[t + "n"] = v["n"]
+        out[t + "radius"] = v["radius_median"]
+        out[t + "radius_contact_off"] = ref[regime]["radius_median"]
+        out[t + "unstable_frac"] = v["frac_unstable"]
+        out[t + "period2_frac"] = v["frac_period2"]
+        out[t + "most_negative_eig"] = v["most_negative_median"]
+        out[t + "rot_share"] = v["rot_share_all"]
+
+    ch, n_runs = open_loop_chatter(model, cfg, data, device)
+    out["chatter_open_loop_n"] = n_runs
+    for comp, label in (("n", "normal"), ("t", "friction")):
+        for src in ("model", "mujoco"):
+            d1, d2 = ch[f"{src}_{comp}"]
+            out[f"chatter_open_loop_{label}_{src}_dF_N"] = d1
+            out[f"chatter_open_loop_{label}_{src}_d2F_N"] = d2
+
+    pred, rev = penalty_size(model, s, cfg, data, device)
+    out["chatter_pred_loss"] = pred
+    out["chatter_reversal_raw"] = rev
+    return out
+
+
+def print_chatter(m):
+    print("1. step stability at sustained contact, full 6-DOF linearization of one step from true states")
+    for regime in ("stuck", "sliding"):
+        t = f"chatter_{regime}_"
+        if t + "n" not in m:
+            continue
+        print(f"   {regime:7s} ({m[t + 'n']:5d} frames)  spectral radius median {m[t + 'radius']:.3f} "
+              f"(contact net off: {m[t + 'radius_contact_off']:.3f}) | "
+              f"unstable (>1.02) {100 * m[t + 'unstable_frac']:4.1f}% | "
+              f"period-2 (eig < -0.9) {100 * m[t + 'period2_frac']:4.1f}% | "
+              f"most negative eig median {m[t + 'most_negative_eig']:+.2f} | "
+              f"in rotation {100 * m[t + 'rot_share']:.0f}%")
+
+    print("2. open-loop chatter, mid-contact starts, first 0.5 s, sustained contact "
+          "(RMS change per step / RMS second difference, N)")
+    for label in ("normal", "friction"):
+        t = f"chatter_open_loop_{label}_"
+        print(f"   {label:8s} model {m[t + 'model_dF_N']:.3f} / {m[t + 'model_d2F_N']:.3f}   "
+              f"MuJoCo {m[t + 'mujoco_dF_N']:.3f} / {m[t + 'mujoco_d2F_N']:.3f}   "
+              f"({m['chatter_open_loop_n']} starts)")
+
+    pred, rev = m["chatter_pred_loss"], m["chatter_reversal_raw"]
+    print(f"3. stage-2 windows: prediction loss {pred:.3e}, reversal penalty (raw) {rev:.3e}")
+    if rev > 0:
+        print(f"   w_contact_reversal for a 10% / 30% share of the prediction loss: "
+              f"{0.1 * pred / rev:.3g} / {0.3 * pred / rev:.3g}")
+
+
+# Writes the metrics into run_name's existing row of the master CSV (adds columns as needed).
+def add_to_master(master_csv, run_name, metrics):
+    with open(master_csv, newline="") as f:
+        rdr = csv.DictReader(f)
+        fieldnames = list(rdr.fieldnames)
+        rows = list(rdr)
+    row = next((r for r in rows if r["run_name"] == run_name), None)
+    if row is None:
+        print(f"   [master] no row named {run_name}, skipped")
+        return
+    for k, v in metrics.items():
+        col = f"metrics.{k}"
+        if col not in fieldnames:
+            fieldnames.append(col)
+        row[col] = repr(float(v))
+    with open(master_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, restval="")
+        w.writeheader()
+        w.writerows(rows)
+    print(f"   [master] wrote {len(metrics)} chatter columns to row {run_name}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", required=True)
     ap.add_argument("--range", type=int, nargs=2, required=True, help="trajectory ids [start, stop)")
     ap.add_argument("--models", nargs="+", required=True)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--master_csv", default=None, help="also write the numbers into this tracker")
     a = ap.parse_args()
 
     for path in a.models:
-        model, cfg, s, _ = load_checkpoint(path, a.device)
+        _, cfg, s, _ = load_checkpoint(path, "cpu")
         data = load_data(a.data, a.range, cfg)
-        print("\n" + "=" * 78 + f"\n{path}   (friction_cap={s.friction_cap}, contact_noise_frac={s.contact_noise_frac})")
-
-        print("1. step stability at sustained contact, full 6-DOF linearization of one step from true states")
-        ref = step_stability(model, data, a.device, use_contact=False)
-        for regime, v in step_stability(model, data, a.device).items():
-            print(f"   {regime:7s} ({v['n']:5d} frames)  spectral radius median {v['radius_median']:.3f} "
-                  f"(contact net off: {ref[regime]['radius_median']:.3f}) | "
-                  f"unstable (>1.02) {100 * v['frac_unstable']:4.1f}% | period-2 (eig < -0.9) {100 * v['frac_period2']:4.1f}% | "
-                  f"most negative eig median {v['most_negative_median']:+.2f}")
-            print(f"            most-negative mode lives in rotation: {100 * v['rot_share_all']:.0f}% (all frames), "
-                  f"{100 * v['rot_share_period2']:.0f}% (period-2 frames)")
-
-        print("2. open-loop chatter, mid-contact starts, first 0.5 s, sustained contact "
-              "(RMS change per step / RMS second difference, N)")
-        ch, n_runs = open_loop_chatter(model, cfg, data, a.device)
-        for comp, label in (("n", "normal"), ("t", "friction")):
-            m, j = ch[f"model_{comp}"], ch[f"mujoco_{comp}"]
-            print(f"   {label:8s} model {m[0]:.3f} / {m[1]:.3f}   MuJoCo {j[0]:.3f} / {j[1]:.3f}   ({n_runs} starts)")
-
-        pred, rev = penalty_size(model, s, cfg, data, a.device)
-        print(f"3. stage-2 windows: prediction loss {pred:.3e}, reversal penalty (raw) {rev:.3e}")
-        if rev > 0:
-            print(f"   w_contact_reversal for a 10% / 30% share of the prediction loss: "
-                  f"{0.1 * pred / rev:.3g} / {0.3 * pred / rev:.3g}")
+        print("\n" + "=" * 78 + f"\n{path}   (w_contact_reversal={getattr(s, 'w_contact_reversal', 0.0)}, "
+              f"friction_cap={s.friction_cap}, contact_noise_frac={s.contact_noise_frac})")
+        m = chatter_metrics(path, data, a.device)
+        print_chatter(m)
+        if a.master_csv:
+            add_to_master(a.master_csv, os.path.basename(os.path.dirname(os.path.abspath(path))), m)
 
 
 if __name__ == "__main__":
