@@ -161,7 +161,8 @@ trajectory_generator.set_pad_offset(pad_offset)
 trajectory_time_length, reference_trajectory = trajectory_generator.generate_trajectory()
 initial_state = trajectory_generator.initial_state
 
-sim = MujocoDroneSim(drone_cfg, wall_normal_vector, wall_center_point, wind_vector, motor_tau=0.0005)
+#Default physics (motor_tau = 0.025 s), the same as the training data
+sim = MujocoDroneSim(drone_cfg, wall_normal_vector, wall_center_point, wind_vector)
 
 #Holds the starting heading for the whole run (the generator starts the drone pointed at the wall)
 R_initial = quat_to_rot_matrix_np(initial_state[6:10])
@@ -228,7 +229,7 @@ input_history = np.vstack([inputs, np.full((1, inputs.shape[1]), np.nan)])
 
 plot_tracking(state_times, states, trajectory_generator.sample(state_times),
               pad_offset, wall_normal_vector, wall_center_point,
-              normal_force_history=normal_force, input_history=input_history,
+              normal_force_history=normal_force, input_history=input_history, hover_input=hover_input,
               save_path=run_folder / "tracking.png")
 
 #Reference pad positions at the same times as the states, so the reference path lines up with the flight

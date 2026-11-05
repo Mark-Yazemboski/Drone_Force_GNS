@@ -29,6 +29,7 @@ import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation
 
 from model import Drone_Dynamics
+from visualize import set_plot_style, figure_legend, save_figures, REPORT_WIDTH
 
 
 SCRIPT_FOLDER = Path(__file__).resolve().parent
@@ -43,16 +44,17 @@ CONTACT_FORCE_THRESHOLD = 0.1   #N, MuJoCo normal force above this counts as con
 RANDOM_SEED = 0                 #for the input perturbations
 
 #Linearization schedules: re-linearize every X steps (X = 1 is LTV, X = horizon length is frozen)
-SCHEDULES = {"LTV": 1, "every 5": 5, "every 10": 10, "frozen": HORIZON_LENGTH}
+#Named the same way as in the report
+SCHEDULES = {"every step": 1, "every 5 steps": 5, "every 10 steps": 10, "first step only": HORIZON_LENGTH}
 
 #Rows of the output vector used here (same packing as model.outputs)
 NORMAL_FORCE = 0
 TILT = slice(1, 3)              #roll, pitch
 PAD_POSITION = slice(3, 6)
 
-ERROR_LABELS = {"pad position": "Pad position error (mm)",
-                "normal force": "Normal force error (N)",
-                "tilt": "Tilt error (deg)"}
+ERROR_LABELS = {"pad position": "pad error (mm)",
+                "normal force": "$F_n$ error (N)",
+                "tilt": "tilt error (deg)"}
 
 device = torch.device("cpu")
 
@@ -153,9 +155,9 @@ def prediction_errors(outputs, reference):
             "tilt": np.degrees(tilt_error)}
 
 
-def plot_errors(axes_column, errors, label, **style):
+def plot_errors(axes_column, prediction_time, errors, label, **style):
     for ax, values in zip(axes_column, errors.values()):
-        ax.plot(values, label=label, **style)
+        ax.plot(prediction_time, values, label=label, **style)
 
 
 def print_summary(label, errors):
@@ -203,6 +205,10 @@ model = Drone_Dynamics(device, Trained_model_path,
 rng = np.random.default_rng(RANDOM_SEED)
 start_steps = pick_start_steps(normal_force, len(inputs))
 
+#Time into the prediction at each horizon step (s), for the x axis
+prediction_time = np.arange(HORIZON_LENGTH) * dt * MPC_DT_MULTIPLE
+set_plot_style()
+
 for start_name, s in start_steps.items():
     print(f"\n{start_name} (start step {s})")
 
@@ -218,24 +224,24 @@ for start_name, s in start_steps.items():
     mujoco = mujoco_outputs(model, states[s:s + HORIZON_LENGTH + 1], normal_force[s:s + HORIZON_LENGTH + 1])
 
     cases = {"Recorded inputs": (recorded_inputs, gnn_recorded),
-             f"Perturbed inputs (±{INPUT_PERTURBATION:g} rad/s)": (perturbed_inputs, gnn_perturbed)}
+             f"Perturbed (±{INPUT_PERTURBATION:g} rad/s)": (perturbed_inputs, gnn_perturbed)}
 
-    fig, axes = plt.subplots(3, 2, figsize=(11, 9), sharex=True)
+    fig, axes = plt.subplots(3, 2, figsize=(REPORT_WIDTH, 4.2), sharex=True)
 
     for column, (case_name, (case_inputs, gnn_outputs)) in enumerate(cases.items()):
         print(f"  {case_name}")
 
-        #Linearization error
+        #Linearization error (relative to the GNN)
         for schedule_name, refresh_every in SCHEDULES.items():
             linear_outputs = linear_prediction(nominal_states, recorded_inputs, linearizations, case_inputs, refresh_every)
             errors = prediction_errors(linear_outputs, gnn_outputs)
-            plot_errors(axes[:, column], errors, f"{schedule_name} vs GNN")
+            plot_errors(axes[:, column], prediction_time, errors, schedule_name)
             print_summary(schedule_name, errors)
 
         #Model error (MuJoCo was only run with the recorded inputs)
         if column == 0:
             errors = prediction_errors(gnn_outputs, mujoco)
-            plot_errors(axes[:, column], errors, "GNN vs MuJoCo", color="black", linestyle="--")
+            plot_errors(axes[:, column], prediction_time, errors, "GNN vs MuJoCo", color="black", linestyle="--")
             print_summary("GNN vs MuJoCo", errors)
 
         axes[0, column].set_title(case_name)
@@ -244,15 +250,13 @@ for start_name, s in start_steps.items():
         axes[row, 0].set_ylabel(label)
         for column in range(2):
             axes[row, column].set_ylim(bottom=0)
-            axes[row, column].grid(alpha=0.3)
+            axes[row, column].grid(alpha=0.3, linewidth=0.4)
 
     for ax in axes[-1]:
-        ax.set_xlabel(f"Horizon step k ({dt:g} s each)")
+        ax.set_xlabel("prediction time (s)")
 
-    axes[0, 0].legend(fontsize=8)
-    fig.suptitle(f"Open-loop prediction error: {start_name} (start step {s})")
-    fig.tight_layout()
-    fig.savefig(output_folder / f"{start_name.replace(' ', '_')}.png", dpi=150)
+    figure_legend(fig, axes[:, 0], ncol=3)
+    save_figures({start_name.replace(" ", "_"): fig}, output_folder / "open_loop.png")
     plt.close(fig)
 
 print(f"\nSaved plots to {output_folder}")

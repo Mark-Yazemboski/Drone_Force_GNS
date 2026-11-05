@@ -65,6 +65,10 @@ def save_run_data(steps_done):
              reference_time=trajectory_generator.reference_time,
              mujoco_friction=mujoco_friction_history[:steps_done + 1],
              predicted_friction=predicted_friction_history[:steps_done + 1],
+             planned_outputs=planned_output_history[:steps_done + 1],
+             mpc_dt=MPC_dt,
+             mpc_gate_d0=MPC_GATE_D0,
+             seed=seed,
              **{"reference_" + key: value for key, value in reference_trajectory.items()})
     print(f"Saved run data ({steps_done} steps) to {RUN_FOLDER / 'run_data.npz'}")
 
@@ -206,6 +210,9 @@ model_pad_distance_history = np.full(len(t) + 1, np.nan)
 mujoco_friction_history = np.full((len(t) + 1, 3), np.nan)
 predicted_friction_history = np.full((len(t) + 1, 3), np.nan)
 
+#What the QP planned at each MPC step: the predicted outputs over the whole horizon (for the plan plots)
+planned_output_history = np.full((len(t) + 1, Horizon_length + 1, 17), np.nan, dtype=np.float32)
+
 print("old sigma in steady contact:", calculate_contact_gate(0.004, d0, tau))
 print("new sigma in steady contact:", calculate_contact_gate(0.004, MPC_GATE_D0, MPC_GATE_TAU))
 
@@ -293,7 +300,8 @@ for time_step in t:
         #Outputs the computed input sequence for the current MPC step
         print("Computing MPC control input sequence...")
         #mpc_control builds the same QP one step at a time (easier to read); the batched version is much faster
-        input_sequence = mpc_control_batched(A_list,B_list,C_list,D_list,nom_states,rollout_input_sequence,nom_outputs,input_vector_current, reference_window,hover_input,Horizon_length,MPC_GATE_D0,MPC_GATE_TAU, wall_normal_vector)
+        input_sequence, planned_outputs = mpc_control_batched(A_list,B_list,C_list,D_list,nom_states,rollout_input_sequence,nom_outputs,input_vector_current, reference_window,hover_input,Horizon_length,MPC_GATE_D0,MPC_GATE_TAU, wall_normal_vector, return_plan=True)
+        planned_output_history[time_step_index + 1] = planned_outputs
 
         #Sets the current input to the first element of the computed input sequence
         input_vector_current = input_sequence[0]
@@ -320,7 +328,10 @@ plot_tracking(times, state_vector[:steps_done + 1], trajectory_generator.sample(
               predicted_friction_history=predicted_friction_history[:steps_done + 1],
               predicted_force_history=predicted_force_history[:steps_done + 1],
               model_pad_distance_history=model_pad_distance_history[:steps_done + 1],
-              contact_d0=float(MPC_GATE_D0), save_path=RUN_FOLDER / "tracking.png")
+              contact_d0=float(MPC_GATE_D0),
+              input_history=input_vector[:steps_done + 1], hover_input=hover_input,
+              planned_outputs=planned_output_history[:steps_done + 1], mpc_dt=MPC_dt,
+              save_path=RUN_FOLDER / "tracking.png")
 
 animate_flight(model.cfg, wall_normal_vector, wall_center_point, state_vector[:steps_done + 1], dt=simulation_dt,
                reference_positions=reference_trajectory["pad_position"],

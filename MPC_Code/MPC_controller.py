@@ -268,7 +268,10 @@ def stacked_squared_error(mpc, weights, Mx, dx, Mu, du, c):
 
 
 def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output, input_vector_current,
-                        reference_trajectory, hover_thrust_values, horizon_length, d0, tau, wall_normal_vector):
+                        reference_trajectory, hover_thrust_values, horizon_length, d0, tau, wall_normal_vector,
+                        return_plan=False):
+    #return_plan=True also returns the planned outputs (N+1, 17): what the QP predicts the outputs
+    #will be with its chosen inputs, y_nom + C dx + D du (the nominal outputs if the solve fails)
 
     #Converts any torch tensors to numpy, since Gurobi only works with numpy
     nominal_state = [to_np(x) for x in nominal_state]
@@ -277,12 +280,16 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     hover_thrust_values = to_np(hover_thrust_values)
     input_vector_current = to_np(input_vector_current)
 
+    #What to return when the solve doesn't work: the shifted previous plan, and its nominal outputs
+    def fallback():
+        return (nominal_input, np.array(nominal_output[:horizon_length + 1])) if return_plan else nominal_input
+
     #If the linearization produced NaN/inf anywhere, don't build the QP, fall back to the shifted plan
     for name, matrices in [("A", A), ("B", B), ("C", C), ("D", D), ("output", nominal_output), ("state", nominal_state)]:
         for k, matrix in enumerate(matrices):
             if not np.all(np.isfinite(matrix)):
                 print(f"NaN/inf in {name}[{k}], using the shifted previous plan")
-                return nominal_input
+                return fallback()
 
     build_start = timer()
     N = horizon_length
@@ -439,14 +446,20 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
         mpc.optimize()
     except gp.GurobiError as error:
         print("MPC solve error:", error, "- using the shifted previous plan")
-        return nominal_input
+        return fallback()
     print(f"  QP build: {solve_start - build_start:.3f} s | QP solve: {timer() - solve_start:.3f} s")
 
     if mpc.Status == GRB.SUBOPTIMAL:
         print("MPC solve suboptimal (numerical issues), using it anyway")
     elif mpc.Status != GRB.OPTIMAL:
         print(f"MPC solve failed (status {mpc.Status}), using the shifted previous plan")
-        return nominal_input
+        return fallback()
 
     #Optimized input sequence = nominal + deviation
-    return du.X.reshape(N, nu) + nominal_input[:N]
+    input_sequence = du.X.reshape(N, nu) + nominal_input[:N]
+    if not return_plan:
+        return input_sequence
+
+    #The outputs the QP planned on with those inputs
+    planned_outputs = (y_nominal + C_big @ dx.X + D_big @ du.X).reshape(N + 1, ny)
+    return input_sequence, planned_outputs
