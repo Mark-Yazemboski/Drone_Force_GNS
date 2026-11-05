@@ -123,12 +123,13 @@ def linear_prediction(nominal_states, nominal_inputs, linearizations, inputs, re
 
 def gnn_rollout(model, initial_state, inputs):
     #Nonlinear GNN rollout. Outputs at steps 0..N-1 (F_n at step k comes from x_k and u_k)
-    state = to_torch(initial_state)
+    #The model works on batches, so each state is a batch of 1
+    state = to_torch(initial_state).unsqueeze(0)
     outputs = []
     with torch.no_grad():
         for rotor_speeds in inputs:
-            next_state, _, info = model.propagate_multi(state, to_torch(rotor_speeds), MPC_DT_MULTIPLE)
-            outputs.append(to_np(model.outputs(state, info["F_n"])))
+            next_state, _, info = model.propagate_multi(state, to_torch(rotor_speeds).unsqueeze(0), MPC_DT_MULTIPLE)
+            outputs.append(to_np(model.outputs(state, info["F_n"])[0]))
             state = next_state
     return np.array(outputs)
 
@@ -139,7 +140,9 @@ def mujoco_outputs(model, states, normal_force):
     outputs = []
     with torch.no_grad():
         for k in range(len(states) - 1):
-            outputs.append(to_np(model.outputs(to_torch(states[k]), to_torch(normal_force[k + 1]))))
+            state = to_torch(states[k]).unsqueeze(0)
+            force = to_torch(normal_force[k + 1]).reshape(1)
+            outputs.append(to_np(model.outputs(state, force)[0]))
     return np.array(outputs)
 
 
