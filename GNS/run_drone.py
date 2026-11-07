@@ -74,7 +74,7 @@ settings = DroneTrainSettings(
 
     # ---- stage 1: aero (contact-free windows) ----
     # Training length is in OPTIMIZER STEPS (same for every N_train); each stage prints the
-    aero_steps=69600, aero_lr=6e-4,
+    aero_steps=46400, aero_lr=6e-4,
     w_aero_anchor=0.1,              # each aero node toward its drag law (shapes the network)
     w_aero_coeff_fit=0.01,          # only used with drag_coeff_fit="gradient"
     w_aero_smooth=0.01,             # aero force smooth in time
@@ -85,12 +85,12 @@ settings = DroneTrainSettings(
     lr_schedule="cosine",           # network lr decays to 0 over each stage (None = constant)
 
     # ---- stage 2: contact (near-wall windows, aero frozen) ----
-    contact_steps=116400, contact_lr=2e-4,
+    contact_steps=77600, contact_lr=2e-4,
     w_fric_dir=1.0, w_fric_mag=1.0, w_fric_cone=1.0,
     mu_init=0.3, learn_mu=True,
     contact_noise_frac=None,
     friction_cap=None,
-    w_contact_reversal = 0,
+    w_contact_reversal = 1e-2,
 
     # ---- validation ----
     val_horizon=20,                 # steps rolled forward per window (match the MPC horizon)
