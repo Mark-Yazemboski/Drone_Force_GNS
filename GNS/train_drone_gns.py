@@ -147,6 +147,8 @@ class DroneTrainSettings:
     w_fric_cone: float = 1.0
     w_contact_reversal: float = 0.0  # high-low-high penalty on the net contact wrench over the unroll
                                      # (see contact_reversal); 0 = off. Needs multistep >= 4.
+    w_force_apart: float = 0.0       # contact force on pad nodes that are clear of the wall (see unroll_loss); 0 = off
+    force_apart_gap: float = 0.001   # m: a node counts as clear when its gap exceeds this now AND at the next frame
     mu_init: float = 0.3
     learn_mu: bool = True
     slip_v0: float = 3e-4           # m/step (0.03 m/s at dt = 0.01 s); slides are 0.05-0.25 m/s
@@ -381,7 +383,7 @@ def unroll_loss(model, phys, batch, s, stage, pred_kind=None):
     com_h, R_h = _window(batch, h)
     n_b1 = batch["wall_n"].unsqueeze(1)
     fric_w = dict(w_fric_dir=s.w_fric_dir, w_fric_mag=s.w_fric_mag, w_fric_cone=s.w_fric_cone,
-                  w_contact_reversal=s.w_contact_reversal)
+                  w_contact_reversal=s.w_contact_reversal, w_force_apart=s.w_force_apart)
 
     pred_terms, raws, F_series, T_series = [], {}, [], []
     for k in range(K):
@@ -422,6 +424,16 @@ def unroll_loss(model, phys, batch, s, stage, pred_kind=None):
                 raws[name] = raws.get(name, 0.0) + v / K
             F_series.append(aux["f_c"])
             T_series.append(aux["tau_c"])
+            # No force without touching: geometry only (true node positions), no force labels.
+            # Both frames must be clear so a node arriving within the step is not penalized.
+            if s.w_force_apart > 0:
+                nodes_next = nodes_from_state(batch["tgt_com"][:, k], batch["tgt_R"][:, k], model.contact_rest)
+                clear = model.contact_mask.bool().clone()
+                for nodes in (aux["hist"][-1], nodes_next):
+                    gap = ((nodes - batch["wall_c"].unsqueeze(1)) * n_b1).sum(-1, keepdim=True) - model.cfg.pad_contact_radius
+                    clear = clear & (gap > s.force_apart_gap)
+                phi = aux["phi_c"] / model.contact_scale.max()
+                raws["force_apart"] = raws.get("force_apart", 0.0) + (phi.pow(2).sum(-1, keepdim=True) * clear).sum(1).mean() / K
 
         com_h = com_h[1:] + [com_n]
         R_h = R_h[1:] + [R_n]
