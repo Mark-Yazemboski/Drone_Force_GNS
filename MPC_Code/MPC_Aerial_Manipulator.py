@@ -37,6 +37,10 @@ print("Saving results to:", RUN_FOLDER)
 #path of the trained contact and fluid model GNN
 Trained_model_path = SCRIPT_FOLDER / "MPC_Model" / "Trained_Model.pt"
 
+#Contact force cutoff (m): the model's contact force is cut off for pad nodes farther than this from the wall,
+#which removes the small phantom force the model predicts while hovering just off the wall. None = the model as trained.
+CONTACT_CUTOFF_GAP = 0.001
+
 #Number of CPU cores to use: what Slurm gave this job on Roar, or every core on a normal PC
 NUM_CORES = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count()))
 
@@ -105,14 +109,16 @@ wind_vector, wall_normal_vector, wall_center_point = trajectory_generator.genera
 
 
 #Initializes the drone dynamics model with the trained GNN and environment parameters
-model = Drone_Dynamics(device, Trained_model_path, wall_normal_vector=wall_normal_vector, wall_center_point=wall_center_point, wind_vector=wind_vector)
+model = Drone_Dynamics(device, Trained_model_path, wall_normal_vector=wall_normal_vector, wall_center_point=wall_center_point, wind_vector=wind_vector,
+                       contact_cutoff_gap=CONTACT_CUTOFF_GAP)
 
 #A CPU copy of the model for the small, one-at-a-time work (rollout, last-step outputs, force prediction).
 #The GPU is slow at batch size 1 because every call waits on launch overhead;
 #it's only worth it for the big batched linearization.
 if device.type == "cuda":
     model_cpu = Drone_Dynamics(torch.device("cpu"), Trained_model_path, wall_normal_vector=wall_normal_vector,
-                               wall_center_point=wall_center_point, wind_vector=wind_vector)
+                               wall_center_point=wall_center_point, wind_vector=wind_vector,
+                               contact_cutoff_gap=CONTACT_CUTOFF_GAP)
 else:
     model_cpu = model
 
@@ -161,6 +167,7 @@ Horizon_length = 50
 #Saves the settings this run used, so the results can be matched to them later
 settings = dict(
     name=Run_Name, seed=seed,
+    model_path=str(Trained_model_path), contact_cutoff_gap=CONTACT_CUTOFF_GAP,
     simulation_dt=simulation_dt, MPC_dt_multiple=MPC_dt_multiple, horizon_length=Horizon_length,
     weights=dict(position=POSITION_WEIGHT, velocity=VELOCITY_WEIGHT, rod_orientation=ROD_ORIENTATION_WEIGHT,
                  angular_velocity=ANG_VEL_WEIGHT, normal_force=NORMAL_FORCE_WEIGHT,

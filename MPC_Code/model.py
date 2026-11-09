@@ -25,7 +25,10 @@ def matvec(M, v):
 class Drone_Dynamics:
 
     # Initialize the drone dynamics model with the given model path.
-    def __init__(self, device, model_path, wall_normal_vector=None, wall_center_point=None, wind_vector=None):
+    #contact_cutoff_gap: if set (m), contact force is cut off for pad nodes farther than this from the wall
+    #(an extra sharp gate on top of the trained one, ~1 in contact). None = the model as trained.
+    def __init__(self, device, model_path, wall_normal_vector=None, wall_center_point=None, wind_vector=None,
+                 contact_cutoff_gap=None):
 
         #Set up the device and load the model.
         self.device = device
@@ -34,6 +37,8 @@ class Drone_Dynamics:
         self.wind_vector = torch.as_tensor(wind_vector, dtype=torch.float32, device=self.device)
         self.model, self.cfg, self.settings, _ = load_checkpoint(model_path, self.device)
         self.model.eval()
+        self.contact_cutoff_gap = contact_cutoff_gap
+        self.contact_cutoff_tau = 0.00015      #m, how sharply the cutoff closes (0.5 at the cutoff gap, ~0 at +1 mm)
 
         #The network weights are fixed. Only gradients with respect to the state
         #and the rotor speeds are needed (for the MPC Jacobians).
@@ -140,6 +145,17 @@ class Drone_Dynamics:
 
         #Call the model to compute contact forces based on the normalized non-contact accelerations.
         contact = self.model.contact_forces(com_h, R_h, non_contact_accel_dt_normed, non_contact_alpha_dt_normed, wall_normal_vector, wall_center_point)
+
+        #Optional contact cutoff: scales the whole pad's contact force by a sharp gate on the CLOSEST pad
+        #node's gap to the wall (~1 in contact, 0 once that gap passes contact_cutoff_gap). It uses the closest
+        #node for the whole pad because the model spreads real contact force over pad nodes that aren't touching.
+        if self.contact_cutoff_gap is not None:
+            pad_nodes = com_h[-1].unsqueeze(1) + torch.einsum('bij,nj->bni', R_h[-1], self.model.pad_rest)    # (B, 9, 3)
+            closest_gap = ((pad_nodes - wall_center_point.unsqueeze(1)) * wall_normal_vector.unsqueeze(1)).sum(-1).min(1).values \
+                - self.cfg.pad_contact_radius                                                                  # (B,)
+            cutoff = torch.sigmoid((self.contact_cutoff_gap - closest_gap) / self.contact_cutoff_tau)
+            contact = dict(phi=contact["phi"] * cutoff[:, None, None], F=contact["F"] * cutoff[:, None],
+                           tau=contact["tau"] * cutoff[:, None], gate=contact["gate"] * cutoff[:, None, None])
 
         #Convert the model's contact force predictions to Newtons.
         F_nodes = self.model.to_newtons(contact["phi"])                                     # (B, N, 3)
