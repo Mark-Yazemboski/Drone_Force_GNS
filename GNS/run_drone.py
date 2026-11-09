@@ -91,7 +91,7 @@ settings = DroneTrainSettings(
     contact_noise_frac=None,
     friction_cap=None,
     w_contact_reversal = 1e-2,
-    w_force_apart=0,
+    w_force_apart=1.0,
 
     # ---- validation ----
     val_horizon=20,                 # steps rolled forward per window (match the MPC horizon)

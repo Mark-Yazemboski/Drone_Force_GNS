@@ -148,7 +148,8 @@ class DroneTrainSettings:
     w_contact_reversal: float = 0.0  # high-low-high penalty on the net contact wrench over the unroll
                                      # (see contact_reversal); 0 = off. Needs multistep >= 4.
     w_force_apart: float = 0.0       # contact force on pad nodes that are clear of the wall (see unroll_loss); 0 = off
-    force_apart_gap: float = 0.001   # m: a node counts as clear when its gap exceeds this now AND at the next frame
+    force_apart_gap: float = 0.001   # m: a node counts as clear when its gap exceeds this at the next frame, and
+                                     #    its gap now, minus how far it moved toward the wall last step, does too
     mu_init: float = 0.3
     learn_mu: bool = True
     slip_v0: float = 3e-4           # m/step (0.03 m/s at dt = 0.01 s); slides are 0.05-0.25 m/s
@@ -424,14 +425,17 @@ def unroll_loss(model, phys, batch, s, stage, pred_kind=None):
                 raws[name] = raws.get(name, 0.0) + v / K
             F_series.append(aux["f_c"])
             T_series.append(aux["tau_c"])
-            # No force without touching: geometry only (true node positions), no force labels.
-            # Both frames must be clear so a node arriving within the step is not penalized.
+            # No force without touching: node positions and wall geometry only, no force labels.
+            # A node is clear only if it is clear at the next frame AND could not reach the
+            # wall within this step at its current approach speed: a fast tap can hit and
+            # bounce back between two frames, clear at both ends.
             if s.w_force_apart > 0:
-                nodes_next = nodes_from_state(batch["tgt_com"][:, k], batch["tgt_R"][:, k], model.contact_rest)
-                clear = model.contact_mask.bool().clone()
-                for nodes in (aux["hist"][-1], nodes_next):
-                    gap = ((nodes - batch["wall_c"].unsqueeze(1)) * n_b1).sum(-1, keepdim=True) - model.cfg.pad_contact_radius
-                    clear = clear & (gap > s.force_apart_gap)
+                gap_of = lambda nodes: ((nodes - batch["wall_c"].unsqueeze(1)) * n_b1).sum(-1, keepdim=True) \
+                    - model.cfg.pad_contact_radius
+                gap_now, gap_prev = gap_of(aux["hist"][-1]), gap_of(aux["hist"][-2])
+                gap_next = gap_of(nodes_from_state(batch["tgt_com"][:, k], batch["tgt_R"][:, k], model.contact_rest))
+                reach = gap_now - torch.relu(gap_prev - gap_now)            # gap after one more step at this approach speed
+                clear = model.contact_mask.bool() & (gap_next > s.force_apart_gap) & (reach > s.force_apart_gap)
                 phi = aux["phi_c"] / model.contact_scale.max()
                 raws["force_apart"] = raws.get("force_apart", 0.0) + (phi.pow(2).sum(-1, keepdim=True) * clear).sum(1).mean() / K
 
