@@ -292,7 +292,8 @@ class Trajectory_Generator:
 
         #Same start for every scenario: hover, approach, push
         hold_traj = self.hold_mode(time_range=[0.5, 0.5])
-        move_traj = self.move_to_wall(hold_traj, time_range=[1.5, 2.0])
+        pad_contact_radius = 0.004
+        move_traj = self.move_to_wall(hold_traj, time_range=[1.5, 2.0],standoff = pad_contact_radius + 0.005)
         push_traj = self.push_ramp(move_traj, time_range=[0.5, 0.5], force_range=force_range)
         segments = [hold_traj, move_traj, push_traj]
 

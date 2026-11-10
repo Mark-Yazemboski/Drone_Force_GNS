@@ -28,10 +28,10 @@ NORMAL_FORCE_WEIGHT    = 1 / 0.3**2    # 0.3 N
 INPUT_WEIGHT           = 1 / 100**2    # 100 rad/s from hover
 INPUT_CHANGE_WEIGHT    = 1 / 20**2     # 20 rad/s per step
 
-SLACK_WEIGHT_ROLL = 100
-SLACK_WEIGHT_PITCH = 100
-SLACK_WEIGHT_CONTACT_DISTANCE = 100
-SLACK_WEIGHT_ROTOR_DISTANCE = 1000
+SLACK_WEIGHT_ROLL = 1 / 0.01**2              # 0.01 rad (~0.6 deg) over the limit
+SLACK_WEIGHT_PITCH = 1 / 0.01**2             # 0.01 rad (~0.6 deg) over the limit
+SLACK_WEIGHT_CONTACT_DISTANCE = 1 / 0.001**2 # 1 mm too far off the wall
+SLACK_WEIGHT_ROTOR_DISTANCE = 1 / 0.002**2   # 2 mm too close to the wall
 
 INPUT_TRUST_REGION = 100.0 # Rad/s per control step
 
