@@ -206,6 +206,8 @@ input_vector = np.full((len(t)+1, INPUT_SIZE), np.nan)
 input_vector[0] = hover_input
 input_vector_current = input_vector[0]
 
+
+
 input_sequence = np.array([input_vector_current for _ in range(Horizon_length)])
 
 #Initializes the time step index for the simulation loop

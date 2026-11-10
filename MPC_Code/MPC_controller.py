@@ -30,7 +30,7 @@ INPUT_CHANGE_WEIGHT    = 1 / 20**2     # 20 rad/s per step
 
 SLACK_WEIGHT_ROLL = 1 / 0.01**2              # 0.01 rad (~0.6 deg) over the limit
 SLACK_WEIGHT_PITCH = 1 / 0.01**2             # 0.01 rad (~0.6 deg) over the limit
-SLACK_WEIGHT_CONTACT_DISTANCE = 1 / 0.001**2 # 1 mm too far off the wall
+SLACK_WEIGHT_CONTACT_DISTANCE = 100 
 SLACK_WEIGHT_ROTOR_DISTANCE = 1 / 0.002**2   # 2 mm too close to the wall
 
 INPUT_TRUST_REGION = 100.0 # Rad/s per control step
@@ -454,6 +454,9 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     elif mpc.Status != GRB.OPTIMAL:
         print(f"MPC solve failed (status {mpc.Status}), using the shifted previous plan")
         return fallback()
+
+    print(f"  max slack: roll {slack_roll.X.max():.4f} rad, pitch {slack_pitch.X.max():.4f} rad, "
+             f"contact {1000 * slack_contact_distance.X.max():.2f} mm, rotor {1000 * slack_rotor_distance.X.max():.2f} mm")
 
     #Optimized input sequence = nominal + deviation
     input_sequence = du.X.reshape(N, nu) + nominal_input[:N]
