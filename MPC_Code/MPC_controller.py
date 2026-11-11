@@ -22,7 +22,7 @@ PITCH_LIM = np.pi / 4 # radians, 45 degrees
 
 POSITION_WEIGHT        = 1 / 0.02**2   # 2 cm
 VELOCITY_WEIGHT        = 1 / 0.1**2    # 0.1 m/s
-ROD_ORIENTATION_WEIGHT = 1 / 0.3**2    # 0.3 rad (~17 deg)
+ROD_ORIENTATION_WEIGHT = 1 / 0.1**2    # 0.1 rad (~6 deg) off the wall normal, pitch and yaw
 ANG_VEL_WEIGHT         = 1 / 0.5**2    # 0.5 rad/s
 NORMAL_FORCE_WEIGHT    = 1 / 0.3**2    # 0.3 N
 INPUT_WEIGHT           = 1 / 100**2    # 100 rad/s from hover
@@ -188,8 +188,9 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
 
             
 
-            #Computes the rod orientation error with respect to the wall normal vector
-            e_rod = -(lin_rod_unit[0:1] * wall_normal_vector[1] - lin_rod_unit[1:2] * wall_normal_vector[0])
+            #Rod orientation error: the part of the rod direction perpendicular to the wall normal
+            #(pad pitch and yaw relative to the wall), zero when the rod points straight into the wall
+            e_rod = (np.eye(3) - np.outer(wall_normal_vector, wall_normal_vector)) @ lin_rod_unit
 
             #Computes the tangent projection matrix based on the contact sigma and wall normal vector
             tangent_projection = np.eye(3) - contact_sigma * np.outer(wall_normal_vector, wall_normal_vector)
@@ -205,7 +206,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
             #Velocity error cost
             cost += VELOCITY_WEIGHT * squared_error(mpc, tangent_projection @ (lin_pad_vel - pad_ref_velocity[k]), 3)
             #Rod orientation error cost
-            cost += ROD_ORIENTATION_WEIGHT * squared_error(mpc, e_rod, 1)
+            cost += ROD_ORIENTATION_WEIGHT * squared_error(mpc, e_rod, 3)
             #Angular velocity error cost
             cost += ANG_VEL_WEIGHT * squared_error(mpc, angular_velocity, 3)
 
@@ -390,13 +391,14 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
             mpc, weight * np.ones(len(rows)), projection @ C_big[rows], dx, projection @ D_big[rows], du,
             projection @ (y_nominal[rows] - reference))
 
-    #Rod yaw error: e_rod = -(rod_x * n_y - rod_y * n_x)
-    rod_x, rod_y = output_rows([9], later_steps), output_rows([10], later_steps)
+    #Rod orientation error: the part of the rod direction perpendicular to the wall normal
+    #(pad pitch and yaw relative to the wall), zero when the rod points straight into the wall
+    rod_rows = output_rows([9, 10, 11], later_steps)
+    perpendicular = sp.kron(sp.eye(N), np.eye(3) - np.outer(n, n), format="csr")
     cost += stacked_squared_error(
-        mpc, ROD_ORIENTATION_WEIGHT * np.ones(N),
-        -n[1] * C_big[rod_x] + n[0] * C_big[rod_y], dx,
-        -n[1] * D_big[rod_x] + n[0] * D_big[rod_y], du,
-        -n[1] * y_nominal[rod_x] + n[0] * y_nominal[rod_y])
+        mpc, ROD_ORIENTATION_WEIGHT * np.ones(3 * N),
+        perpendicular @ C_big[rod_rows], dx, perpendicular @ D_big[rod_rows], du,
+        perpendicular @ y_nominal[rod_rows])
 
     #Angular velocity (state entries 10:13, error-state entries 9:12)
     angular_velocity_entries = [k * nx + i for k in later_steps for i in range(9, 12)]

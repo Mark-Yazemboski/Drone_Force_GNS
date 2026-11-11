@@ -2,14 +2,16 @@
 Checks the linearized model for a friction deadband: when the pad is stuck on the wall, does a change in
 rotor speed move it in the wall plane?
 
-Takes a few stuck frames and a few free-flight frames from a saved MPC run and prints, in mm/s of next-step
-velocity per rad/s of rotor speed:
+Takes a few stuck frames and a few free-flight frames from a saved MPC run and prints:
     B plane / B normal:  largest singular value of the B-matrix velocity rows, in-plane and normal to the wall
+                         (mm/s of next-step velocity per rad/s of rotor speed)
     B coll:              in-plane response to a collective change (all four rotors together), from B
-    +d/-d:               the same collective response from a real step of +d and -d rad/s (secant, not tangent)
+    dD KK:               in-plane pad displacement (mm) from holding +D rad/s collective for K model steps,
+                         vs holding the recorded input
 
-Deadband: B is ~0 at the stuck frames (vs free flight), and the secant grows once d is big enough to break
-the pad loose. The d where that happens is the perturbation size to use for the smoothed Jacobian.
+Deadband over one step: B at the stuck frames is ~0 compared with free flight.
+Deadband over the horizon: B looks normal, but the K-step displacement at the stuck frames is ~0 compared
+with free flight (friction catches up after the first step).
 
 Run:  python deadband_check.py <run name>
 """
@@ -28,7 +30,7 @@ SCRIPT_FOLDER = Path(__file__).resolve().parent
 STUCK_FORCE = 0.3           #N, MuJoCo normal force above this at both ends of the step counts as pressed on the wall
 STUCK_SPEED = 0.002         #m/s, pad in-plane speed below this counts as stuck
 FREE_GAP = 0.02             #m, pad surface at least this far off the wall counts as free flight
-DELTAS = [1, 10, 30, 100]   #rad/s, collective steps for the secant check
+MULTI_STEP = [(10, 10), (10, 50), (100, 10), (100, 50)]    #(rad/s, model steps) for the multi-step check
 
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -90,27 +92,28 @@ def check(i):
     B_normal = np.linalg.norm(B_velocity[0])
     B_collective = np.linalg.norm(B_velocity[1:] @ np.ones(4))
 
-    #Secant: next-step in-plane velocity change from a real collective step of +d and -d
-    def in_plane_velocity(rotor_speeds):
+    #Multi-step: in-plane pad displacement (mm) from holding +d collective for K model steps, vs holding u.
+    #Friction reacts to the pad's velocity, which only shows up a step later, so a deadband may only
+    #appear over several steps.
+    def in_plane_pad(rotor_speeds, steps):
         with torch.no_grad():
-            next_state, _, _ = model.propagate_state(x[None], rotor_speeds[None])
-        return (W @ next_state[0, 3:6].numpy())[1:]
+            trajectory = model.rollout(x, rotor_speeds.repeat(steps, 1), 1)
+            pad_position, _, _ = model.get_pad_values(trajectory[-1:])
+        return (W @ pad_position[0].numpy())[1:]
 
-    v0 = in_plane_velocity(u)
-    secants = []
-    for d in DELTAS:
-        plus = np.linalg.norm(in_plane_velocity(u + d) - v0) / d
-        minus = np.linalg.norm(v0 - in_plane_velocity(u - d)) / d
-        secants.append(f"{1000 * plus:6.2f}/{1000 * minus:<6.2f}")
+    displacements = []
+    for d, steps in MULTI_STEP:
+        moved = np.linalg.norm(in_plane_pad(u + d, steps) - in_plane_pad(u, steps))
+        displacements.append(f"{1000 * moved:10.2f}")
 
     print(f"{times[i]:6.2f} {normal_force[i]:6.2f} {1000 * gap[i]:7.1f} {1000 * in_plane_speed[i]:8.1f} | "
-          f"{B_plane:8.3f} {B_normal:8.3f} {B_collective:8.3f} | " + " ".join(secants))
+          f"{B_plane:8.3f} {B_normal:8.3f} {B_collective:8.3f} | " + " ".join(displacements))
     return B_plane
 
 
 header = (f"{'t s':>6s} {'Fn N':>6s} {'gap mm':>7s} {'pad mm/s':>8s} | "
           f"{'B plane':>8s} {'B normal':>8s} {'B coll':>8s} | "
-          + " ".join(f"{f'd={d} +/-':^13s}" for d in DELTAS))
+          + " ".join(f"{f'd{d} K{steps}':>10s}" for d, steps in MULTI_STEP))
 
 results = {}
 for name, indices in [("STUCK", stuck), ("FREE FLIGHT", free)]:
