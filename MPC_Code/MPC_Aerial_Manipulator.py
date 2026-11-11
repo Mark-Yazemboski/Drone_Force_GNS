@@ -26,6 +26,7 @@ Run_Name = "testing_freeflight"
 
 #Seeds the random scenario so this exact run can be regenerated later
 seed =  int(np.random.SeedSequence().entropy % 2**32)
+seed = 1234
 np.random.seed(seed)
 
 #Folder for this run's results: MPC_runs/<name>
@@ -140,7 +141,7 @@ hover_input = model.calculate_hover_inputs().cpu().numpy()
 
 #Generates the reference trajectory based on the wall and wind conditions set above, this needed to
 #happen after model because we needed the pad offset from the model
-scenario = "push"  # Example scenario, can be changed to "push", "line_horizontal", "line_vertical", or "circle"
+scenario = "line_vertical"  # Example scenario, can be changed to "push", "line_horizontal", "line_vertical", or "circle"
 trajectory_time_length, reference_trajectory = trajectory_generator.generate_trajectory(scenario)
 # trajectory_time_length, reference_trajectory = trajectory_generator.generate_free_flight_trajectory(time_range = [0.5,0.5])
 
