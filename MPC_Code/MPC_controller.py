@@ -7,7 +7,7 @@ from gurobipy import GRB
 import numpy as np
 import scipy.sparse as sp
 
-from utilities import quat_error_map, to_np, calculate_contact_gate, timer
+from utilities import quat_error_map, to_np, calculate_contact_gate, timer, quat_to_rot_matrix_np
 
 
 MOTOR_MIN = 0.0 #Rad/s
@@ -35,6 +35,13 @@ SLACK_WEIGHT_ROTOR_DISTANCE = 1 / 0.002**2   # 2 mm too close to the wall
 
 INPUT_TRUST_REGION = 100.0 # Rad/s per control step
 
+#Breaking the pad loose: where the reference slides but the plan has the pad stuck, the in-plane force the
+#drone applies along the slide direction is pushed toward PUSH_MARGIN * mu * F_n (mu is the model's learned value)
+PUSH_WEIGHT     = 1 / 0.1**2    # 0.1 N
+PUSH_MARGIN     = 1.3           # over the friction limit; the learned mu (~0.33) is below MuJoCo's 0.4
+SLIDE_MIN_SPEED = 0.01          # m/s, reference in-plane speed above this counts as a slide
+STICK_SPEED     = 0.005         # m/s, planned pad in-plane speed below this counts as stuck
+
 
 
 #Sets the state and input sizes for the MPC controller
@@ -56,6 +63,35 @@ def squared_error(mpc, expression, size):
     mpc.addConstr(error == expression)
     return error @ error
 
+#Push along the slide direction at the steps where the pad should slide but the nominal plan has it stuck.
+#The applied in-plane force is thrust + gravity (no contact or aero), so it's linear in the deviations without the model:
+#   push_k = direction . (T b3 + m g) - target,   d(push)/d(du_k) = 2 k_f (direction . b3) omega,
+#   d(push)/d(dtheta_k) = T (b3 x direction)   (the attitude error rotates b3 by dtheta x b3)
+#While stuck, friction cancels this force, so pushing it past mu * F_n is what makes the pad slip.
+#params: k_f, mass, gravity, mu from the model. Returns (k, g_theta (3,), g_u (4,), constant) per stuck step.
+def stuck_push_rows(nominal_state, nominal_input, nominal_output, reference_trajectory, contact_sigma, n, params, N):
+    in_plane = np.eye(3) - np.outer(n, n)
+    weight = np.array([0.0, 0.0, -params["mass"] * params["gravity"]])
+    rows = []
+    for k in range(N):
+        reference_velocity = in_plane @ reference_trajectory["pad_velocity"][k]
+        reference_speed = np.linalg.norm(reference_velocity)
+        planned_speed = np.linalg.norm(in_plane @ nominal_output[k][6:9])
+        if contact_sigma[k] < 0.5 or reference_speed < SLIDE_MIN_SPEED or planned_speed > STICK_SPEED:
+            continue
+
+        direction = reference_velocity / reference_speed
+        b3 = quat_to_rot_matrix_np(nominal_state[k][6:10])[:, 2]
+        omega = nominal_input[k]
+        thrust = params["k_f"] * np.sum(omega ** 2)
+        target = PUSH_MARGIN * params["mu"] * max(nominal_output[k][0], 0.0)
+
+        g_theta = thrust * np.cross(b3, direction)
+        g_u = 2 * params["k_f"] * (direction @ b3) * omega
+        constant = direction @ (thrust * b3 + weight) - target
+        rows.append((k, g_theta, g_u, constant))
+    return rows
+
 #Builds the full 19-number linearized state from the nominal state and the 18-number correction
 def linearize_state(x_nom, dx_k):
 
@@ -70,7 +106,7 @@ def linearize_state(x_nom, dx_k):
             x_nom[16:19] + dx_k[15:18]]        # previous angular velocity
 
 #Performs MPC control using the Sequential Quadratic Programming (SQP) approach
-def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_current,reference_trajectory,hover_thrust_values,horizon_length,d0,tau, wall_normal_vector):
+def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_current,reference_trajectory,hover_thrust_values,horizon_length,d0,tau, wall_normal_vector, push_params):
 
     #Converts any torch tensors to numpy, since Gurobi only works with numpy
     nominal_state = [to_np(x) for x in nominal_state]
@@ -122,6 +158,12 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     contact_flag = reference_trajectory['contact_flag']
 
 
+    #Steps where the pad should slide but the plan has it stuck, and the push needed there
+    sigma_all = [calculate_contact_gate(nominal_output[k][12], d0, tau) * contact_flag[k] for k in range(horizon_length + 1)]
+    push_rows = {k: (g_theta, g_u, constant) for k, g_theta, g_u, constant in stuck_push_rows(
+        nominal_state, nominal_input, nominal_output, reference_trajectory, sigma_all,
+        np.asarray(wall_normal_vector, dtype=float), push_params, horizon_length)}
+
     #Initializes the cost function to zero
     cost = 0
     for k in range(horizon_length + 1):
@@ -172,6 +214,10 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
             cost += INPUT_CHANGE_WEIGHT * squared_error(mpc, linearized_input - previous_lin_input, 4)
             #Normal force error cost
             cost += contact_sigma * NORMAL_FORCE_WEIGHT * squared_error(mpc, lin_normal_force - normal_force_ref[k], 1)
+            #Push to break the pad loose (only at stuck steps of a slide)
+            if k in push_rows:
+                g_theta, g_u, constant = push_rows[k]
+                cost += PUSH_WEIGHT * squared_error(mpc, g_theta[None] @ dx[k][6:9] + g_u[None] @ du[k] + constant, 1)
 
             #Adds the constraints related to motor change limits for each rotor
             mpc.addConstr(linearized_input - previous_lin_input <= MOTOR_CHANGE_LIM)
@@ -270,7 +316,8 @@ def stacked_squared_error(mpc, weights, Mx, dx, Mu, du, c):
 
 def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output, input_vector_current,
                         reference_trajectory, hover_thrust_values, horizon_length, d0, tau, wall_normal_vector,
-                        return_plan=False):
+                        push_params, return_plan=False):
+    #push_params: dict(k_f, mass, gravity, mu) from the model, for the push that breaks a stuck pad loose
     #return_plan=True also returns the planned outputs (N+1, 17): what the QP predicts the outputs
     #will be with its chosen inputs, y_nom + C dx + D du (the nominal outputs if the solve fails)
 
@@ -375,6 +422,22 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     cost += stacked_squared_error(
         mpc, NORMAL_FORCE_WEIGHT * contact_sigma[:N], C_big[rows], dx, D_big[rows], du,
         y_nominal[rows] - reference_trajectory["normal_force"][:N])
+
+    #Push to break the pad loose, at the steps where the reference slides but the plan has the pad stuck
+    push_rows = stuck_push_rows(nominal_state, nominal_input, nominal_output, reference_trajectory,
+                                contact_sigma, n, push_params, N)
+    if push_rows:
+        steps = [k for k, _, _, _ in push_rows]
+        row_index = np.arange(len(steps))
+        push_dx = sp.csr_matrix((np.concatenate([g_theta for _, g_theta, _, _ in push_rows]),
+                                 (np.repeat(row_index, 3), [k * nx + 6 + j for k in steps for j in range(3)])),
+                                shape=(len(steps), (N + 1) * nx))
+        push_du = sp.csr_matrix((np.concatenate([g_u for _, _, g_u, _ in push_rows]),
+                                 (np.repeat(row_index, nu), [k * nu + j for k in steps for j in range(nu)])),
+                                shape=(len(steps), N * nu))
+        cost += stacked_squared_error(mpc, PUSH_WEIGHT * np.ones(len(steps)), push_dx, dx, push_du, du,
+                                      np.array([constant for _, _, _, constant in push_rows]))
+        print(f"  stuck push active at {len(steps)} of {N} steps")
 
 
     # ---------------- State and output costs (k = 1..N) ----------------

@@ -57,6 +57,7 @@ class Drone_Dynamics:
         self.spin_dirs   = np.asarray(self.cfg.spin_dir, float)
         self.motor_kf = float(self.model.params.k_f)
         self.motor_km = float(self.model.params.k_m)
+        self.friction_mu = float(self.model.params.mu)      #learned friction coefficient
 
         #Computes the pad offset and rod unit vector in the body frame.
         self.pad_offset = self.tip_location - self.com_location

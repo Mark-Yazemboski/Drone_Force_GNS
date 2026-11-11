@@ -223,6 +223,10 @@ predicted_friction_history = np.full((len(t) + 1, 3), np.nan)
 #What the QP planned at each MPC step: the predicted outputs over the whole horizon (for the plan plots)
 planned_output_history = np.full((len(t) + 1, Horizon_length + 1, 17), np.nan, dtype=np.float32)
 
+
+#Model values for the push that breaks a stuck pad loose
+push_params = dict(k_f=model.motor_kf, mass=model.mass, gravity=float(model.cfg.gravity), mu=model.friction_mu)
+
 print("old sigma in steady contact:", calculate_contact_gate(0.004, d0, tau))
 print("new sigma in steady contact:", calculate_contact_gate(0.004, MPC_GATE_D0, MPC_GATE_TAU))
 
@@ -310,7 +314,7 @@ for time_step in t:
         #Outputs the computed input sequence for the current MPC step
         print("Computing MPC control input sequence...")
         #mpc_control builds the same QP one step at a time (easier to read); the batched version is much faster
-        input_sequence, planned_outputs = mpc_control_batched(A_list,B_list,C_list,D_list,nom_states,rollout_input_sequence,nom_outputs,input_vector_current, reference_window,hover_input,Horizon_length,MPC_GATE_D0,MPC_GATE_TAU, wall_normal_vector, return_plan=True)
+        input_sequence, planned_outputs = mpc_control_batched(A_list,B_list,C_list,D_list,nom_states,rollout_input_sequence,nom_outputs,input_vector_current, reference_window,hover_input,Horizon_length,MPC_GATE_D0,MPC_GATE_TAU, wall_normal_vector, push_params, return_plan=True)
         planned_output_history[time_step_index + 1] = planned_outputs
 
         #Sets the current input to the first element of the computed input sequence
