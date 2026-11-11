@@ -35,7 +35,7 @@ class Drone_Dynamics:
         self.wall_normal_vector = torch.as_tensor(wall_normal_vector, dtype=torch.float32, device=self.device)
         self.wall_center_point  = torch.as_tensor(wall_center_point,  dtype=torch.float32, device=self.device)
         self.wind_vector = torch.as_tensor(wind_vector, dtype=torch.float32, device=self.device)
-        self.model, self.cfg, self.settings, _ = load_checkpoint(model_path, self.device)
+        self.model, self.cfg, self.settings, checkpoint = load_checkpoint(model_path, self.device)
         self.model.eval()
         self.contact_cutoff_gap = contact_cutoff_gap
         self.contact_cutoff_tau = 0.00015      #m, how sharply the cutoff closes (0.5 at the cutoff gap, ~0 at +1 mm)
@@ -56,8 +56,8 @@ class Drone_Dynamics:
         self.rotor_locations   = torch.tensor(np.asarray(self.cfg.rotor_pos) - self.cfg.com_offset, dtype=torch.float32, device=self.device)
         self.spin_dirs   = np.asarray(self.cfg.spin_dir, float)
         self.motor_kf = float(self.model.params.k_f)
-        self.motor_km = float(self.model.params.k_m)
-        self.friction_mu = float(self.model.params.mu)      #learned friction coefficient
+        self.motor_km = float(self.model.params.k_m)        
+        self.friction_mu = float(torch.exp(checkpoint["phys"]["log_mu"]))     #learned friction coefficient
 
         #Computes the pad offset and rod unit vector in the body frame.
         self.pad_offset = self.tip_location - self.com_location
