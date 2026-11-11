@@ -36,6 +36,8 @@ SLACK_WEIGHT_APPROACH = 1 / 0.02**2          # 2 cm/s faster than the approach s
 
 #Approach speed limit: the pad's speed into the wall must stay under gap / APPROACH_TIME + TOUCH_SPEED,
 #so it slows down as it closes in and touches at about TOUCH_SPEED. Far from the wall the limit is loose.
+#It applies only at steps where the planned pad isn't touching (contact gate < 0.5, from the pad distance, not the
+#contact flag): once touching, the wall stops the motion and the force cost takes over.
 APPROACH_TIME = 0.1             # s, about the time to close the remaining gap at the allowed speed
 TOUCH_SPEED   = 0.02            # m/s, allowed speed into the wall at contact
 
@@ -282,10 +284,11 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
             #Adds the constraint related to the minimum distance of the rotors from the wall
             mpc.addConstr(lin_rotor_dist >= ROTOR_MIN_DIST - slack_rotor_distance[k])
 
-            #Approach speed limit: speed into the wall under gap / APPROACH_TIME + TOUCH_SPEED
-            speed_into_wall = -(wall_normal_vector @ lin_pad_vel)
-            gap = lin_pad_dist - model_params["contact_radius"]
-            mpc.addConstr(speed_into_wall - gap / APPROACH_TIME <= TOUCH_SPEED + slack_approach[k])
+            #Approach speed limit: speed into the wall under gap / APPROACH_TIME + TOUCH_SPEED, while not touching
+            if contact_gate < 0.5:
+                speed_into_wall = -(wall_normal_vector @ lin_pad_vel)
+                gap = lin_pad_dist - model_params["contact_radius"]
+                mpc.addConstr(speed_into_wall - gap / APPROACH_TIME <= TOUCH_SPEED + slack_approach[k])
 
             #Adds the constraints related to roll and pitch limits
             mpc.addConstr(lin_roll <= ROLL_LIM + slack_roll[k])
@@ -525,13 +528,20 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
 
     #Approach speed limit: speed into the wall - gap / APPROACH_TIME <= TOUCH_SPEED, where
     #speed into the wall = -n . pad velocity (outputs 6:9) and gap = pad distance (output 12) - contact sphere radius
-    velocity_rows = output_rows([6, 7, 8], later_steps)
-    distance_rows = output_rows([12], later_steps)
-    into_wall = sp.kron(sp.eye(N), -n[None, :], format="csr")
-    approach_dx = into_wall @ C_big[velocity_rows] - C_big[distance_rows] / APPROACH_TIME
-    approach_du = into_wall @ D_big[velocity_rows] - D_big[distance_rows] / APPROACH_TIME
-    approach_nominal = into_wall @ y_nominal[velocity_rows] - (y_nominal[distance_rows] - model_params["contact_radius"]) / APPROACH_TIME
-    mpc.addConstr(approach_dx @ dx + approach_du @ du - slack_approach <= TOUCH_SPEED - approach_nominal)
+    #Only at steps where the planned pad isn't touching (contact gate < 0.5)
+    approach_steps = [k for k in later_steps if contact_gate[k] < 0.5]
+    if approach_steps:
+        m = len(approach_steps)
+        velocity_rows = output_rows([6, 7, 8], approach_steps)
+        distance_rows = output_rows([12], approach_steps)
+        into_wall = sp.kron(sp.eye(m), -n[None, :], format="csr")
+        approach_dx = into_wall @ C_big[velocity_rows] - C_big[distance_rows] / APPROACH_TIME
+        approach_du = into_wall @ D_big[velocity_rows] - D_big[distance_rows] / APPROACH_TIME
+        approach_nominal = (into_wall @ y_nominal[velocity_rows]
+                            - (y_nominal[distance_rows] - model_params["contact_radius"]) / APPROACH_TIME)
+        select_slack = sp.csr_matrix((np.ones(m), (np.arange(m), [k - 1 for k in approach_steps])), shape=(m, N))
+        mpc.addConstr(approach_dx @ dx + approach_du @ du - select_slack @ slack_approach
+                      <= TOUCH_SPEED - approach_nominal)
 
     #Roll and pitch limits
     for output_index, limit, slack in [(1, ROLL_LIM, slack_roll), (2, PITCH_LIM, slack_pitch)]:
