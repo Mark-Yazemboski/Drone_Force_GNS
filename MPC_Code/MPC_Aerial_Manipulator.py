@@ -226,7 +226,7 @@ planned_output_history = np.full((len(t) + 1, Horizon_length + 1, 17), np.nan, d
 
 #Model values for the push that breaks a stuck pad loose
 model_params = dict(k_f=model.motor_kf, mass=model.mass, gravity=float(model.cfg.gravity),
-                    mu=model.friction_mu, pad_radius=float(model.cfg.pad_contact_radius))
+                    mu=model.friction_mu, contact_radius=float(model.cfg.pad_contact_radius))
 
 print("old sigma in steady contact:", calculate_contact_gate(0.004, d0, tau))
 print("new sigma in steady contact:", calculate_contact_gate(0.004, MPC_GATE_D0, MPC_GATE_TAU))
