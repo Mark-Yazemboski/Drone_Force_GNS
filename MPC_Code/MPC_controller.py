@@ -26,7 +26,7 @@ ROD_ORIENTATION_WEIGHT = 1 / 0.1**2    # 0.1 rad (~6 deg) off the wall normal, p
 ANG_VEL_WEIGHT         = 1 / 0.5**2    # 0.5 rad/s
 NORMAL_FORCE_WEIGHT    = 1 / 0.3**2    # 0.3 N
 INPUT_WEIGHT           = 1 / 100**2    # 100 rad/s from hover
-INPUT_CHANGE_WEIGHT    = 1 / 20**2     # 20 rad/s per step
+INPUT_CHANGE_WEIGHT    = 1 / 10**2     # 10 rad/s per step
 
 SLACK_WEIGHT_ROLL = 1 / 0.01**2              # 0.01 rad (~0.6 deg) over the limit
 SLACK_WEIGHT_PITCH = 1 / 0.01**2             # 0.01 rad (~0.6 deg) over the limit
@@ -221,7 +221,9 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
             #Input change cost
             cost += INPUT_CHANGE_WEIGHT * squared_error(mpc, linearized_input - previous_lin_input, 4)
             #Normal force error cost
-            cost += contact_sigma * NORMAL_FORCE_WEIGHT * squared_error(mpc, lin_normal_force - normal_force_ref[k], 1)
+            #Normal force error, whenever the pad is at the wall (gate only, not the contact flag), so outside the
+            #contact phase it drives the force to the reference's 0 and the pad can come off the wall
+            cost += contact_gate * NORMAL_FORCE_WEIGHT * squared_error(mpc, lin_normal_force - normal_force_ref[k], 1)
             #Push to break the pad loose (only at stuck steps of a slide)
             if k in push_rows:
                 g_theta, g_u, constant, scale = push_rows[k]
@@ -366,7 +368,8 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
 
     #Contact gate at every step, from the nominal pad distance (output 12), times the contact flag
     pad_distance = y_nominal[output_rows([12], range(N + 1))]
-    contact_sigma = reference_trajectory["contact_flag"][:N + 1] / (1.0 + np.exp(-(d0 - pad_distance) / tau))
+    contact_gate = 1.0 / (1.0 + np.exp(-(d0 - pad_distance) / tau))
+    contact_sigma = reference_trajectory["contact_flag"][:N + 1] * contact_gate
 
     #Steps 1..N carry the state and output costs (dx_0 = 0, so step 0 is a constant)
     later_steps = range(1, N + 1)
@@ -425,10 +428,11 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     mpc.addConstr(input_change == input_difference.tocsr() @ du + (nominal_input_flat - previous_nominal_input))
     cost += INPUT_CHANGE_WEIGHT * (input_change @ input_change)
 
-    #Normal force error, weighted by the contact gate
+    #Normal force error, whenever the pad is at the wall (gate only, not the contact flag), so outside the
+    #contact phase it drives the force to the reference's 0 and the pad can come off the wall
     rows = output_rows([0], range(N))
     cost += stacked_squared_error(
-        mpc, NORMAL_FORCE_WEIGHT * contact_sigma[:N], C_big[rows], dx, D_big[rows], du,
+        mpc, NORMAL_FORCE_WEIGHT * contact_gate[:N], C_big[rows], dx, D_big[rows], du,
         y_nominal[rows] - reference_trajectory["normal_force"][:N])
 
     #Push to break the pad loose, at the steps where the pad should move faster than the plan has it moving
