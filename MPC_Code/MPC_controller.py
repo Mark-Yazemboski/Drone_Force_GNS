@@ -26,12 +26,18 @@ ROD_ORIENTATION_WEIGHT = 1 / 0.1**2    # 0.1 rad (~6 deg) off the wall normal, p
 ANG_VEL_WEIGHT         = 1 / 0.5**2    # 0.5 rad/s
 NORMAL_FORCE_WEIGHT    = 1 / 0.3**2    # 0.3 N
 INPUT_WEIGHT           = 1 / 100**2    # 100 rad/s from hover
-INPUT_CHANGE_WEIGHT    = 1 / 10**2     # 10 rad/s per step
+INPUT_CHANGE_WEIGHT    = 1 / 20**2     # 20 rad/s per step
 
 SLACK_WEIGHT_ROLL = 1 / 0.01**2              # 0.01 rad (~0.6 deg) over the limit
 SLACK_WEIGHT_PITCH = 1 / 0.01**2             # 0.01 rad (~0.6 deg) over the limit
 SLACK_WEIGHT_CONTACT_DISTANCE = 100 
 SLACK_WEIGHT_ROTOR_DISTANCE = 1 / 0.002**2   # 2 mm too close to the wall
+SLACK_WEIGHT_APPROACH = 1 / 0.02**2          # 2 cm/s faster than the approach speed limit
+
+#Approach speed limit: the pad's speed into the wall must stay under gap / APPROACH_TIME + TOUCH_SPEED,
+#so it slows down as it closes in and touches at about TOUCH_SPEED. Far from the wall the limit is loose.
+APPROACH_TIME = 0.1             # s, about the time to close the remaining gap at the allowed speed
+TOUCH_SPEED   = 0.02            # m/s, allowed speed into the wall at contact
 
 INPUT_TRUST_REGION = 100.0 # Rad/s per control step
 
@@ -41,7 +47,7 @@ INPUT_TRUST_REGION = 100.0 # Rad/s per control step
 PUSH_WEIGHT     = 1 / 0.1**2    # 0.1 N
 PUSH_MARGIN     = 1.3           # over the friction limit; the learned mu (~0.33) is below MuJoCo's 0.4
 SLIDE_MIN_SPEED = 0.01          # m/s, wanted in-plane speed above this counts as a slide
-CATCH_UP_TIME   = 0.5           # s, the wanted speed includes closing the in-plane position error over this time
+CATCH_UP_TIME   = 0.5          # s, the wanted speed includes closing the in-plane position error over this time
 
 
 
@@ -114,7 +120,7 @@ def linearize_state(x_nom, dx_k):
             x_nom[16:19] + dx_k[15:18]]        # previous angular velocity
 
 #Performs MPC control using the Sequential Quadratic Programming (SQP) approach
-def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_current,reference_trajectory,hover_thrust_values,horizon_length,d0,tau, wall_normal_vector, push_params):
+def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_current,reference_trajectory,hover_thrust_values,horizon_length,d0,tau, wall_normal_vector, model_params):
 
     #Converts any torch tensors to numpy, since Gurobi only works with numpy
     nominal_state = [to_np(x) for x in nominal_state]
@@ -148,6 +154,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     slack_pitch = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_pitch")
     slack_contact_distance = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_contact_distance")
     slack_rotor_distance = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_rotor_distance")
+    slack_approach = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_approach")
 
     #adds trust region constraints for the input deviations
     #this makes sure the solution stays within a reasonable bound so
@@ -170,7 +177,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     sigma_all = [calculate_contact_gate(nominal_output[k][12], d0, tau) * contact_flag[k] for k in range(horizon_length + 1)]
     push_rows = {k: (g_theta, g_u, constant, scale) for k, g_theta, g_u, constant, scale in stuck_push_rows(
         nominal_state, nominal_input, nominal_output, reference_trajectory, sigma_all,
-        np.asarray(wall_normal_vector, dtype=float), push_params, horizon_length)}
+        np.asarray(wall_normal_vector, dtype=float), model_params, horizon_length)}
 
     #Initializes the cost function to zero
     cost = 0
@@ -221,8 +228,8 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
             #Input change cost
             cost += INPUT_CHANGE_WEIGHT * squared_error(mpc, linearized_input - previous_lin_input, 4)
             #Normal force error cost
-            #Normal force error, whenever the pad is at the wall (gate only, not the contact flag), so outside the
-            #contact phase it drives the force to the reference's 0 and the pad can come off the wall
+            #Normal force error whenever the pad is at the wall, over the whole trajectory (the reference
+            #force is 0 outside the contact phase, so touching the wall when it shouldn't costs the same everywhere)
             cost += contact_gate * NORMAL_FORCE_WEIGHT * squared_error(mpc, lin_normal_force - normal_force_ref[k], 1)
             #Push to break the pad loose (only at stuck steps of a slide)
             if k in push_rows:
@@ -256,6 +263,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
             cost += slack_pitch[k]**2 * SLACK_WEIGHT_PITCH
             cost += slack_contact_distance[k]**2 * SLACK_WEIGHT_CONTACT_DISTANCE
             cost += slack_rotor_distance[k]**2 * SLACK_WEIGHT_ROTOR_DISTANCE
+            cost += slack_approach[k]**2 * SLACK_WEIGHT_APPROACH
             
             #Position error cost
             cost += POSITION_WEIGHT * squared_error(mpc, tangent_projection @ (lin_pad_pos - pad_ref_position[k]), 3)
@@ -273,6 +281,11 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
 
             #Adds the constraint related to the minimum distance of the rotors from the wall
             mpc.addConstr(lin_rotor_dist >= ROTOR_MIN_DIST - slack_rotor_distance[k])
+
+            #Approach speed limit: speed into the wall under gap / APPROACH_TIME + TOUCH_SPEED
+            speed_into_wall = -(wall_normal_vector @ lin_pad_vel)
+            gap = lin_pad_dist - model_params["contact_radius"]
+            mpc.addConstr(speed_into_wall - gap / APPROACH_TIME <= TOUCH_SPEED + slack_approach[k])
 
             #Adds the constraints related to roll and pitch limits
             mpc.addConstr(lin_roll <= ROLL_LIM + slack_roll[k])
@@ -326,8 +339,8 @@ def stacked_squared_error(mpc, weights, Mx, dx, Mu, du, c):
 
 def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output, input_vector_current,
                         reference_trajectory, hover_thrust_values, horizon_length, d0, tau, wall_normal_vector,
-                        push_params, return_plan=False):
-    #push_params: dict(k_f, mass, gravity, mu) from the model, for the push that breaks a stuck pad loose
+                        model_params, return_plan=False):
+    #model_params: dict(k_f, mass, gravity, mu, contact_radius) from the model, for the stuck push and the approach speed
     #return_plan=True also returns the planned outputs (N+1, 17): what the QP predicts the outputs
     #will be with its chosen inputs, y_nom + C dx + D du (the nominal outputs if the solve fails)
 
@@ -394,6 +407,7 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     slack_pitch = mpc.addMVar(N, lb=0, name="slack_pitch")
     slack_contact_distance = mpc.addMVar(N, lb=0, name="slack_contact_distance")
     slack_rotor_distance = mpc.addMVar(N, lb=0, name="slack_rotor_distance")
+    slack_approach = mpc.addMVar(N, lb=0, name="slack_approach")
 
     zeros_du = lambda rows: sp.csr_matrix((rows, N * nu))
     zeros_dx = lambda rows: sp.csr_matrix((rows, (N + 1) * nx))
@@ -428,8 +442,8 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     mpc.addConstr(input_change == input_difference.tocsr() @ du + (nominal_input_flat - previous_nominal_input))
     cost += INPUT_CHANGE_WEIGHT * (input_change @ input_change)
 
-    #Normal force error, whenever the pad is at the wall (gate only, not the contact flag), so outside the
-    #contact phase it drives the force to the reference's 0 and the pad can come off the wall
+    #Normal force error whenever the pad is at the wall, over the whole trajectory (the reference
+    #force is 0 outside the contact phase, so touching the wall when it shouldn't costs the same everywhere)
     rows = output_rows([0], range(N))
     cost += stacked_squared_error(
         mpc, NORMAL_FORCE_WEIGHT * contact_gate[:N], C_big[rows], dx, D_big[rows], du,
@@ -437,7 +451,7 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
 
     #Push to break the pad loose, at the steps where the pad should move faster than the plan has it moving
     push_rows = stuck_push_rows(nominal_state, nominal_input, nominal_output, reference_trajectory,
-                                contact_sigma, n, push_params, N)
+                                contact_sigma, n, model_params, N)
     if push_rows:
         steps = [row[0] for row in push_rows]
         row_index = np.arange(len(steps))
@@ -489,6 +503,7 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     cost += SLACK_WEIGHT_PITCH * (slack_pitch @ slack_pitch)
     cost += SLACK_WEIGHT_CONTACT_DISTANCE * (slack_contact_distance @ slack_contact_distance)
     cost += SLACK_WEIGHT_ROTOR_DISTANCE * (slack_rotor_distance @ slack_rotor_distance)
+    cost += SLACK_WEIGHT_APPROACH * (slack_approach @ slack_approach)
 
 
     # ---------------- Output constraints (k = 1..N) ----------------
@@ -507,6 +522,16 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     each_rotor = sp.kron(sp.eye(N), np.ones((4, 1)), format="csr")
     mpc.addConstr(C_big[rows] @ dx + D_big[rows] @ du + each_rotor @ slack_rotor_distance
                   >= ROTOR_MIN_DIST - y_nominal[rows])
+
+    #Approach speed limit: speed into the wall - gap / APPROACH_TIME <= TOUCH_SPEED, where
+    #speed into the wall = -n . pad velocity (outputs 6:9) and gap = pad distance (output 12) - contact sphere radius
+    velocity_rows = output_rows([6, 7, 8], later_steps)
+    distance_rows = output_rows([12], later_steps)
+    into_wall = sp.kron(sp.eye(N), -n[None, :], format="csr")
+    approach_dx = into_wall @ C_big[velocity_rows] - C_big[distance_rows] / APPROACH_TIME
+    approach_du = into_wall @ D_big[velocity_rows] - D_big[distance_rows] / APPROACH_TIME
+    approach_nominal = into_wall @ y_nominal[velocity_rows] - (y_nominal[distance_rows] - model_params["contact_radius"]) / APPROACH_TIME
+    mpc.addConstr(approach_dx @ dx + approach_du @ du - slack_approach <= TOUCH_SPEED - approach_nominal)
 
     #Roll and pitch limits
     for output_index, limit, slack in [(1, ROLL_LIM, slack_roll), (2, PITCH_LIM, slack_pitch)]:
@@ -534,7 +559,8 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
         return fallback()
 
     print(f"  max slack: roll {slack_roll.X.max():.4f} rad, pitch {slack_pitch.X.max():.4f} rad, "
-             f"contact {1000 * slack_contact_distance.X.max():.2f} mm, rotor {1000 * slack_rotor_distance.X.max():.2f} mm")
+             f"contact {1000 * slack_contact_distance.X.max():.2f} mm, rotor {1000 * slack_rotor_distance.X.max():.2f} mm, "
+             f"approach {100 * slack_approach.X.max():.1f} cm/s")
 
     #Optimized input sequence = nominal + deviation
     input_sequence = du.X.reshape(N, nu) + nominal_input[:N]
