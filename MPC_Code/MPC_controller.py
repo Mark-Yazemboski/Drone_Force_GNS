@@ -138,16 +138,41 @@ def clean_jacobians(matrices):
     return cleaned
 
 
+#Snaps gate values within GATE_SNAP of 0 or 1 to exactly 0 or 1. A sigmoid far from its center gives values like
+#1e-20 or 1 - 1e-9; as cost weights (and through the tangent projection) those become tiny QP coefficients
+#that only stretch the coefficient range, and change nothing a solver could resolve anyway.
+GATE_SNAP = 1e-3
+
+def snap_gate(values):
+    values = np.asarray(values, dtype=float)
+    return np.where(values < GATE_SNAP, 0.0, np.where(values > 1.0 - GATE_SNAP, 1.0, values))
+
+
+#Drops entries smaller than JACOBIAN_ZERO times the largest entry in their row, from a sparse matrix built from
+#products of the Jacobians (the projections and weightings can leave round-off behind)
+def drop_small(matrix):
+    matrix = sp.csr_matrix(matrix, dtype=float)
+    if matrix.nnz == 0:
+        return matrix
+    row_max = abs(matrix).max(axis=1).toarray().ravel()
+    rows = np.repeat(np.arange(matrix.shape[0]), np.diff(matrix.indptr))
+    matrix.data[np.abs(matrix.data) < JACOBIAN_ZERO * row_max[rows]] = 0.0
+    matrix.eliminate_zeros()
+    return matrix
+
+
 #Solves the QP. On numerical trouble (status 12), logs the model's coefficient ranges, which show what makes it
-#badly scaled, and retries once with Gurobi's most careful numerics (slower, only on the steps that need it)
+#badly scaled, and retries once with dual simplex and Gurobi's most careful numerics. Barrier (the default for
+#QPs) is what reports the trouble; simplex is usually more robust on a QP this small (slower, only when needed).
 def solve_qp(mpc):
     mpc.optimize()
     if mpc.Status == GRB.NUMERIC:
         log_event("numeric_trouble", coefficient_ranges(mpc))
+        mpc.Params.Method = 1
         mpc.Params.NumericFocus = 3
         mpc.reset()
         mpc.optimize()
-        log_event("numeric_retry", f"status {mpc.Status}")
+        log_event("numeric_retry", f"dual simplex: status {mpc.Status}")
 
 #Makes an error variable equal to the expression and returns its square.
 #This keeps the objective's Q matrix diagonal, so Gurobi always sees a convex QP
@@ -261,7 +286,8 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
 
 
     #Steps where the pad should slide but the plan has it stuck, and the push needed there
-    sigma_all = [calculate_contact_gate(nominal_output[k][12], d0, tau) * contact_flag[k] for k in range(horizon_length + 1)]
+    sigma_all = [float(snap_gate(calculate_contact_gate(nominal_output[k][12], d0, tau))) * contact_flag[k]
+                 for k in range(horizon_length + 1)]
     push_rows = {k: (g_theta, g_u, constant, scale) for k, g_theta, g_u, constant, scale in stuck_push_rows(
         nominal_state, nominal_input, nominal_output, reference_trajectory, sigma_all,
         np.asarray(wall_normal_vector, dtype=float), model_params, horizon_length)}
@@ -271,7 +297,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     for k in range(horizon_length + 1):
 
         #Calculates the contact gate for the current time step
-        contact_gate = calculate_contact_gate(nominal_output[k][12], d0, tau)
+        contact_gate = float(snap_gate(calculate_contact_gate(nominal_output[k][12], d0, tau)))
 
         #Computes the contact sigma by multiplying the contact gate with the contact flag
         contact_sigma = contact_gate * contact_flag[k]
@@ -424,7 +450,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
 def stacked_squared_error(mpc, weights, Mx, dx, Mu, du, c):
     scale = sp.diags(np.sqrt(weights))
     error = mpc.addMVar(len(c), lb=-GRB.INFINITY)
-    mpc.addConstr(error == (scale @ Mx) @ dx + (scale @ Mu) @ du + scale @ c)
+    mpc.addConstr(error == drop_small(scale @ Mx) @ dx + drop_small(scale @ Mu) @ du + scale @ c)
     return error @ error
 
 
@@ -474,7 +500,7 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
 
     #Contact gate at every step, from the nominal pad distance (output 12), times the contact flag
     pad_distance = y_nominal[output_rows([12], range(N + 1))]
-    contact_gate = 1.0 / (1.0 + np.exp(-(d0 - pad_distance) / tau))
+    contact_gate = snap_gate(1.0 / (1.0 + np.exp(-(d0 - pad_distance) / tau)))
     contact_sigma = reference_trajectory["contact_flag"][:N + 1] * contact_gate
 
     #Steps 1..N carry the state and output costs (dx_0 = 0, so step 0 is a constant)
