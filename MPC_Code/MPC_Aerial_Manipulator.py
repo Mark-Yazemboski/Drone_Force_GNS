@@ -24,6 +24,15 @@ from pathlib import Path
 SCRIPT_FOLDER = Path(__file__).resolve().parent
 
 
+#REMOVE THISIISSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS
+import MPC_controller
+#Test settings: override the controller's constants for this run
+MPC_controller.PROXIMAL_WEIGHT = 1 / 20**2
+MPC_controller.PUSH_MARGIN     = 1.3
+MPC_controller.PRESTABILIZE    = True
+#REMOVE THISIISSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS
+
+
 Run_Name = "testing_freeflight"
 
 #Seeds the random scenario so this exact run can be regenerated later
