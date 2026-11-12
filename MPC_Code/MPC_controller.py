@@ -28,11 +28,15 @@ NORMAL_FORCE_WEIGHT    = 1 / 0.3**2    # 0.3 N
 INPUT_WEIGHT           = 1 / 100**2    # 100 rad/s from hover
 INPUT_CHANGE_WEIGHT    = 1 / 20**2     # 20 rad/s per step
 
-SLACK_WEIGHT_ROLL = 1 / 0.01**2              # 0.01 rad (~0.6 deg) over the limit
-SLACK_WEIGHT_PITCH = 1 / 0.01**2             # 0.01 rad (~0.6 deg) over the limit
-SLACK_WEIGHT_CONTACT_DISTANCE = 100 
-SLACK_WEIGHT_ROTOR_DISTANCE = 1 / 0.002**2   # 2 mm too close to the wall
-SLACK_WEIGHT_APPROACH = 1 / 0.02**2          # 2 cm/s faster than the approach speed limit
+#L1 (exact penalty) slacks: cost = weight * violation. Above a threshold weight the constraint holds exactly whenever
+#it can, so these only need to be "big enough": 100 / tolerance makes one tolerance of violation cost as much as
+#100 steps of being one tolerance off in a tracking cost. Contact distance is kept weak on purpose: enforced
+#exactly, it makes the MPC tilt the pad so the closest node satisfies it (it limits the closest node, not the center).
+SLACK_WEIGHT_ROLL = 100 / 0.01               # per rad over the limit
+SLACK_WEIGHT_PITCH = 100 / 0.01              # per rad over the limit
+SLACK_WEIGHT_CONTACT_DISTANCE = 1 / 0.1      # per m too far off the wall (weak on purpose)
+SLACK_WEIGHT_ROTOR_DISTANCE = 100 / 0.002    # per m too close to the wall
+SLACK_WEIGHT_APPROACH = 100 / 0.02           # per m/s over the approach speed limit
 
 #Approach speed limit: the pad's speed into the wall must stay under gap / APPROACH_TIME + TOUCH_SPEED,
 #so it slows down as it closes in and touches at about TOUCH_SPEED. Far from the wall the limit is loose.
@@ -342,11 +346,11 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
             tangent_projection = np.eye(3) - contact_sigma * np.outer(wall_normal_vector, wall_normal_vector)
 
              #Slack variable cost
-            cost += slack_roll[k]**2 * SLACK_WEIGHT_ROLL
-            cost += slack_pitch[k]**2 * SLACK_WEIGHT_PITCH
-            cost += slack_contact_distance[k]**2 * SLACK_WEIGHT_CONTACT_DISTANCE
-            cost += slack_rotor_distance[k]**2 * SLACK_WEIGHT_ROTOR_DISTANCE
-            cost += slack_approach[k]**2 * SLACK_WEIGHT_APPROACH
+            cost += slack_roll[k] * SLACK_WEIGHT_ROLL
+            cost += slack_pitch[k] * SLACK_WEIGHT_PITCH
+            cost += slack_contact_distance[k] * SLACK_WEIGHT_CONTACT_DISTANCE
+            cost += slack_rotor_distance[k] * SLACK_WEIGHT_ROTOR_DISTANCE
+            cost += slack_approach[k] * SLACK_WEIGHT_APPROACH
             
             #Position error cost
             cost += POSITION_WEIGHT * squared_error(mpc, tangent_projection @ (lin_pad_pos - pad_ref_position[k]), 3)
@@ -592,12 +596,12 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
         mpc, ANG_VEL_WEIGHT * np.ones(3 * N), select_angular_velocity, dx, zeros_du(3 * N), du,
         np.concatenate([nominal_state[k][10:13] for k in later_steps]))
 
-    #Slack costs
-    cost += SLACK_WEIGHT_ROLL * (slack_roll @ slack_roll)
-    cost += SLACK_WEIGHT_PITCH * (slack_pitch @ slack_pitch)
-    cost += SLACK_WEIGHT_CONTACT_DISTANCE * (slack_contact_distance @ slack_contact_distance)
-    cost += SLACK_WEIGHT_ROTOR_DISTANCE * (slack_rotor_distance @ slack_rotor_distance)
-    cost += SLACK_WEIGHT_APPROACH * (slack_approach @ slack_approach)
+    #Slack costs: linear (L1), so the quadratic objective stays the identity
+    cost += SLACK_WEIGHT_ROLL * slack_roll.sum()
+    cost += SLACK_WEIGHT_PITCH * slack_pitch.sum()
+    cost += SLACK_WEIGHT_CONTACT_DISTANCE * slack_contact_distance.sum()
+    cost += SLACK_WEIGHT_ROTOR_DISTANCE * slack_rotor_distance.sum()
+    cost += SLACK_WEIGHT_APPROACH * slack_approach.sum()
 
 
     # ---------------- Output constraints (k = 1..N) ----------------
