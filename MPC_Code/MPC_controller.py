@@ -166,14 +166,25 @@ def drop_small(matrix):
     return matrix
 
 
+#How unstable the linearized dynamics are over the horizon: the largest |eigenvalue| of any A_k (above 1 means a
+#mode that grows every step), and how much the product A_{N-1} ... A_0 can amplify a deviation across the whole
+#horizon (its largest singular value). A large horizon gain makes the QP badly conditioned whatever its scaling.
+def horizon_growth(A):
+    radius = max(np.abs(np.linalg.eigvals(matrix)).max() for matrix in A)
+    product = np.eye(A[0].shape[0])
+    for matrix in A:
+        product = matrix @ product
+    return f"A eig max {radius:.3f} | horizon gain {np.linalg.norm(product, 2):.1e}"
+
+
 #Solves the QP. On numerical trouble (status 12), logs the model's coefficient ranges, which show what makes it
 #badly scaled, and retries once with barrier in its more robust settings: the homogeneous algorithm, extra numerical
 #care, and no crossover (the MPC only needs the interior solution, and crossover is a common source of trouble).
 #Dual simplex was tried here and ran into the time limit (status 9) almost every time.
-def solve_qp(mpc):
+def solve_qp(mpc, A):
     mpc.optimize()
     if mpc.Status == GRB.NUMERIC:
-        log_event("numeric_trouble", coefficient_ranges(mpc))
+        log_event("numeric_trouble", coefficient_ranges(mpc) + " | " + horizon_growth(A))
         mpc.Params.Method = 2
         mpc.Params.BarHomogeneous = 1
         mpc.Params.Crossover = 0
@@ -423,7 +434,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     #Optimizes the MPC problem to find the optimal du input sequence
     solve_start = timer()
     try:
-        solve_qp(mpc)
+        solve_qp(mpc, A)
     except gp.GurobiError as error:
         log_event("solver_error", f"{error} - using the shifted previous plan")
         return nominal_input
@@ -685,7 +696,7 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
 
     solve_start = timer()
     try:
-        solve_qp(mpc)
+        solve_qp(mpc, A)
     except gp.GurobiError as error:
         log_event("solver_error", f"{error} - using the shifted previous plan")
         return fallback()
