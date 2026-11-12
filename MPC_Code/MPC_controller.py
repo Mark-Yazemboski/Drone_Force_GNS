@@ -33,6 +33,12 @@ INPUT_CHANGE_WEIGHT    = 1 / 20**2     # 20 rad/s per step
 #without pulling the inputs toward hover; it costs nothing once a plan stops changing. 0 turns it off.
 PROXIMAL_WEIGHT        = 1 / 20**2     # 20 rad/s away from the nominal plan
 
+#Pre-stabilized prediction (batched builder only): the QP chooses v with du_k = K_k dx_k + v_k, where K_k are LQR
+#gains for the horizon's linearizations. Predictions then run on A_k + B_k K_k instead of A_k, so an unstable mode
+#in the linearization (contact chatter) can't compound over the horizon. Same feasible plans, same optimum; only the
+#solver's coordinates change. False gives the original formulation exactly.
+PRESTABILIZE = True
+
 #L1 (exact penalty) slacks: cost = weight * violation. Above a threshold weight the constraint holds exactly whenever
 #it can, so these only need to be "big enough": 100 / tolerance makes one tolerance of violation cost as much as
 #100 steps of being one tolerance off in a tracking cost. Contact distance is kept weak on purpose: enforced
@@ -174,22 +180,44 @@ def drop_small(matrix):
 #How unstable the linearized dynamics are over the horizon: the largest |eigenvalue| of any A_k (above 1 means a
 #mode that grows every step), and how much the product A_{N-1} ... A_0 can amplify a deviation across the whole
 #horizon (its largest singular value). A large horizon gain makes the QP badly conditioned whatever its scaling.
-def horizon_growth(A):
+def horizon_growth(A, label="A"):
     radius = max(np.abs(np.linalg.eigvals(matrix)).max() for matrix in A)
     product = np.eye(A[0].shape[0])
     for matrix in A:
         product = matrix @ product
-    return f"A eig max {radius:.3f} | horizon gain {np.linalg.norm(product, 2):.1e}"
+    return f"{label} eig max {radius:.3f} | horizon gain {np.linalg.norm(product, 2):.1e}"
+
+
+#Gains for the pre-stabilized prediction: one K_k per horizon step, from the finite-horizon LQR (backward Riccati)
+#recursion on the horizon's own linearizations, so each step is stabilized for the A_k it actually has (one gain
+#from A_0 can destabilize later steps when contact changes along the horizon). The state weights are the tracking
+#tolerances (history states get a token weight); the input weight is the input change weight, so the gains stay
+#moderate. 50 small 4x4 solves, a few ms. An unstable mode the inputs can't reach stays in the closed-loop
+#growth that the numeric_trouble log line reports.
+def prestabilizing_gains(A, B):
+    state_weights = np.concatenate([np.full(3, POSITION_WEIGHT), np.full(3, VELOCITY_WEIGHT),
+                                    np.full(3, ROD_ORIENTATION_WEIGHT), np.full(3, ANG_VEL_WEIGHT),
+                                    np.full(6, 1e-6)])
+    Q = np.diag(state_weights)
+    R = INPUT_CHANGE_WEIGHT * np.eye(B[0].shape[1])
+    P = Q.copy()
+    gains = [None] * len(A)
+    for k in reversed(range(len(A))):
+        K = -np.linalg.solve(R + B[k].T @ P @ B[k], B[k].T @ P @ A[k])
+        gains[k] = K
+        P = Q + A[k].T @ P @ (A[k] + B[k] @ K)
+        P = 0.5 * (P + P.T)
+    return gains
 
 
 #Solves the QP. On numerical trouble (status 12), logs the model's coefficient ranges, which show what makes it
 #badly scaled, and retries once with barrier in its more robust settings: the homogeneous algorithm, extra numerical
 #care, and no crossover (the MPC only needs the interior solution, and crossover is a common source of trouble).
 #Dual simplex was tried here and ran into the time limit (status 9) almost every time.
-def solve_qp(mpc, A):
+def solve_qp(mpc, A, label="A"):
     mpc.optimize()
     if mpc.Status == GRB.NUMERIC:
-        log_event("numeric_trouble", coefficient_ranges(mpc) + " | " + horizon_growth(A))
+        log_event("numeric_trouble", coefficient_ranges(mpc) + " | " + horizon_growth(A, label))
         mpc.Params.Method = 2
         mpc.Params.BarHomogeneous = 1
         mpc.Params.Crossover = 0
@@ -475,6 +503,11 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
 #Stacked outputs (17 per step, k = 0..N):   y = y_nominal + C_big @ dx + D_big @ du
 
 
+#Empty (N*nu, (N+1)*nx) matrix: the dx part of a row that only involves the inputs
+def zeros_dx_(N, nx, nu):
+    return sp.csr_matrix((N * nu, (N + 1) * nx))
+
+
 #Sum of weight * (Mx @ dx + Mu @ du + c)^2 over every row, through one error variable per row.
 #Each row is scaled by sqrt(weight) so the objective's Q matrix stays the identity (always convex).
 def stacked_squared_error(mpc, weights, Mx, dx, Mu, du, c):
@@ -552,7 +585,35 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     du_lower = np.maximum(MOTOR_MIN - nominal_input_flat, -INPUT_TRUST_REGION)
     du_upper = np.minimum(MOTOR_MAX - nominal_input_flat, INPUT_TRUST_REGION)
     dx = mpc.addMVar((N + 1) * nx, lb=-GRB.INFINITY, name="dx")
-    du = mpc.addMVar(N * nu, lb=du_lower, ub=du_upper, name="du")
+
+    #Pre-stabilization: du = K_big dx + v, with K_k applied to dx_k at every step k = 0..N-1 (K_big = 0 when off).
+    #Every cost and constraint written as Mx @ dx + Mu @ du becomes (Mx + Mu K_big) @ dx + Mu @ v.
+    prestabilized = PRESTABILIZE
+    gains = prestabilizing_gains(A[:N], B[:N]) if prestabilized else [np.zeros((nu, nx))] * N
+    K_big = sp.hstack([sp.block_diag(gains), sp.csr_matrix((N * nu, nx))], format="csr")
+
+    def fold(Mx, Mu):
+        Mu = sp.csr_matrix(Mu)
+        return (sp.csr_matrix(Mx) + Mu @ K_big).tocsr(), Mu
+
+    def linear(Mx, Mu):
+        #The linear expression Mx @ dx + Mu @ du, in terms of dx and v
+        Mx, Mu = fold(Mx, Mu)
+        return drop_small(Mx) @ dx + drop_small(Mu) @ v
+
+    def cost_rows(weights, Mx, Mu, c):
+        #stacked_squared_error for Mx @ dx + Mu @ du + c, in terms of dx and v
+        Mx, Mu = fold(Mx, Mu)
+        return stacked_squared_error(mpc, weights, Mx, dx, Mu, v, c)
+
+    #Input bounds (motor limits and trust region): simple bounds on v when not pre-stabilized,
+    #linear constraints on K dx + v when pre-stabilized
+    if prestabilized:
+        v = mpc.addMVar(N * nu, lb=-GRB.INFINITY, name="v")
+        mpc.addConstr(linear(zeros_dx_(N, nx, nu), sp.eye(N * nu)) >= du_lower)
+        mpc.addConstr(linear(zeros_dx_(N, nx, nu), sp.eye(N * nu)) <= du_upper)
+    else:
+        v = mpc.addMVar(N * nu, lb=du_lower, ub=du_upper, name="du")
 
     #Slacks for the softened constraints, one per step k = 1..N
     slack_roll = mpc.addMVar(N, lb=0, name="slack_roll")
@@ -576,22 +637,20 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     #   [             ...  ... ]          [             ...  ]
     next_state = sp.kron(sp.eye(N, N + 1, k=1), sp.eye(nx))
     current_state = sp.hstack([sp.block_diag(A[:N]), sp.csr_matrix((N * nx, nx))])
-    mpc.addConstr((next_state - current_state).tocsr() @ dx - sp.block_diag(B[:N], format="csr") @ du == 0)
+    mpc.addConstr(linear(next_state - current_state, -sp.block_diag(B[:N], format="csr")) == 0)
 
 
     # ---------------- Input costs and constraints (k = 0..N-1) ----------------
 
     #Input deviation from hover (the weight goes into the rows, like every other cost, so the
     #quadratic objective stays the identity and its range stays small)
-    cost = stacked_squared_error(
-        mpc, INPUT_WEIGHT * np.ones(N * nu), zeros_dx(N * nu), dx, sp.eye(N * nu, format="csr"), du,
-        nominal_input_flat - np.tile(hover_thrust_values, N))
+    cost = cost_rows(INPUT_WEIGHT * np.ones(N * nu), zeros_dx(N * nu), sp.eye(N * nu, format="csr"),
+                     nominal_input_flat - np.tile(hover_thrust_values, N))
 
     #Proximal cost: change from the nominal plan (du itself)
     if PROXIMAL_WEIGHT > 0:
-        cost += stacked_squared_error(
-            mpc, PROXIMAL_WEIGHT * np.ones(N * nu), zeros_dx(N * nu), dx, sp.eye(N * nu, format="csr"), du,
-            np.zeros(N * nu))
+        cost += cost_rows(PROXIMAL_WEIGHT * np.ones(N * nu), zeros_dx(N * nu), sp.eye(N * nu, format="csr"),
+                          np.zeros(N * nu))
 
     #Input change from one step to the next (step 0 is compared with the input applied right now).
     #The variable is the change scaled by sqrt(INPUT_CHANGE_WEIGHT) (so its square is the cost directly),
@@ -601,16 +660,15 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     change_scale = np.sqrt(INPUT_CHANGE_WEIGHT)
     input_change = mpc.addMVar(N * nu, lb=-change_scale * MOTOR_CHANGE_LIM, ub=change_scale * MOTOR_CHANGE_LIM,
                                name="input_change")
-    mpc.addConstr(input_change == change_scale * (input_difference.tocsr() @ du
+    mpc.addConstr(input_change == change_scale * (linear(zeros_dx(N * nu), input_difference)
                                                   + (nominal_input_flat - previous_nominal_input)))
     cost += input_change @ input_change
 
     #Normal force error whenever the pad is at the wall, over the whole trajectory (the reference
     #force is 0 outside the contact phase, so touching the wall when it shouldn't costs the same everywhere)
     rows = output_rows([0], range(N))
-    cost += stacked_squared_error(
-        mpc, NORMAL_FORCE_WEIGHT * contact_gate[:N], C_big[rows], dx, D_big[rows], du,
-        y_nominal[rows] - reference_trajectory["normal_force"][:N])
+    cost += cost_rows(NORMAL_FORCE_WEIGHT * contact_gate[:N], C_big[rows], D_big[rows],
+                      y_nominal[rows] - reference_trajectory["normal_force"][:N])
 
     #Push to break the pad loose, at the steps where the pad should move faster than the plan has it moving
     push_rows = stuck_push_rows(nominal_state, nominal_input, nominal_output, reference_trajectory,
@@ -625,8 +683,7 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
                                  (np.repeat(row_index, nu), [k * nu + j for k in steps for j in range(nu)])),
                                 shape=(len(steps), N * nu))
         scales = np.array([row[4] for row in push_rows])
-        cost += stacked_squared_error(mpc, PUSH_WEIGHT * scales, push_dx, dx, push_du, du,
-                                      np.array([row[3] for row in push_rows]))
+        cost += cost_rows(PUSH_WEIGHT * scales, push_dx, push_du, np.array([row[3] for row in push_rows]))
         print(f"  push active at {len(steps)} of {N} steps (mean scale {scales.mean():.2f})")
 
 
@@ -640,26 +697,23 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
                                                   ([6, 7, 8], "pad_velocity", VELOCITY_WEIGHT)]:
         rows = output_rows(output_indices, later_steps)
         reference = reference_trajectory[reference_key][1:N + 1].reshape(-1)
-        cost += stacked_squared_error(
-            mpc, weight * np.ones(len(rows)), projection @ C_big[rows], dx, projection @ D_big[rows], du,
-            projection @ (y_nominal[rows] - reference))
+        cost += cost_rows(weight * np.ones(len(rows)), projection @ C_big[rows], projection @ D_big[rows],
+                          projection @ (y_nominal[rows] - reference))
 
     #Rod orientation error: the part of the rod direction perpendicular to the wall normal
     #(pad pitch and yaw relative to the wall), zero when the rod points straight into the wall
     rod_rows = output_rows([9, 10, 11], later_steps)
     perpendicular = sp.kron(sp.eye(N), np.eye(3) - np.outer(n, n), format="csr")
-    cost += stacked_squared_error(
-        mpc, ROD_ORIENTATION_WEIGHT * np.ones(3 * N),
-        perpendicular @ C_big[rod_rows], dx, perpendicular @ D_big[rod_rows], du,
-        perpendicular @ y_nominal[rod_rows])
+    cost += cost_rows(ROD_ORIENTATION_WEIGHT * np.ones(3 * N),
+                      perpendicular @ C_big[rod_rows], perpendicular @ D_big[rod_rows],
+                      perpendicular @ y_nominal[rod_rows])
 
     #Angular velocity (state entries 10:13, error-state entries 9:12)
     angular_velocity_entries = [k * nx + i for k in later_steps for i in range(9, 12)]
     select_angular_velocity = sp.csr_matrix((np.ones(3 * N), (np.arange(3 * N), angular_velocity_entries)),
                                             shape=(3 * N, (N + 1) * nx))
-    cost += stacked_squared_error(
-        mpc, ANG_VEL_WEIGHT * np.ones(3 * N), select_angular_velocity, dx, zeros_du(3 * N), du,
-        np.concatenate([nominal_state[k][10:13] for k in later_steps]))
+    cost += cost_rows(ANG_VEL_WEIGHT * np.ones(3 * N), select_angular_velocity, zeros_du(3 * N),
+                      np.concatenate([nominal_state[k][10:13] for k in later_steps]))
 
     #Slack costs: linear (L1), so the quadratic objective stays the identity
     cost += SLACK_WEIGHT_ROLL * slack_roll.sum()
@@ -677,13 +731,13 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
         rows = output_rows([12], contact_steps)
         select_slack = sp.csr_matrix((np.ones(len(contact_steps)), (np.arange(len(contact_steps)), [k - 1 for k in contact_steps])),
                                      shape=(len(contact_steps), N))
-        mpc.addConstr(C_big[rows] @ dx + D_big[rows] @ du - select_slack @ slack_contact_distance
+        mpc.addConstr(linear(C_big[rows], D_big[rows]) - select_slack @ slack_contact_distance
                       <= CONTACT_MAX_DIST - y_nominal[rows])
 
     #Rotors at least ROTOR_MIN_DIST from the wall (one slack per step, shared by the 4 rotors)
     rows = output_rows([13, 14, 15, 16], later_steps)
     each_rotor = sp.kron(sp.eye(N), np.ones((4, 1)), format="csr")
-    mpc.addConstr(C_big[rows] @ dx + D_big[rows] @ du + each_rotor @ slack_rotor_distance
+    mpc.addConstr(linear(C_big[rows], D_big[rows]) + each_rotor @ slack_rotor_distance
                   >= ROTOR_MIN_DIST - y_nominal[rows])
 
     #Approach speed limit: speed into the wall - gap / APPROACH_TIME <= TOUCH_SPEED, where
@@ -700,14 +754,14 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
         approach_nominal = (into_wall @ y_nominal[velocity_rows]
                             - (y_nominal[distance_rows] - model_params["contact_radius"]) / APPROACH_TIME)
         select_slack = sp.csr_matrix((np.ones(m), (np.arange(m), [k - 1 for k in approach_steps])), shape=(m, N))
-        mpc.addConstr(approach_dx @ dx + approach_du @ du - select_slack @ slack_approach
+        mpc.addConstr(linear(approach_dx, approach_du) - select_slack @ slack_approach
                       <= TOUCH_SPEED - approach_nominal)
 
     #Roll and pitch limits
     for output_index, limit, slack in [(1, ROLL_LIM, slack_roll), (2, PITCH_LIM, slack_pitch)]:
         rows = output_rows([output_index], later_steps)
-        mpc.addConstr(C_big[rows] @ dx + D_big[rows] @ du - slack <= limit - y_nominal[rows])
-        mpc.addConstr(C_big[rows] @ dx + D_big[rows] @ du + slack >= -limit - y_nominal[rows])
+        mpc.addConstr(linear(C_big[rows], D_big[rows]) - slack <= limit - y_nominal[rows])
+        mpc.addConstr(linear(C_big[rows], D_big[rows]) + slack >= -limit - y_nominal[rows])
 
 
     # ---------------- Solve ----------------
@@ -715,8 +769,9 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     mpc.setObjective(cost, GRB.MINIMIZE)
 
     solve_start = timer()
+    growth = [A[k] + B[k] @ gains[k] for k in range(N)] if prestabilized else A[:N]
     try:
-        solve_qp(mpc, A)
+        solve_qp(mpc, growth, "closed-loop A+BK" if prestabilized else "A")
     except gp.GurobiError as error:
         log_event("solver_error", f"{error} - using the shifted previous plan")
         return fallback()
@@ -728,18 +783,21 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
         log_event("solve_failed", f"status {mpc.Status} - using the shifted previous plan")
         return fallback()
 
+    #Input deviations the QP chose: du = K dx + v
+    du_value = K_big @ dx.X + v.X
+
     print(f"  max slack: roll {slack_roll.X.max():.4f} rad, pitch {slack_pitch.X.max():.4f} rad, "
              f"contact {1000 * slack_contact_distance.X.max():.2f} mm, rotor {1000 * slack_rotor_distance.X.max():.2f} mm, "
              f"approach {100 * slack_approach.X.max():.1f} cm/s")
 
     #Optimized input sequence = nominal + deviation
-    input_sequence = du.X.reshape(N, nu) + nominal_input[:N]
+    input_sequence = du_value.reshape(N, nu) + nominal_input[:N]
     log_solution([slack.X.max() for slack in (slack_roll, slack_pitch, slack_contact_distance,
                                               slack_rotor_distance, slack_approach)],
-                 input_sequence[0], du.X[:nu])
+                 input_sequence[0], du_value[:nu])
     if not return_plan:
         return input_sequence
 
     #The outputs the QP planned on with those inputs
-    planned_outputs = (y_nominal + C_big @ dx.X + D_big @ du.X).reshape(N + 1, ny)
+    planned_outputs = (y_nominal + C_big @ dx.X + D_big @ du_value).reshape(N + 1, ny)
     return input_sequence, planned_outputs
