@@ -28,6 +28,11 @@ NORMAL_FORCE_WEIGHT    = 1 / 0.3**2    # 0.3 N
 INPUT_WEIGHT           = 1 / 100**2    # 100 rad/s from hover
 INPUT_CHANGE_WEIGHT    = 1 / 20**2     # 20 rad/s per step
 
+#Proximal term: penalizes du, the change from the nominal (shifted) plan, not the input itself. It adds curvature in
+#input directions the other costs barely see (stuck contact, where the stiff force rows dominate everything else),
+#without pulling the inputs toward hover; it costs nothing once a plan stops changing. 0 turns it off.
+PROXIMAL_WEIGHT        = 1 / 20**2     # 20 rad/s away from the nominal plan
+
 #L1 (exact penalty) slacks: cost = weight * violation. Above a threshold weight the constraint holds exactly whenever
 #it can, so these only need to be "big enough": 100 / tolerance makes one tolerance of violation cost as much as
 #100 steps of being one tolerance off in a tracking cost. Contact distance is kept weak on purpose: enforced
@@ -360,6 +365,9 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
 
             #Input deviation cost
             cost += INPUT_WEIGHT * squared_error(mpc, linearized_input - hover_thrust_values, 4)
+            #Proximal cost: change from the nominal plan
+            if PROXIMAL_WEIGHT > 0:
+                cost += PROXIMAL_WEIGHT * squared_error(mpc, du[k], 4)
             #Input change cost
             cost += INPUT_CHANGE_WEIGHT * squared_error(mpc, linearized_input - previous_lin_input, 4)
             #Normal force error cost
@@ -578,6 +586,12 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     cost = stacked_squared_error(
         mpc, INPUT_WEIGHT * np.ones(N * nu), zeros_dx(N * nu), dx, sp.eye(N * nu, format="csr"), du,
         nominal_input_flat - np.tile(hover_thrust_values, N))
+
+    #Proximal cost: change from the nominal plan (du itself)
+    if PROXIMAL_WEIGHT > 0:
+        cost += stacked_squared_error(
+            mpc, PROXIMAL_WEIGHT * np.ones(N * nu), zeros_dx(N * nu), dx, sp.eye(N * nu, format="csr"), du,
+            np.zeros(N * nu))
 
     #Input change from one step to the next (step 0 is compared with the input applied right now).
     #The variable is the change scaled by sqrt(INPUT_CHANGE_WEIGHT) (so its square is the cost directly),
