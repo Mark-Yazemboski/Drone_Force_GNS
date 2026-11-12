@@ -65,6 +65,20 @@ gurobi_env.setParam("Threads", 2)
 gurobi_env.start()
 
 
+#Solves the QP. On numerical trouble (status 12), prints the model's coefficient ranges, which show what makes
+#it badly scaled, and retries once with Gurobi's most careful numerics (slower, only on the steps that need it)
+def solve_qp(mpc):
+    mpc.optimize()
+    if mpc.Status == GRB.NUMERIC:
+        print("  QP numerical trouble, coefficient ranges:")
+        mpc.Params.OutputFlag = 1
+        mpc.printStats()
+        mpc.Params.OutputFlag = 0
+        mpc.Params.NumericFocus = 3
+        mpc.reset()
+        mpc.optimize()
+        print(f"  retry with NumericFocus=3: status {mpc.Status}")
+
 #Makes an error variable equal to the expression and returns its square.
 #This keeps the objective's Q matrix diagonal, so Gurobi always sees a convex QP
 def squared_error(mpc, expression, size):
@@ -304,7 +318,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     #Optimizes the MPC problem to find the optimal du input sequence
     solve_start = timer()
     try:
-        mpc.optimize()
+        solve_qp(mpc)
     except gp.GurobiError as error:
         print("MPC solve error:", error, "- using the shifted previous plan")
         return nominal_input
@@ -556,7 +570,7 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
 
     solve_start = timer()
     try:
-        mpc.optimize()
+        solve_qp(mpc)
     except gp.GurobiError as error:
         print("MPC solve error:", error, "- using the shifted previous plan")
         return fallback()
