@@ -126,14 +126,18 @@ def log_solution(slack_maxes, first_input, first_du):
 #Zeroes Jacobian entries that are float32 round-off: anything under JACOBIAN_ZERO times the largest entry in its row.
 #The autograd Jacobians come out of float32 math, so entries around 1e-11 to 1e-13 are noise, but they stretch the
 #QP's coefficient range across ~17 orders of magnitude, which is what Gurobi's numerical trouble comes from.
+#Also zeroes anything under JACOBIAN_FLOOR outright: rows that should be exactly zero come out of autograd as pure
+#round-off, and a row-relative test keeps those (the noise is its own row maximum). Nothing physical in these
+#units is that small (the smallest real entries, position vs rotor speed over one step, are ~1e-6).
 JACOBIAN_ZERO = 1e-6
+JACOBIAN_FLOOR = 1e-9
 
 def clean_jacobians(matrices):
     cleaned = []
     for matrix in matrices:
         matrix = np.array(matrix, dtype=float)
         row_max = np.abs(matrix).max(axis=-1, keepdims=True)
-        matrix[np.abs(matrix) < JACOBIAN_ZERO * row_max] = 0.0
+        matrix[(np.abs(matrix) < JACOBIAN_ZERO * row_max) | (np.abs(matrix) < JACOBIAN_FLOOR)] = 0.0
         cleaned.append(matrix)
     return cleaned
 
@@ -156,23 +160,27 @@ def drop_small(matrix):
         return matrix
     row_max = abs(matrix).max(axis=1).toarray().ravel()
     rows = np.repeat(np.arange(matrix.shape[0]), np.diff(matrix.indptr))
-    matrix.data[np.abs(matrix.data) < JACOBIAN_ZERO * row_max[rows]] = 0.0
+    small = (np.abs(matrix.data) < JACOBIAN_ZERO * row_max[rows]) | (np.abs(matrix.data) < JACOBIAN_FLOOR)
+    matrix.data[small] = 0.0
     matrix.eliminate_zeros()
     return matrix
 
 
 #Solves the QP. On numerical trouble (status 12), logs the model's coefficient ranges, which show what makes it
-#badly scaled, and retries once with dual simplex and Gurobi's most careful numerics. Barrier (the default for
-#QPs) is what reports the trouble; simplex is usually more robust on a QP this small (slower, only when needed).
+#badly scaled, and retries once with barrier in its more robust settings: the homogeneous algorithm, extra numerical
+#care, and no crossover (the MPC only needs the interior solution, and crossover is a common source of trouble).
+#Dual simplex was tried here and ran into the time limit (status 9) almost every time.
 def solve_qp(mpc):
     mpc.optimize()
     if mpc.Status == GRB.NUMERIC:
         log_event("numeric_trouble", coefficient_ranges(mpc))
-        mpc.Params.Method = 1
-        mpc.Params.NumericFocus = 3
+        mpc.Params.Method = 2
+        mpc.Params.BarHomogeneous = 1
+        mpc.Params.Crossover = 0
+        mpc.Params.NumericFocus = 2
         mpc.reset()
         mpc.optimize()
-        log_event("numeric_retry", f"dual simplex: status {mpc.Status}")
+        log_event("numeric_retry", f"homogeneous barrier: status {mpc.Status}")
 
 #Makes an error variable equal to the expression and returns its square.
 #This keeps the objective's Q matrix diagonal, so Gurobi always sees a convex QP
@@ -656,8 +664,8 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
         velocity_rows = output_rows([6, 7, 8], approach_steps)
         distance_rows = output_rows([12], approach_steps)
         into_wall = sp.kron(sp.eye(m), -n[None, :], format="csr")
-        approach_dx = into_wall @ C_big[velocity_rows] - C_big[distance_rows] / APPROACH_TIME
-        approach_du = into_wall @ D_big[velocity_rows] - D_big[distance_rows] / APPROACH_TIME
+        approach_dx = drop_small(into_wall @ C_big[velocity_rows] - C_big[distance_rows] / APPROACH_TIME)
+        approach_du = drop_small(into_wall @ D_big[velocity_rows] - D_big[distance_rows] / APPROACH_TIME)
         approach_nominal = (into_wall @ y_nominal[velocity_rows]
                             - (y_nominal[distance_rows] - model_params["contact_radius"]) / APPROACH_TIME)
         select_slack = sp.csr_matrix((np.ones(m), (np.arange(m), [k - 1 for k in approach_steps])), shape=(m, N))
