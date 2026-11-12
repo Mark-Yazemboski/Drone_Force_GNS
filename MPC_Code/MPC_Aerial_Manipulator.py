@@ -13,6 +13,8 @@ from MPC_controller import mpc_control, mpc_control_batched, STATE_SIZE, INPUT_S
     POSITION_WEIGHT, VELOCITY_WEIGHT, ROD_ORIENTATION_WEIGHT, ANG_VEL_WEIGHT, NORMAL_FORCE_WEIGHT, INPUT_WEIGHT, \
     INPUT_CHANGE_WEIGHT, SLACK_WEIGHT_ROLL, SLACK_WEIGHT_PITCH, SLACK_WEIGHT_CONTACT_DISTANCE, SLACK_WEIGHT_ROTOR_DISTANCE
 import warnings
+from MPC_controller import open_event_log, set_log_step, log_event
+from utilities import quat_to_rot_matrix_np
 
 warnings.filterwarnings("ignore", message=".*np.chararray.*")
 
@@ -34,6 +36,8 @@ RUN_FOLDER = SCRIPT_FOLDER / "MPC_runs" / Run_Name
 RUN_FOLDER.mkdir(parents=True, exist_ok=True)
 print("Run name:", Run_Name, "| seed:", seed)
 print("Saving results to:", RUN_FOLDER)
+
+open_event_log(RUN_FOLDER / "events.csv")
 
 #path of the trained contact and fluid model GNN
 Trained_model_path = SCRIPT_FOLDER / "MPC_Model" / "Trained_Model.pt"
@@ -228,6 +232,8 @@ planned_output_history = np.full((len(t) + 1, Horizon_length + 1, 17), np.nan, d
 model_params = dict(k_f=model.motor_kf, mass=model.mass, gravity=float(model.cfg.gravity),
                     mu=model.friction_mu, contact_radius=float(model.cfg.pad_contact_radius))
 
+crash_logged = False
+
 print("old sigma in steady contact:", calculate_contact_gate(0.004, d0, tau))
 print("new sigma in steady contact:", calculate_contact_gate(0.004, MPC_GATE_D0, MPC_GATE_TAU))
 
@@ -257,6 +263,16 @@ for time_step in t:
     state_vector_current = state_vector[time_step_index+1]
     mujoco_friction_history[time_step_index + 1] = sim.get_friction_force()
     print(f"  force prediction: {predict_time:.3f} s | MuJoCo step: {timer(device) - section_start:.3f} s")
+
+    set_log_step(time_step_index, time_step)
+
+    #Sim events: something other than the pad hit the wall, or the drone tilted past 60 deg
+    if sim.crash_message and not crash_logged:
+        log_event("crash", sim.crash_message)
+        crash_logged = True
+    tilt = np.degrees(np.arccos(np.clip(quat_to_rot_matrix_np(state_vector_current[6:10])[2, 2], -1, 1)))
+    if tilt > 60:
+        log_event("large_tilt", f"{tilt:.0f} deg")
 
     #runs the mpc controller when the time since the last update exceeds the MPC timestep
     if time_since_last_MPC_update >= MPC_dt:

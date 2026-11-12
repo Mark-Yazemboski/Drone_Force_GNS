@@ -65,19 +65,70 @@ gurobi_env.setParam("Threads", 2)
 gurobi_env.start()
 
 
-#Solves the QP. On numerical trouble (status 12), prints the model's coefficient ranges, which show what makes
-#it badly scaled, and retries once with Gurobi's most careful numerics (slower, only on the steps that need it)
+#---------------------------------- Event log ----------------------------------------
+#One line per thing that went wrong (failed or suboptimal solves, numerical trouble, slacks in use, rotors at their
+#limits, the trust region hit), so a run can be reviewed from one dense file instead of the console.
+#open_event_log(path) once per run, set_log_step(step, time) every step, log_event(...) anywhere.
+_event_log = None
+_log_step = (0, 0.0)
+
+def open_event_log(path):
+    global _event_log
+    _event_log = open(path, "w", buffering=1)      #line buffered, so the file is complete even if the run crashes
+    _event_log.write("step,time_s,event,details\n")
+
+def set_log_step(step, time):
+    global _log_step
+    _log_step = (step, time)
+
+def log_event(event, details=""):
+    details = str(details).replace(",", ";")      #keeps every line at four CSV fields
+    print(f"  [{event}] {details}")
+    if _event_log is not None:
+        _event_log.write(f"{_log_step[0]},{_log_step[1]:.2f},{event},{details}\n")
+
+
+def value_range(values):
+    #"min..max" of the nonzero magnitudes
+    values = np.abs(np.asarray(values, dtype=float))
+    values = values[values > 0]
+    return f"{values.min():.1e}..{values.max():.1e}" if len(values) else "none"
+
+def coefficient_ranges(mpc):
+    #Ranges of the QP's constraint matrix, quadratic objective, right-hand sides, and finite bounds
+    objective = mpc.getObjective()
+    quadratic = [objective.getCoeff(i) for i in range(objective.size())]
+    bounds = np.concatenate([mpc.getAttr("LB", mpc.getVars()), mpc.getAttr("UB", mpc.getVars())])
+    bounds = bounds[np.abs(bounds) < GRB.INFINITY]
+    return (f"matrix {value_range(mpc.getA().data)} | quadratic objective {value_range(quadratic)} | "
+            f"rhs {value_range(mpc.getAttr('RHS', mpc.getConstrs()))} | bounds {value_range(bounds)}")
+
+
+def log_solution(slack_maxes, first_input, first_du):
+    #Logs the slacks in use, rotors at their limits, and a first step that hits the trust region
+    over = [f"{name} {scale * value:.2f} {unit}" for name, value, limit, scale, unit in [
+        ("roll", slack_maxes[0], 0.01, 1, "rad"), ("pitch", slack_maxes[1], 0.01, 1, "rad"),
+        ("contact", slack_maxes[2], 0.001, 1000, "mm"), ("rotor", slack_maxes[3], 0.001, 1000, "mm"),
+        ("approach", slack_maxes[4], 0.01, 100, "cm/s")] if value > limit]
+    if over:
+        log_event("slack", "; ".join(over))
+    saturated = np.flatnonzero((first_input <= MOTOR_MIN + 1.0) | (first_input >= MOTOR_MAX - 1.0))
+    if len(saturated):
+        log_event("rotor_saturated", " ".join(f"rotor{j + 1}={first_input[j]:.0f}" for j in saturated))
+    if np.any(np.abs(first_du) >= INPUT_TRUST_REGION - 1e-3):
+        log_event("trust_region_hit", "du = " + " ".join(f"{v:.0f}" for v in first_du))
+
+
+#Solves the QP. On numerical trouble (status 12), logs the model's coefficient ranges, which show what makes it
+#badly scaled, and retries once with Gurobi's most careful numerics (slower, only on the steps that need it)
 def solve_qp(mpc):
     mpc.optimize()
     if mpc.Status == GRB.NUMERIC:
-        print("  QP numerical trouble, coefficient ranges:")
-        mpc.Params.OutputFlag = 1
-        mpc.printStats()
-        mpc.Params.OutputFlag = 0
+        log_event("numeric_trouble", coefficient_ranges(mpc))
         mpc.Params.NumericFocus = 3
         mpc.reset()
         mpc.optimize()
-        print(f"  retry with NumericFocus=3: status {mpc.Status}")
+        log_event("numeric_retry", f"status {mpc.Status}")
 
 #Makes an error variable equal to the expression and returns its square.
 #This keeps the objective's Q matrix diagonal, so Gurobi always sees a convex QP
@@ -149,7 +200,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     for name, matrices in [("A", A), ("B", B), ("C", C), ("D", D), ("output", nominal_output), ("state", nominal_state)]:
         for k, matrix in enumerate(matrices):
             if not np.all(np.isfinite(matrix)):
-                print(f"NaN/inf in {name}[{k}], using the shifted previous plan")
+                log_event("nan_linearization", f"{name}[{k}] - using the shifted previous plan")
                 return nominal_input
 
     
@@ -320,18 +371,21 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     try:
         solve_qp(mpc)
     except gp.GurobiError as error:
-        print("MPC solve error:", error, "- using the shifted previous plan")
+        log_event("solver_error", f"{error} - using the shifted previous plan")
         return nominal_input
     print(f"  QP build: {solve_start - build_start:.3f} s | QP solve: {timer() - solve_start:.3f} s")
 
     if mpc.Status == GRB.SUBOPTIMAL:
-        print("MPC solve suboptimal (numerical issues), using it anyway")
+        log_event("solve_suboptimal", "using it anyway")
     elif mpc.Status != GRB.OPTIMAL:
-        print(f"MPC solve failed (status {mpc.Status}), using the shifted previous plan")
+        log_event("solve_failed", f"status {mpc.Status} - using the shifted previous plan")
         return nominal_input
 
     #Takes the optimized du input sequence and adds it to the nominal input to get the actual input sequence
     input_sequence = du.X + nominal_input
+    log_solution([slack.X.max() for slack in (slack_roll, slack_pitch, slack_contact_distance,
+                                              slack_rotor_distance, slack_approach)],
+                 input_sequence[0], du.X[0])
 
     return input_sequence
 
@@ -376,7 +430,7 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     for name, matrices in [("A", A), ("B", B), ("C", C), ("D", D), ("output", nominal_output), ("state", nominal_state)]:
         for k, matrix in enumerate(matrices):
             if not np.all(np.isfinite(matrix)):
-                print(f"NaN/inf in {name}[{k}], using the shifted previous plan")
+                log_event("nan_linearization", f"{name}[{k}] - using the shifted previous plan")
                 return fallback()
 
     build_start = timer()
@@ -572,14 +626,14 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     try:
         solve_qp(mpc)
     except gp.GurobiError as error:
-        print("MPC solve error:", error, "- using the shifted previous plan")
+        log_event("solver_error", f"{error} - using the shifted previous plan")
         return fallback()
     print(f"  QP build: {solve_start - build_start:.3f} s | QP solve: {timer() - solve_start:.3f} s")
 
     if mpc.Status == GRB.SUBOPTIMAL:
-        print("MPC solve suboptimal (numerical issues), using it anyway")
+        log_event("solve_suboptimal", "using it anyway")
     elif mpc.Status != GRB.OPTIMAL:
-        print(f"MPC solve failed (status {mpc.Status}), using the shifted previous plan")
+        log_event("solve_failed", f"status {mpc.Status} - using the shifted previous plan")
         return fallback()
 
     print(f"  max slack: roll {slack_roll.X.max():.4f} rad, pitch {slack_pitch.X.max():.4f} rad, "
@@ -588,6 +642,9 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
 
     #Optimized input sequence = nominal + deviation
     input_sequence = du.X.reshape(N, nu) + nominal_input[:N]
+    log_solution([slack.X.max() for slack in (slack_roll, slack_pitch, slack_contact_distance,
+                                              slack_rotor_distance, slack_approach)],
+                 input_sequence[0], du.X[:nu])
     if not return_plan:
         return input_sequence
 
