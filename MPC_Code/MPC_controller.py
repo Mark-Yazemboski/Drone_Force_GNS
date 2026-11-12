@@ -119,6 +119,21 @@ def log_solution(slack_maxes, first_input, first_du):
         log_event("trust_region_hit", "du = " + " ".join(f"{v:.0f}" for v in first_du))
 
 
+#Zeroes Jacobian entries that are float32 round-off: anything under JACOBIAN_ZERO times the largest entry in its row.
+#The autograd Jacobians come out of float32 math, so entries around 1e-11 to 1e-13 are noise, but they stretch the
+#QP's coefficient range across ~17 orders of magnitude, which is what Gurobi's numerical trouble comes from.
+JACOBIAN_ZERO = 1e-6
+
+def clean_jacobians(matrices):
+    cleaned = []
+    for matrix in matrices:
+        matrix = np.array(matrix, dtype=float)
+        row_max = np.abs(matrix).max(axis=-1, keepdims=True)
+        matrix[np.abs(matrix) < JACOBIAN_ZERO * row_max] = 0.0
+        cleaned.append(matrix)
+    return cleaned
+
+
 #Solves the QP. On numerical trouble (status 12), logs the model's coefficient ranges, which show what makes it
 #badly scaled, and retries once with Gurobi's most careful numerics (slower, only on the steps that need it)
 def solve_qp(mpc):
@@ -203,7 +218,8 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
                 log_event("nan_linearization", f"{name}[{k}] - using the shifted previous plan")
                 return nominal_input
 
-    
+    A, B, C, D = clean_jacobians(A), clean_jacobians(B), clean_jacobians(C), clean_jacobians(D)
+
     #Initializes the MPC optimization model using Gurobi
     build_start = timer()
     mpc = gp.Model("Aerial_Manipulator", env=gurobi_env)
@@ -433,6 +449,8 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
                 log_event("nan_linearization", f"{name}[{k}] - using the shifted previous plan")
                 return fallback()
 
+    A, B, C, D = clean_jacobians(A), clean_jacobians(B), clean_jacobians(C), clean_jacobians(D)
+
     build_start = timer()
     N = horizon_length
     nx, nu, ny = STATE_SIZE - 1, INPUT_SIZE, len(nominal_output[0])     # 18, 4, 17
@@ -500,18 +518,23 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
 
     # ---------------- Input costs and constraints (k = 0..N-1) ----------------
 
-    #Input deviation from hover
-    cost = INPUT_WEIGHT * stacked_squared_error(
-        mpc, np.ones(N * nu), zeros_dx(N * nu), dx, sp.eye(N * nu, format="csr"), du,
+    #Input deviation from hover (the weight goes into the rows, like every other cost, so the
+    #quadratic objective stays the identity and its range stays small)
+    cost = stacked_squared_error(
+        mpc, INPUT_WEIGHT * np.ones(N * nu), zeros_dx(N * nu), dx, sp.eye(N * nu, format="csr"), du,
         nominal_input_flat - np.tile(hover_thrust_values, N))
 
     #Input change from one step to the next (step 0 is compared with the input applied right now).
-    #The motor change limit is the bound on this variable.
+    #The variable is the change scaled by sqrt(INPUT_CHANGE_WEIGHT) (so its square is the cost directly),
+    #and the motor change limit, scaled the same way, is its bound.
     previous_nominal_input = np.concatenate([input_vector_current, nominal_input_flat[:-nu]])
     input_difference = sp.eye(N * nu) - sp.eye(N * nu, k=-nu)
-    input_change = mpc.addMVar(N * nu, lb=-MOTOR_CHANGE_LIM, ub=MOTOR_CHANGE_LIM, name="input_change")
-    mpc.addConstr(input_change == input_difference.tocsr() @ du + (nominal_input_flat - previous_nominal_input))
-    cost += INPUT_CHANGE_WEIGHT * (input_change @ input_change)
+    change_scale = np.sqrt(INPUT_CHANGE_WEIGHT)
+    input_change = mpc.addMVar(N * nu, lb=-change_scale * MOTOR_CHANGE_LIM, ub=change_scale * MOTOR_CHANGE_LIM,
+                               name="input_change")
+    mpc.addConstr(input_change == change_scale * (input_difference.tocsr() @ du
+                                                  + (nominal_input_flat - previous_nominal_input)))
+    cost += input_change @ input_change
 
     #Normal force error whenever the pad is at the wall, over the whole trajectory (the reference
     #force is 0 outside the contact phase, so touching the wall when it shouldn't costs the same everywhere)
