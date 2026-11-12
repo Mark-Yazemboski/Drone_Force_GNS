@@ -276,6 +276,9 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     #Sets the time limit for the solver and specifies that the problem is non-convex
     mpc.Params.TimeLimit = 1.0
     mpc.Params.NonConvex = 0 
+    #Barrier convergence tolerance: Gurobi's default (1e-8) is far tighter than an MPC step needs, and solves
+    #that stall just short of it are what come back as numerical trouble (12) or suboptimal (13)
+    mpc.Params.BarConvTol = 1e-6
 
     #Creates the decision variables for the state and input deviations
     #Sets limits for the input deviations based on the motor constraints
@@ -533,6 +536,9 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     mpc.Params.OutputFlag = 0
     mpc.Params.TimeLimit = 1.0
     mpc.Params.NonConvex = 0
+    #Barrier convergence tolerance: Gurobi's default (1e-8) is far tighter than an MPC step needs, and solves
+    #that stall just short of it are what come back as numerical trouble (12) or suboptimal (13)
+    mpc.Params.BarConvTol = 1e-6
 
     nominal_input_flat = nominal_input[:N].reshape(-1)
     du_lower = np.maximum(MOTOR_MIN - nominal_input_flat, -INPUT_TRUST_REGION)
