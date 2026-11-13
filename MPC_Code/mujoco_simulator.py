@@ -267,6 +267,7 @@ class MujocoDroneSim:
         self.data.ctrl[:] = np.clip(thrust_command, 0.0, 100.0)
 
         num_substeps = round(duration / self.physics_dt)
+        contact_force_sum = np.zeros(3)
         for _ in range(num_substeps):
 
             #One physics substep with rotor drag
@@ -282,7 +283,7 @@ class MujocoDroneSim:
                     self.crash_message = f"part of the drone other than the pad hit the wall at t={self.time:.2f}s"
                     print("WARNING:", self.crash_message)
             else:
-                self.contact_force = contact_force
+                contact_force_sum += contact_force
 
 
             #Every 0.01 s, record the pose for the finite-difference state
@@ -292,6 +293,9 @@ class MujocoDroneSim:
                 if self.viewer is not None:
                     self.viewer.sync()
 
+        #Contact force averaged over the whole step, like the GNN's training labels (a single substep catches
+        #the pad mid-hop while it slides, reading 0 or a spike)
+        self.contact_force = contact_force_sum / max(num_substeps, 1)
         return self.get_state()
 
 
@@ -311,9 +315,10 @@ class MujocoDroneSim:
 
 
     def get_normal_force(self):
-        #Normal force the wall pushes on the pad with (N), from the last substep
+        #Normal force the wall pushes on the pad with (N), averaged over the last step
         return float(self.contact_force @ self.wall_normal_vector)
 
     def get_friction_force(self):
-        #Friction the wall applies to the pad (N): the part of the contact force in the wall plane, world frame
+        #Friction the wall applies to the pad (N), averaged over the last step: the part of the contact force in the wall
+        #plane, world frame
         return self.contact_force - (self.contact_force @ self.wall_normal_vector) * self.wall_normal_vector

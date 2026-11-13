@@ -13,7 +13,8 @@ from MPC_controller import mpc_control, mpc_control_batched, STATE_SIZE, INPUT_S
     POSITION_WEIGHT, VELOCITY_WEIGHT, ROD_ORIENTATION_WEIGHT, ANG_VEL_WEIGHT, NORMAL_FORCE_WEIGHT, INPUT_WEIGHT, \
     INPUT_CHANGE_WEIGHT, SLACK_WEIGHT_ROLL, SLACK_WEIGHT_PITCH, SLACK_WEIGHT_CONTACT_DISTANCE, SLACK_WEIGHT_ROTOR_DISTANCE
 import warnings
-from MPC_controller import open_event_log, set_log_step, log_event
+from MPC_controller import open_event_log, set_log_step, log_event, motor_step, motor_map
+import MPC_controller
 from utilities import quat_to_rot_matrix_np
 
 warnings.filterwarnings("ignore", message=".*np.chararray.*")
@@ -22,18 +23,6 @@ from pathlib import Path
 
 #Folder this script lives in (MPC_Code), so the path works on any computer
 SCRIPT_FOLDER = Path(__file__).resolve().parent
-
-
-#REMOVE THISIISSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS
-import MPC_controller
-#Test settings: override the controller's constants for this run
-MPC_controller.PROXIMAL_WEIGHT = 1 / 20**2
-MPC_controller.PUSH_MARGIN     = 1.3
-MPC_controller.PRESTABILIZE    = True
-MPC_controller.CATCH_UP_TIME   = 0.5
-MPC_controller.PUSH_WEIGHT     = 1 / 0.1**2
-MPC_controller.NORMAL_FORCE_WEIGHT    = 1 / 0.3**2
-#REMOVE THISIISSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS
 
 
 Run_Name = "testing_freeflight"
@@ -165,7 +154,9 @@ trajectory_time_length, reference_trajectory = trajectory_generator.generate_tra
 
 #---------------------Initilize mujoco simulation ---------------------
 #Assuming you have a mujoco model file and a mujoco simulation object
-sim = MujocoDroneSim(model.cfg, wall_normal_vector, wall_center_point, wind_vector, motor_tau=0.025, show_viewer=False)
+#The motor time constant comes from the controller, so the MPC's motor model and the sim always match
+#(for a no-lag test, set MOTOR_TAU = 0.001 in MPC_controller.py, not 0: the sim needs a time constant above 0)
+sim = MujocoDroneSim(model.cfg, wall_normal_vector, wall_center_point, wind_vector, motor_tau=MPC_controller.MOTOR_TAU, show_viewer=False)
 state_vector_current = sim.reset(trajectory_generator.initial_state, hover_input)
 
 
@@ -242,7 +233,11 @@ planned_output_history = np.full((len(t) + 1, Horizon_length + 1, 17), np.nan, d
 
 #Model values for the push that breaks a stuck pad loose
 model_params = dict(k_f=model.motor_kf, mass=model.mass, gravity=float(model.cfg.gravity),
-                    mu=model.friction_mu, contact_radius=float(model.cfg.pad_contact_radius))
+                    mu=model.friction_mu, contact_radius=float(model.cfg.pad_contact_radius), dt=MPC_dt)
+
+#The motors' squared speeds right now (thrust / k_f), tracked through the lag from the commands sent.
+#The sim starts with the motors at hover.
+motor_speed_squared = hover_input ** 2
 
 crash_logged = False
 
@@ -257,10 +252,13 @@ for time_step in t:
     print("Time step:", time_step_index)
     step_start = timer(device)
 
+    #The rotor speed the model sees over this step (the command after the motor lag), and the motors at the end of it
+    effective_input_current, next_motor_speed_squared = motor_step(motor_speed_squared, input_vector_current, simulation_dt)
+
     #What the model predicts the contact force will be over this step (for the plots)
     predicted_normal, predicted_friction = model_cpu.predict_contact_force(
         torch.as_tensor(state_vector_current, dtype=torch.float32),
-        torch.as_tensor(input_vector_current, dtype=torch.float32))
+        torch.as_tensor(effective_input_current, dtype=torch.float32))
     predicted_force_history[time_step_index + 1] = predicted_normal
     predicted_friction_history[time_step_index + 1] = predicted_friction
     predict_time = timer(device) - step_start
@@ -273,6 +271,7 @@ for time_step in t:
     state_vector[time_step_index+1] = sim.step(input_vector_current, simulation_dt)
     normal_force_history[time_step_index + 1] = sim.get_normal_force()
     state_vector_current = state_vector[time_step_index+1]
+    motor_speed_squared = next_motor_speed_squared
     mujoco_friction_history[time_step_index + 1] = sim.get_friction_force()
     print(f"  force prediction: {predict_time:.3f} s | MuJoCo step: {timer(device) - section_start:.3f} s")
 
@@ -297,10 +296,13 @@ for time_step in t:
         #Rolls out the previous input sequence moved by one timestep, with the last input repeated at the end
         rollout_input_sequence = np.array(list(input_sequence[1:]) + [input_sequence[-1]])
 
+        #The rotor speeds the model sees for those commands, after the motor lag
+        effective_input_sequence, _ = motor_map(rollout_input_sequence, motor_speed_squared, MPC_dt)
+
         #Nominal trajectory over the horizon from the shifted plan (on the CPU: sequential, batch of 1, no gradients)
         section_start = timer(device)
         torch_state = torch.as_tensor(state_vector_current, dtype=torch.float32)
-        torch_inputs = torch.as_tensor(rollout_input_sequence, dtype=torch.float32)
+        torch_inputs = torch.as_tensor(effective_input_sequence, dtype=torch.float32)
         nominal_states = model_cpu.rollout(torch_state, torch_inputs, MPC_dt_multiple)          # (N+1, 19)
         rollout_time = timer(device) - section_start
 
@@ -343,7 +345,7 @@ for time_step in t:
         #Outputs the computed input sequence for the current MPC step
         print("Computing MPC control input sequence...")
         #mpc_control builds the same QP one step at a time (easier to read); the batched version is much faster
-        input_sequence, planned_outputs = mpc_control_batched(A_list,B_list,C_list,D_list,nom_states,rollout_input_sequence,nom_outputs,input_vector_current, reference_window,hover_input,Horizon_length,MPC_GATE_D0,MPC_GATE_TAU, wall_normal_vector, model_params, return_plan=True)
+        input_sequence, planned_outputs = mpc_control_batched(A_list,B_list,C_list,D_list,nom_states,rollout_input_sequence,nom_outputs,input_vector_current, reference_window,hover_input,Horizon_length,MPC_GATE_D0,MPC_GATE_TAU, wall_normal_vector, model_params, motor_speed_squared, return_plan=True)
         planned_output_history[time_step_index + 1] = planned_outputs
 
         #Sets the current input to the first element of the computed input sequence

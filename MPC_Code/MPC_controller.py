@@ -62,10 +62,18 @@ INPUT_TRUST_REGION = 100.0 # Rad/s per control step
 #the in-plane force the drone applies along that direction is pushed toward PUSH_MARGIN * mu * F_n
 #(mu is the model's learned value). The push fades out as the planned speed reaches the wanted speed.
 PUSH_WEIGHT     = 1 / 0.1**2    # 0.1 N
-PUSH_MARGIN     = 1.3           # over the friction limit; the learned mu (~0.33) is below MuJoCo's 0.4
+PUSH_MARGIN     = 2.0           # over the friction limit; the learned mu (~0.33) is below MuJoCo's 0.4, and the push is one
+                                # cost among several, so the drone delivers less than the target
 SLIDE_MIN_SPEED = 0.01          # m/s, wanted in-plane speed above this counts as a slide
 CATCH_UP_TIME   = 0.5          # s, the wanted speed includes closing the in-plane position error over this time
 
+
+
+#Motor lag: each rotor's thrust follows its command through a first-order lag with this time constant (as in MuJoCo).
+#The QP's decisions are the commands; the model takes the effective (lagged) rotor speed over each step, which is a
+#weighted sum of the current command and the earlier ones, so the lag adds no QP states. Keep it equal to the
+#simulator's motor_tau (the run file passes this value to the simulator). 0 turns the lag off.
+MOTOR_TAU = 0.025 # s
 
 
 #Sets the state and input sizes for the MPC controller
@@ -132,6 +140,48 @@ def log_solution(slack_maxes, first_input, first_du):
         log_event("rotor_saturated", " ".join(f"rotor{j + 1}={first_input[j]:.0f}" for j in saturated))
     if np.any(np.abs(first_du) >= INPUT_TRUST_REGION - 1e-3):
         log_event("trust_region_hit", "du = " + " ".join(f"{v:.0f}" for v in first_du))
+
+
+#---------------------------------- Motor lag ----------------------------------------
+#Over one step of length dt with the command held, the squared rotor speed (thrust / k_f) goes from s0 toward the
+#squared command c: at the end it is (1 - end) c + end s0, and its average over the step is (1 - average) c + average s0.
+def motor_lag_factors(dt):
+    if MOTOR_TAU <= 0:
+        return 0.0, 0.0
+    end = np.exp(-dt / MOTOR_TAU)
+    average = MOTOR_TAU / dt * (1.0 - end)
+    return end, average
+
+
+def motor_step(speed_squared, command, dt):
+    #Runs the motors one step from their squared speeds now (4,), holding the command (4,).
+    #Returns the effective rotor speed over the step (the model's input) and the squared speed at the end.
+    end, average = motor_lag_factors(dt)
+    command_squared = np.asarray(command, dtype=float) ** 2
+    effective = np.sqrt((1.0 - average) * command_squared + average * speed_squared)
+    return effective, (1.0 - end) * command_squared + end * speed_squared
+
+
+def motor_map(commands, speed_squared, dt):
+    #Effective rotor speeds over a horizon of commands (N, 4), from the motors' squared speeds now (4,),
+    #and the matrix M (N*4, N*4) with d(effective) = M d(command), linearized about these commands.
+    #M is lower triangular: a step's speed depends on its own command and the earlier ones, less the older they are.
+    commands = np.asarray(commands, dtype=float)
+    N, nu = commands.shape
+    end, average = motor_lag_factors(dt)
+
+    effective = np.zeros((N, nu))
+    for k in range(N):
+        effective[k], speed_squared = motor_step(speed_squared, commands[k], dt)
+
+    #Weight of command j's square in step k's effective squared speed (j <= k), then the chain rule through the squares
+    k, j = np.tril_indices(N)
+    weight = np.where(k == j, 1.0 - average, average * (1.0 - end) * end ** np.maximum(k - j - 1, 0))
+    values = weight[:, None] * commands[j] / np.maximum(effective[k], 1.0)
+    rotors = np.arange(nu)
+    matrix = sp.csr_matrix((values.ravel(), ((k[:, None] * nu + rotors).ravel(), (j[:, None] * nu + rotors).ravel())),
+                           shape=(N * nu, N * nu))
+    return effective, drop_small(matrix)
 
 
 #Zeroes Jacobian entries that are float32 round-off: anything under JACOBIAN_ZERO times the largest entry in its row.
@@ -283,7 +333,7 @@ def linearize_state(x_nom, dx_k):
             x_nom[16:19] + dx_k[15:18]]        # previous angular velocity
 
 #Performs MPC control using the Sequential Quadratic Programming (SQP) approach
-def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_current,reference_trajectory,hover_thrust_values,horizon_length,d0,tau, wall_normal_vector, model_params):
+def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_current,reference_trajectory,hover_thrust_values,horizon_length,d0,tau, wall_normal_vector, model_params, motor_speed_squared):
 
     #Converts any torch tensors to numpy, since Gurobi only works with numpy
     nominal_state = [to_np(x) for x in nominal_state]
@@ -317,6 +367,12 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     #Sets limits for the input deviations based on the motor constraints
     dx = mpc.addMVar((horizon_length + 1, STATE_SIZE - 1), lb=-GRB.INFINITY, name="dx")
     du = mpc.addMVar((horizon_length, INPUT_SIZE), lb=MOTOR_MIN - nominal_input, ub=MOTOR_MAX - nominal_input, name="du")
+
+    #Motor lag: du are changes to the commands; the model sees the change in the effective rotor speed,
+    #effective_du[k] = rows k of M times all the command changes
+    effective_input, motor_matrix = motor_map(nominal_input[:horizon_length], motor_speed_squared, model_params["dt"])
+    du_all = du.reshape(-1)
+    effective_du = [motor_matrix[k * INPUT_SIZE:(k + 1) * INPUT_SIZE] @ du_all for k in range(horizon_length)]
     slack_roll = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_roll")
     slack_pitch = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_pitch")
     slack_contact_distance = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_contact_distance")
@@ -344,7 +400,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     sigma_all = [float(snap_gate(calculate_contact_gate(nominal_output[k][12], d0, tau))) * contact_flag[k]
                  for k in range(horizon_length + 1)]
     push_rows = {k: (g_theta, g_u, constant, scale) for k, g_theta, g_u, constant, scale in stuck_push_rows(
-        nominal_state, nominal_input, nominal_output, reference_trajectory, sigma_all,
+        nominal_state, effective_input, nominal_output, reference_trajectory, sigma_all,
         np.asarray(wall_normal_vector, dtype=float), model_params, horizon_length)}
 
     #Initializes the cost function to zero
@@ -361,7 +417,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
         #Computes the linearized output for the current time step
         #outputs dont depend on the input deviations in this linearization
         if k < horizon_length:
-            dy = C[k] @ dx[k] + D[k] @ du[k]
+            dy = C[k] @ dx[k] + D[k] @ effective_du[k]
         else:
             dy = C[k] @ dx[k]
         linearized_output = nominal_output[k] + dy
@@ -387,7 +443,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
             previous_lin_input = nominal_input[k-1] + du[k-1] if k > 0 else input_vector_current
 
             #Adds the linearized system dynamics constraint for the current time step
-            mpc.addConstr(dx[k + 1] == A[k] @ dx[k] + B[k] @ du[k])
+            mpc.addConstr(dx[k + 1] == A[k] @ dx[k] + B[k] @ effective_du[k])
 
            
 
@@ -405,7 +461,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
             #Push to break the pad loose (only at stuck steps of a slide)
             if k in push_rows:
                 g_theta, g_u, constant, scale = push_rows[k]
-                cost += scale * PUSH_WEIGHT * squared_error(mpc, g_theta[None] @ dx[k][6:9] + g_u[None] @ du[k] + constant, 1)
+                cost += scale * PUSH_WEIGHT * squared_error(mpc, g_theta[None] @ dx[k][6:9] + g_u[None] @ effective_du[k] + constant, 1)
 
             #Adds the constraints related to motor change limits for each rotor
             mpc.addConstr(linearized_input - previous_lin_input <= MOTOR_CHANGE_LIM)
@@ -500,7 +556,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
 #Stacked variables:
 #   dx: (N+1)*18 numbers  [dx_0, dx_1, ..., dx_N]
 #   du:  N*4     numbers  [du_0, du_1, ..., du_{N-1}]
-#Stacked outputs (17 per step, k = 0..N):   y = y_nominal + C_big @ dx + D_big @ du
+#Stacked outputs (17 per step, k = 0..N):   y = y_nominal + C_big @ dx + D_big @ du   (D_big includes the motor map)
 
 
 #Empty (N*nu, (N+1)*nx) matrix: the dx part of a row that only involves the inputs
@@ -519,8 +575,11 @@ def stacked_squared_error(mpc, weights, Mx, dx, Mu, du, c):
 
 def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output, input_vector_current,
                         reference_trajectory, hover_thrust_values, horizon_length, d0, tau, wall_normal_vector,
-                        model_params, return_plan=False):
-    #model_params: dict(k_f, mass, gravity, mu, contact_radius) from the model, for the stuck push and the approach speed
+                        model_params, motor_speed_squared, return_plan=False):
+    #model_params: dict(k_f, mass, gravity, mu, contact_radius, dt) from the model, for the stuck push, the approach speed,
+    #and the motor lag (dt is the MPC step)
+    #motor_speed_squared: (4,) the rotors' squared speeds right now (from motor_step in the run file)
+    #nominal_input: the nominal COMMANDS; A, B, C, D are linearized at the effective (lagged) speeds they give
     #return_plan=True also returns the planned outputs (N+1, 17): what the QP predicts the outputs
     #will be with its chosen inputs, y_nom + C dx + D du (the nominal outputs if the solve fails)
 
@@ -552,9 +611,14 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
 
     # ---------------- Stacked linear model ----------------
 
+    #Motor lag: the model's input is the effective rotor speed, d(effective) = M d(command), so every place the
+    #model's input enters (B, D, and the push) is multiplied by M; the input costs and limits stay on the commands
+    effective_input, motor_matrix = motor_map(nominal_input[:N], motor_speed_squared, model_params["dt"])
+
     #Outputs at every step k = 0..N. The last step has no input, so its D block is zeros.
     C_big = sp.block_diag(C[:N + 1], format="csr")                                          # ((N+1)*17, (N+1)*18)
     D_big = sp.vstack([sp.block_diag(D[:N]), sp.csr_matrix((ny, N * nu))], format="csr")     # ((N+1)*17, N*4)
+    D_big = (D_big @ motor_matrix).tocsr()
     y_nominal = np.concatenate(nominal_output[:N + 1])                                       # ((N+1)*17,)
 
     def output_rows(output_indices, steps):
@@ -587,6 +651,8 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     dx = mpc.addMVar((N + 1) * nx, lb=-GRB.INFINITY, name="dx")
 
     #Pre-stabilization: du = K_big dx + v, with K_k applied to dx_k at every step k = 0..N-1 (K_big = 0 when off).
+    #The gains ignore the motor lag (they're designed as if the command acted at once); that's fine, since they only
+    #change the solver's coordinates, not which plans are feasible or optimal.
     #Every cost and constraint written as Mx @ dx + Mu @ du becomes (Mx + Mu K_big) @ dx + Mu @ v.
     prestabilized = PRESTABILIZE
     gains = prestabilizing_gains(A[:N], B[:N]) if prestabilized else [np.zeros((nu, nx))] * N
@@ -637,7 +703,7 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     #   [             ...  ... ]          [             ...  ]
     next_state = sp.kron(sp.eye(N, N + 1, k=1), sp.eye(nx))
     current_state = sp.hstack([sp.block_diag(A[:N]), sp.csr_matrix((N * nx, nx))])
-    mpc.addConstr(linear(next_state - current_state, -sp.block_diag(B[:N], format="csr")) == 0)
+    mpc.addConstr(linear(next_state - current_state, -sp.block_diag(B[:N], format="csr") @ motor_matrix) == 0)
 
 
     # ---------------- Input costs and constraints (k = 0..N-1) ----------------
@@ -671,7 +737,7 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
                       y_nominal[rows] - reference_trajectory["normal_force"][:N])
 
     #Push to break the pad loose, at the steps where the pad should move faster than the plan has it moving
-    push_rows = stuck_push_rows(nominal_state, nominal_input, nominal_output, reference_trajectory,
+    push_rows = stuck_push_rows(nominal_state, effective_input, nominal_output, reference_trajectory,
                                 contact_sigma, n, model_params, N)
     if push_rows:
         steps = [row[0] for row in push_rows]
@@ -681,7 +747,7 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
                                 shape=(len(steps), (N + 1) * nx))
         push_du = sp.csr_matrix((np.concatenate([row[2] for row in push_rows]),
                                  (np.repeat(row_index, nu), [k * nu + j for k in steps for j in range(nu)])),
-                                shape=(len(steps), N * nu))
+                                shape=(len(steps), N * nu)) @ motor_matrix
         scales = np.array([row[4] for row in push_rows])
         cost += cost_rows(PUSH_WEIGHT * scales, push_dx, push_du, np.array([row[3] for row in push_rows]))
         print(f"  push active at {len(steps)} of {N} steps (mean scale {scales.mean():.2f})")
