@@ -11,6 +11,10 @@ animate_closed_loop()  GIF: MuJoCo drone (gray) and model drone (blue) flying th
                          same scenario with the same controller, with contact
                          arrows, beside a live normal-force trace.
 
+Static figures use the same report style as the MPC figures (MPC_Code/visualize.py):
+set_plot_style, figure_legend and save_figure below, also used by plot_training_history.py
+and drone_open_loop.py. Each is saved as .png (for viewing) and .svg (for the thesis).
+
 Force arrows follow the cube visualizer: NORMAL green, FRICTION orange, aero
 magenta at the COM. Lengths are log-scaled (see arrow_len) so taps of ~30 N and
 pushes of ~1 N are both visible; friction gets a larger gain because it is
@@ -34,11 +38,80 @@ from drone_config import build_drone_graph, build_contact_graph
 from drone_closed_loop import pad_center_positions
 
 PHASE_NAMES = {0: "free", 1: "approach", 2: "hold", 3: "slide", 4: "release", 5: "hover near"}
-PHASE_COLORS = {0: "white", 1: "#dbe9f6", 2: "#f6dbdb", 3: "#f6eedb", 4: "#e2f6db", 5: "#ece0f6"}
-C_TRUE, C_ONE, C_CL = "#2C2C2A", "#378ADD", "#D85A30"         # MuJoCo, one-step model, closed-loop model
+CONTACT_PHASES = (2, 3)                                          # hold, slide: shaded gray as "contact"
+PHASE_COLORS = {0: "white", 1: "#dbe9f6", 2: "#f6dbdb", 3: "#f6eedb", 4: "#e2f6db", 5: "#ece0f6"}   # GIF only
+C_TRUE, C_ONE, C_CL = "#2C2C2A", "#378ADD", "#D85A30"         # GIF only: MuJoCo, one-step model, model run
 C_NORMAL, C_FRIC, C_AERO = "#2ca02c", "#ff7f0e", "#d62798"
 C_DRONE_TRUE, C_DRONE_PRED = "#888780", "#185FA5"
-C_OFF = "#9a9890"                                                # model with the contact network off
+
+
+# ---------------------------------------------------------------- report style
+# Same as the MPC figures: MuJoCo / actual = blue, reference = orange (dashed),
+# model one step = green (dotted). The model flying on its own (closed or open
+# loop) is purple, and the model with its contact network off is gray (dashed).
+ACTUAL_COLOR = "#2a78d6"
+REFERENCE_COLOR = "#eb6834"
+MODEL_COLOR = "#2ca02c"
+MODEL_RUN_COLOR = "#8a4fbf"
+OFF_COLOR = "#9a9890"
+
+#Figure width for one column of a two-column page (inches). Figures are made at the size
+#they're printed, so the text comes out at the same size as the body text.
+REPORT_WIDTH = 3.5
+
+
+def set_plot_style(font_size=9):
+    #Report-style figures (same idea as the MATLAB defaults): Times font, text about the size of
+    #10 pt body text, thin lines, white background. STIX is a Times look-alike that
+    #ships with matplotlib, so this works on computers without Times New Roman (like Roar).
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Times", "Nimbus Roman", "STIXGeneral"],
+        "mathtext.fontset": "stix",
+        "font.size": font_size,
+        "axes.labelsize": font_size,
+        "axes.titlesize": font_size,
+        "xtick.labelsize": font_size - 1,
+        "ytick.labelsize": font_size - 1,
+        "legend.fontsize": font_size - 1,
+        "lines.linewidth": 1.0,
+        "axes.linewidth": 0.6,
+        "figure.facecolor": "white",
+        "savefig.facecolor": "white",
+        "savefig.dpi": 300,
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.02,
+    })
+
+
+def figure_legend(fig, axes, ncol=3):
+    #One legend above all the panels instead of one per panel (saves a lot of room at report size)
+    handles = {}
+    for ax in axes:
+        for handle, label in zip(*ax.get_legend_handles_labels()):
+            handles.setdefault(label, handle)
+    fig.legend(handles.values(), handles.keys(), loc="upper center", ncol=ncol, frameon=False,
+               bbox_to_anchor=(0.5, 1.0), handlelength=1.8, columnspacing=1.0)
+    rows = -(-len(handles) // ncol)
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.045 * rows * 4.0 / fig.get_figheight()))
+
+
+def save_figure(fig, path):
+    #Saves <path>.png (for viewing) and <path>.svg (sharp text in the thesis), then closes the figure
+    stem = os.path.splitext(path)[0]
+    os.makedirs(os.path.dirname(os.path.abspath(stem)), exist_ok=True)
+    fig.savefig(stem + ".png")
+    fig.savefig(stem + ".svg")
+    plt.close(fig)
+
+
+def shade_contact(axes, phase, dt):
+    #Shades the contact phases (hold, slide) gray and labels the time axis
+    t = np.arange(len(phase)) * dt
+    contact = np.isin(phase, CONTACT_PHASES)
+    for i, ax in enumerate(axes):
+        ax.fill_between(t, 0, 1, where=contact, transform=ax.get_xaxis_transform(), color="gray",
+                        alpha=0.15, linewidth=0, label="contact" if i == 0 else "_nolegend_")
 
 
 def _pad_nodes(cfg):
@@ -71,7 +144,7 @@ FORCE_LINTHRESH_N = 0.1
 
 def _force_axis(ax, top):
     ax.set_yscale("symlog", linthresh=FORCE_LINTHRESH_N, linscale=0.5)
-    ax.set_ylim(0.0, top)
+    ax.set_ylim(-0.02, top)
 
 
 # Upper axis limit that clips nothing: the max over every trace drawn (MuJoCo,
@@ -87,7 +160,9 @@ def plot_closed_loop(res, cfg, path, title=None, mode="closed loop"):
     """mode: "closed loop" or "open loop" (drone_open_loop.py). Optional entries of res:
     one_step (one-step model forces along the MuJoCo run; None for open loop) and
     contact_off (the same run with the contact network switched off). Open loop puts
-    the pad error on a log axis (the growth is exponential) with 1 cm / 5 cm lines."""
+    the pad error on a log axis (the growth is exponential) with 1 cm / 5 cm lines.
+    Saves <path>.png and .svg. title is not drawn (report figures have no titles): the
+    callers print it instead."""
     sc, true, pred = res["scenario"], res["true"], res["pred"]
     one, off = res.get("one_step"), res.get("contact_off")
     n, wp = sc["n"], sc["wall_point"]
@@ -95,79 +170,61 @@ def plot_closed_loop(res, cfg, path, title=None, mode="closed loop"):
     Tt, Tp = true["n_frames"], pred["n_frames"]
     tt, tp = np.arange(Tt) * dt, np.arange(Tp) * dt
     T = min(Tt, Tp)
-    lab = f"model, {mode}"
+    run_label = f"model, {mode}"
+    radius = cfg.pad_contact_radius
 
-    fig, ax = plt.subplots(5, 1, figsize=(10, 11), sharex=True)
-    for a in ax:
-        _shade(a, true["phase"], dt)
+    set_plot_style()
+    fig, ax = plt.subplots(5, 1, figsize=(REPORT_WIDTH, 5.8), sharex=True)
 
-    ax[0].plot(tt, 1e3 * _wall_dist(true, cfg, n, wp), color=C_TRUE, label="MuJoCo")
-    ax[0].plot(tp, 1e3 * _wall_dist(pred, cfg, n, wp), color=C_CL, label=lab)
+    #Gap between the closest pad sphere and the wall (mm), zoomed in near the wall
+    ax[0].plot(tt, 1e3 * (_wall_dist(true, cfg, n, wp) - radius), color=ACTUAL_COLOR, label="MuJoCo")
+    ax[0].plot(tp, 1e3 * (_wall_dist(pred, cfg, n, wp) - radius), color=MODEL_RUN_COLOR, label=run_label)
     if off is not None:
-        ax[0].plot(np.arange(off["n_frames"]) * dt, 1e3 * _wall_dist(off, cfg, n, wp), color=C_OFF, lw=1.0,
-                   ls="--", label="model, contact network off")
-    ax[0].axhline(1e3 * cfg.pad_contact_radius, color="k", lw=0.6, ls=":")
-    ax[0].set_ylim(-5, 120)
-    ax[0].set_ylabel("closest pad node\nto wall (mm)")
+        ax[0].plot(np.arange(off["n_frames"]) * dt, 1e3 * (_wall_dist(off, cfg, n, wp) - radius),
+                   color=OFF_COLOR, ls="--", label="model, contact off")
+    ax[0].axhline(0.0, color="black", linewidth=0.6)
+    ax[0].set_ylim(-2.0, 20.0)
+    ax[0].set_ylabel("gap (mm)")
 
-    Fn = [true["F_contact"] @ n, pred["F_contact"] @ n]
-    ax[1].plot(tt, Fn[0], color=C_TRUE, label="MuJoCo label")
-    if one is not None:
-        Fn.append(one["F_contact"] @ n)
-        ax[1].plot(tt, Fn[-1], color=C_ONE, lw=1.0, label="model, one step")
-    ax[1].plot(tp, Fn[1], color=C_CL, lw=1.0, label=lab)
-    ax[1].set_ylabel("normal contact\nforce (N, symlog)")
-    _force_axis(ax[1], _full_range(*Fn))
-
-    Ft = [_tangential(true["F_contact"], n), _tangential(pred["F_contact"], n)]
-    ax[2].plot(tt, Ft[0], color=C_TRUE)
-    if one is not None:
-        Ft.append(_tangential(one["F_contact"], n))
-        ax[2].plot(tt, Ft[-1], color=C_ONE, lw=1.0)
-    ax[2].plot(tp, Ft[1], color=C_CL, lw=1.0)
+    #Normal force, friction magnitude and aero force magnitude: MuJoCo, one step, model run
+    traces = [("$F_n$ (N)", lambda r: r["F_contact"] @ n, 1.0),
+              (r"$\|F_t\|$ (N)", lambda r: _tangential(r["F_contact"], n), 0.3),
+              (r"$\|F_\mathrm{aero}\|$ (N)", lambda r: np.linalg.norm(r["F_aero"], axis=1), None)]
+    for a, (label, value, floor) in zip(ax[1:4], traces):
+        drawn = [value(true), value(pred)]
+        a.plot(tt, drawn[0], color=ACTUAL_COLOR)
+        if one is not None:
+            drawn.append(value(one))
+            a.plot(tt, drawn[-1], color=MODEL_COLOR, linestyle=":", linewidth=1.2, label="model, one step")
+        a.plot(tp, drawn[1], color=MODEL_RUN_COLOR)
+        if floor is not None:
+            _force_axis(a, _full_range(*drawn, floor=floor))
+        a.set_ylabel(label)
     mu = res.get("mu_true")
     if mu:
-        ax[2].plot(tt, mu * np.maximum(true["F_contact"] @ n, 0), ":", color=C_TRUE, lw=0.8, label=f"mu x normal (mu={mu:g})")
-        ax[2].legend(loc="upper right", fontsize=8)
-    ax[2].set_ylabel("friction (N, symlog)")
-    _force_axis(ax[2], _full_range(*Ft, floor=0.3))
+        ax[2].plot(tt, mu * np.maximum(true["F_contact"] @ n, 0), color="black", ls="--", lw=0.6,
+                   label=rf"$\mu F_n$, MuJoCo ($\mu$ = {mu:g})")
 
-    ax[3].plot(tt, np.linalg.norm(true["F_aero"], axis=1), color=C_TRUE)
-    if one is not None:
-        ax[3].plot(tt, np.linalg.norm(one["F_aero"], axis=1), color=C_ONE, lw=1.0)
-    ax[3].plot(tp, np.linalg.norm(pred["F_aero"], axis=1), color=C_CL, lw=1.0)
-    ax[3].set_ylabel("aero force (N)")
-
+    #Pad position error of the model run vs MuJoCo
     pc_true = pad_center_positions(true, cfg)
     err = 1e3 * np.linalg.norm(pc_true[:T] - pad_center_positions(pred, cfg)[:T], axis=1)
-    ax[4].plot(tp[:T], np.maximum(err, 1e-3) if mode == "open loop" else err, color=C_CL)
+    ax[4].plot(tp[:T], np.maximum(err, 1e-3) if mode == "open loop" else err, color=MODEL_RUN_COLOR)
     if off is not None:
         To = min(Tt, off["n_frames"])
         e_off = 1e3 * np.linalg.norm(pc_true[:To] - pad_center_positions(off, cfg)[:To], axis=1)
-        ax[4].plot(np.arange(To) * dt, np.maximum(e_off, 1e-3), color=C_OFF, lw=1.0, ls="--")
+        ax[4].plot(np.arange(To) * dt, np.maximum(e_off, 1e-3), color=OFF_COLOR, ls="--")
     if mode == "open loop":
         ax[4].set_yscale("log")
         for thr in (10, 50):
-            ax[4].axhline(thr, color="k", ls=":", lw=0.8)
+            ax[4].axhline(thr, color="black", ls=":", lw=0.6)
         ax[4].set_ylim(1e-2, 400)
-        ax[4].set_ylabel("pad position\nerror (mm, log)")
-    else:
-        ax[4].set_ylabel("pad position\nerror (mm)")
+    ax[4].set_ylabel("pad error (mm)")
     ax[4].set_xlabel("time since start (s)" if mode == "open loop" else "time (s)")
+    ax[4].set_xlim(0, max(tt[-1], tp[-1]))
 
-    h0, l0 = ax[0].get_legend_handles_labels()
-    h1, l1 = ax[1].get_legend_handles_labels()
-    extra = [(h, l) for h, l in zip(h1, l1) if l == "model, one step"]
-    ax[0].legend(h0 + [h for h, _ in extra], l0 + [l for _, l in extra], loc="upper right", fontsize=8, ncol=2)
-    if title is None:
-        m = res["metrics"]
-        status = "" if pred.get("completed", True) else f"  MODEL RUN STOPPED: {pred.get('crash')}"
-        title = (f"{sc['kind']} | pad err mean {m['pad_err_mean_mm']:.1f} mm, in contact "
-                 f"{m['pad_err_contact_mm']:.1f} mm | contact onset err {m['contact_onset_err_ms']:.0f} ms" + status)
-    fig.suptitle(title, fontsize=10)
-    fig.tight_layout()
-    fig.savefig(path, dpi=110)
-    plt.close(fig)
+    shade_contact(ax, true["phase"], dt)
+    figure_legend(fig, ax, ncol=2)
+    save_figure(fig, path)
     return path
 
 

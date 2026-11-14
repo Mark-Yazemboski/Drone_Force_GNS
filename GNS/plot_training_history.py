@@ -1,30 +1,32 @@
 """Loss history for both training stages, to judge whether more training would help.
 
+One figure per stage (<path stem>_aero and <path stem>_contact, each .png and .svg), in
+the same report style as the MPC figures (see visualize_drone_model.set_plot_style).
+
 x axis: optimizer steps (bottom) and epochs (top). Training length is set in steps,
 so curves from runs with different amounts of data line up. Histories from
 before step-based training have no steps-per-epoch record and are plotted in epochs.
 
-Top row (one column per stage, aero then contact), log scale:
-    train pred   the normalized prediction loss on training windows, in the training
-                 loss (MSE or Huber; for MSE, 1 = no better than zero learned force).
-                 Inputs are noised, so it sits above val.
-    train total  pred + the stage's regularizers (anchor, smoothness, friction terms...)
+Top panel, log scale:
+    train                 the normalized prediction loss on training windows, in the training
+                          loss (MSE or Huber; for MSE, 1 = no better than zero learned force).
+                          Inputs are noised, so it sits above val.
+    train + regularizers  the stage's full training loss (anchor, smoothness, friction terms...)
     val MSE / val Huber   the normalized prediction loss on validation windows
     val pad error         pad position error after val_horizon steps (mm, right axis)
     The star is on the metric that chose the checkpoint (best_metric), at the
-    checkpoint kept ("best model"); the dotted vertical line marks it in every panel.
-Bottom row: learned coefficients, with their values at the best model.
+    checkpoint kept ("best model"); the dotted vertical line marks it in both panels.
+Bottom panel (its own legend): learned coefficients, with their values at the best model.
     aero     k_f, k_m, k_rot divided by their true values (1.0 = recovered exactly)
     contact  the learned mu parameter (it only feeds the friction regularizer), the
              friction-to-normal ratio of the PREDICTED sliding forces on validation
              (what the model actually does), the same ratio for MuJoCo's labels, and
              the true mu
 
-Each top panel is titled with how much the val MSE fell over the last 25% of the
-stage's epochs. Still falling a few percent or more -> more epochs would likely
-help. With lr_schedule="cosine" the learning rate goes to 0 at the end of each
-stage, so the tail flattens partly by construction; look at the middle of the
-curve too, and compare against a run with more epochs to be sure.
+plot_loss_history also returns how much the val MSE fell over the last 25% of each
+stage. Still falling a few percent or more -> more training would likely help. With
+lr_schedule="cosine" the learning rate goes to 0 at the end of each stage, so the tail
+flattens partly by construction; look at the middle of the curve too.
 
 Standalone:  python plot_training_history.py models/<run>/<run>_history.pt [out.png]
 """
@@ -38,9 +40,14 @@ import matplotlib
 if not os.environ.get("DISPLAY") and os.name != "nt":
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter, NullFormatter
 
-C_PRED, C_TOTAL, C_VAL, C_BEST = "#378ADD", "#9DBFE6", "#D85A30", "#2C2C2A"
-COEFF_COLORS = {"k_f": "#185FA5", "k_m": "#2ca02c", "k_rot": "#D85A30", "mu": "#D85A30"}
+from visualize_drone_model import (set_plot_style, figure_legend, save_figure, REPORT_WIDTH,
+                                   ACTUAL_COLOR, REFERENCE_COLOR, MODEL_COLOR)
+
+C_TRAIN, C_TOTAL, C_VAL, C_PAD, C_BEST = ACTUAL_COLOR, "#9DBFE6", REFERENCE_COLOR, "#8a4fbf", "#2C2C2A"
+COEFF_COLORS = {"k_f": ACTUAL_COLOR, "k_m": MODEL_COLOR, "k_rot": REFERENCE_COLOR}
+COEFF_LABELS = {"k_f": "$k_f$", "k_m": "$k_m$", "k_rot": r"$k_\mathrm{rot}$"}
 
 
 def val_tail_change(hist, frac=0.25):
@@ -70,16 +77,11 @@ def _xaxis(hist):
 def _epoch_axis(ax, spe):
     if spe:
         top = ax.secondary_xaxis("top", functions=(lambda x: x / spe, lambda e: e * spe))
-        top.set_xlabel("epoch", fontsize=8)
-        top.tick_params(labelsize=7)
+        top.set_xlabel("epoch")
 
 
 def _kept_epoch(hist):
     return hist.get("best", {}).get("epoch")
-
-
-C_PAD = "#6A4C93"
-METRIC_LABEL = {"val_loss": "val MSE", "val_huber": "val Huber", "pad_err": "val pad error"}
 
 
 def _val_series(hist):
@@ -92,55 +94,49 @@ def _val_series(hist):
     return ep, mse, hub, pad
 
 
-def _kept_line(ax, X, hist, label=True):
+def _kept_line(ax, X, hist):
     kept = _kept_epoch(hist)
     if kept is not None:
-        ax.axvline(X(kept), color=C_BEST, ls=":", lw=1.2,
-                   label=f"best model (step {int(X(kept))})" if label else None)
+        ax.axvline(X(kept), color=C_BEST, ls=":", lw=0.8)
 
 
-def _loss_panel(ax, hist, stage, pred_loss="mse", best_metric="val_loss"):
-    X, xlabel, spe = _xaxis(hist)
+# Returns the axes drawn on (the pad-error axis is a second y axis), for the legend.
+def _loss_panel(ax, hist, best_metric="val_loss"):
+    X, _, spe = _xaxis(hist)
     tr = np.array(hist["train"], dtype=float)           # (epoch, total, pred)
-    ax.plot(X(tr[:, 0]), tr[:, 2], color=C_PRED, lw=1.4, label=f"train pred ({pred_loss})")
-    ax.plot(X(tr[:, 0]), tr[:, 1], color=C_TOTAL, lw=1.0, ls="--", label="train total")
-    handles2 = []
+    ax.plot(X(tr[:, 0]), tr[:, 2], color=C_TRAIN, label="train")
+    ax.plot(X(tr[:, 0]), tr[:, 1], color=C_TOTAL, ls="--", label="train + regularizers")
+    axes = [ax]
     if hist.get("val"):
         ve, mse, hub, pad = _val_series(hist)
-        ax.plot(X(ve), mse, "o-", color=C_VAL, ms=3, lw=1.4, label="val MSE")
+        ax.plot(X(ve), mse, "o-", color=C_VAL, ms=2, label="val MSE")
         if np.isfinite(hub).any():
-            ax.plot(X(ve), hub, "o--", color=C_VAL, ms=2, lw=1.0, alpha=0.6, label="val Huber")
-        # pad error after val_horizon steps (mm) on its own log axis
+            ax.plot(X(ve), hub, "o--", color=C_VAL, ms=1.5, alpha=0.6, label="val Huber")
         ax2 = None
         if np.isfinite(pad).any():
             ax2 = ax.twinx()
-            ax2.plot(X(ve), pad, "s-", color=C_PAD, ms=2.5, lw=1.0, alpha=0.8, label="val pad error (mm, right)")
+            ax2.plot(X(ve), pad, "s-", color=C_PAD, ms=1.5, lw=0.8, alpha=0.8, label="val pad error")
             ax2.set_yscale("log")
-            ax2.set_ylabel("pad error after val_horizon steps (mm)", color=C_PAD, fontsize=8)
-            ax2.tick_params(axis="y", colors=C_PAD, labelsize=7)
+            # plain numbers (not 3x10^0); label the minor ticks too when the range is under a decade
+            plain = FuncFormatter(lambda v, _: f"{v:g}")
+            ax2.yaxis.set_major_formatter(plain)
+            ax2.yaxis.set_minor_formatter(plain if np.nanmax(pad) / np.nanmin(pad) < 10 else NullFormatter())
+            ax2.set_ylabel("pad error (mm)", color=C_PAD)
+            ax2.tick_params(axis="y", colors=C_PAD)
+            axes.append(ax2)
         # the star sits on the metric that chose the checkpoint, at the kept checkpoint
         series = {"val_loss": (ax, mse), "val_huber": (ax, hub), "pad_err": (ax2, pad)}
-        tgt, y = series.get(best_metric, (ax, mse))
+        target, y = series.get(best_metric, (ax, mse))
         kept = _kept_epoch(hist)
-        if tgt is not None and np.isfinite(y).any():
+        if target is not None and np.isfinite(y).any():
             i = int(np.flatnonzero(ve == kept)[0]) if kept is not None and (ve == kept).any() else int(np.nanargmin(y))
-            tgt.plot(X(ve[i]), y[i], "*", color=C_BEST, ms=13, zorder=6,
-                     label=f"best model: lowest {METRIC_LABEL.get(best_metric, best_metric)} (step {int(X(ve[i]))})")
-        _kept_line(ax, X, hist, label=False)
-        if ax2 is not None:
-            handles2 = ax2.get_legend_handles_labels()
+            target.plot(X(ve[i]), y[i], "*", color=C_BEST, ms=8, zorder=6, label="best model")
+        _kept_line(ax, X, hist)
     ax.set_yscale("log")
-    ax.grid(True, which="both", alpha=0.25)
-    ax.set_xlabel(xlabel)
+    ax.grid(True, which="both", alpha=0.2, linewidth=0.4)
     _epoch_axis(ax, spe)
-    ax.set_ylabel("normalized loss (MSE: 1 = zero learned force)")
-    ch = val_tail_change(hist)
-    tail = "" if np.isnan(ch) else f"\nval MSE over the last 25% of training: {100 * ch:+.1f}%"
-    ax.set_title(f"{stage} stage{tail}", fontsize=10)
-    h, l = ax.get_legend_handles_labels()
-    if handles2:
-        h, l = h + handles2[0], l + handles2[1]
-    ax.legend(h, l, fontsize=7.5, loc="best")
+    ax.set_ylabel("normalized loss")
+    return axes
 
 
 def _coeff_panel(ax, hist, stage, true):
@@ -148,23 +144,19 @@ def _coeff_panel(ax, hist, stage, true):
     if not p:
         ax.set_visible(False)
         return
-    X, xlabel, spe = _xaxis(hist)
+    X, xlabel, _ = _xaxis(hist)
     ep = X([q["epoch"] for q in p])
     best = hist.get("best") or p[-1]            # coefficients of the kept checkpoint
     if stage == "aero":
-        drawn = False
         for k in ("k_f", "k_m", "k_rot"):
             if true.get(k):
-                ax.plot(ep, np.array([q[k] for q in p]) / true[k], color=COEFF_COLORS[k], lw=1.4,
-                        label=f"{k}: best model {best[k] / true[k]:.3f}x true")
-                drawn = True
-        ax.axhline(1.0, color=C_BEST, ls=":", lw=1)
+                ax.plot(ep, np.array([q[k] for q in p]) / true[k], color=COEFF_COLORS[k],
+                        label=f"{COEFF_LABELS[k]}: {best[k] / true[k]:.3f}")
+        ax.axhline(1.0, color=C_BEST, ls=":", lw=0.6)
         ax.set_ylabel("learned / true")
-        if not drawn:
-            ax.text(0.5, 0.5, "no true values passed", transform=ax.transAxes, ha="center", color="gray")
     else:
         mu = np.array([q["mu"] for q in p])
-        ax.plot(ep, mu, color=COEFF_COLORS["mu"], lw=1.4, label=f"learned mu parameter: best model {best['mu']:.3f}")
+        ax.plot(ep, mu, color=REFERENCE_COLOR, label=rf"learned $\mu$: {best['mu']:.3f}")
         # Friction-to-normal ratio of the sliding forces, at each validation pass.
         vals = [v for v in hist.get("val", []) if "slide_mu_implied" in v.get("forces", {})]
         if vals:
@@ -173,45 +165,42 @@ def _coeff_panel(ax, hist, stage, true):
             lab = np.array([v["forces"].get("slide_mu_implied_label", np.nan) for v in vals])
             kept = _kept_epoch(hist)
             j = int(np.flatnonzero(ve == kept)[0]) if kept is not None and (ve == kept).any() else len(imp) - 1
-            ax.plot(X(ve), imp, "o-", color="#185FA5", ms=3, lw=1.2,
-                    label=f"implied by predicted forces (|F_t|/F_n): best model {imp[j]:.3f}")
+            ax.plot(X(ve), imp, "o-", color=ACTUAL_COLOR, ms=1.5, lw=0.8,
+                    label=rf"$\|F_t\|/F_n$, model: {imp[j]:.3f}")
             if np.isfinite(lab).any():
-                ax.axhline(float(np.nanmean(lab)), color="#185FA5", ls="--", lw=1,
-                           label=f"implied by MuJoCo labels {np.nanmean(lab):.3f}")
+                ax.axhline(float(np.nanmean(lab)), color=ACTUAL_COLOR, ls="--", lw=0.8,
+                           label=rf"$\|F_t\|/F_n$, MuJoCo: {np.nanmean(lab):.3f}")
         if true.get("mu"):
-            ax.axhline(true["mu"], color=C_BEST, ls="--", lw=1, label=f"true mu {true['mu']:.2f}")
+            ax.axhline(true["mu"], color=C_BEST, ls="--", lw=0.8, label=rf"true $\mu$: {true['mu']:.2f}")
         # Early in training the implied ratio can be far off (tiny normal forces);
         # cap the axis so it does not squash the mu lines.
         ax.set_ylim(0.0, min(1.0, max(0.6, ax.get_ylim()[1])))
-        ax.set_ylabel("friction coefficient")
+        ax.set_ylabel(r"$\mu$")
     _kept_line(ax, X, hist)
-    ax.grid(True, alpha=0.25)
+    ax.grid(True, alpha=0.2, linewidth=0.4)
     ax.set_xlabel(xlabel)
-    _epoch_axis(ax, spe)
-    ax.legend(fontsize=8, loc="best")
+    ax.legend(loc="best")
 
 
 def plot_loss_history(history, path, true=None, title=None):
     """history: the dict saved as <run>_history.pt. true: {"k_f", "k_m", "k_rot", "mu"}
-    (see drone_run_report.true_values_from_meta). Returns {"<stage>_val_loss_tail_change": x}."""
+    (see drone_run_report.true_values_from_meta). Saves <path stem>_aero and
+    <path stem>_contact (.png and .svg). title is not drawn (report figures have no titles).
+    Returns {"<stage>_val_loss_tail_change": x}."""
     true = true or {}
     stages = [st for st in ("aero", "contact") if history.get(st, {}).get("train")]
-    if not stages:
-        return {}
-    fig, axes = plt.subplots(2, len(stages), figsize=(6.5 * len(stages), 8), squeeze=False,
-                             gridspec_kw=dict(height_ratios=[1.6, 1]))
+    best_metric = history.get("settings", {}).get("best_metric", "val_loss")
+    stem = os.path.splitext(path)[0]
+    set_plot_style()
     out = {}
-    for j, st in enumerate(stages):
-        cfg_s = history.get("settings", {})
-        _loss_panel(axes[0, j], history[st], st, cfg_s.get("pred_loss", "mse"), cfg_s.get("best_metric", "val_loss"))
-        _coeff_panel(axes[1, j], history[st], st, true)
+    for st in stages:
+        fig, axes = plt.subplots(2, 1, figsize=(REPORT_WIDTH, 4.2), sharex=True,
+                                 gridspec_kw=dict(height_ratios=[1.6, 1]))
+        drawn = _loss_panel(axes[0], history[st], best_metric)
+        _coeff_panel(axes[1], history[st], st, true)
+        figure_legend(fig, drawn, ncol=2)
+        save_figure(fig, f"{stem}_{st}.png")
         out[f"{st}_val_loss_tail_change"] = val_tail_change(history[st])
-    if title:
-        fig.suptitle(title, fontsize=11)
-    fig.tight_layout()
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
     return out
 
 
@@ -220,4 +209,4 @@ if __name__ == "__main__":
     hist_path = sys.argv[1]
     out_path = sys.argv[2] if len(sys.argv) > 2 else hist_path.replace("_history.pt", "_loss_history.png")
     plot_loss_history(torch.load(hist_path, weights_only=False), out_path)
-    print(f"saved {out_path}")
+    print(f"saved {os.path.splitext(out_path)[0]}_aero / _contact (.png, .svg)")

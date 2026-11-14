@@ -133,7 +133,10 @@ def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
             plot_closed_loop(r, cfg, stem + ".png")
             if make_gifs:
                 animate_closed_loop(r, cfg, stem + ".gif", stride=gif_stride)
-            print(f"  saved {os.path.basename(stem)}.png" + (" and .gif" if make_gifs else ""))
+            m = r["metrics"]
+            print(f"  saved {os.path.basename(stem)} (.png, .svg" + (", .gif)" if make_gifs else ")")
+                  + f" | pad err mean {m['pad_err_mean_mm']:.1f} mm, in contact {m['pad_err_contact_mm']:.1f} mm"
+                  + f" | contact onset err {m['contact_onset_err_ms']:.0f} ms")
         torch.save([dict(scenario=r["scenario"], metrics=r["metrics"]) for r in results],
                    os.path.join(out_folder, "closed_loop_summary.pt"))
 

@@ -214,38 +214,44 @@ def evaluate_open_loop(model, cfg, data, out_folder, horizon_s=2.0, n_gifs=4, gi
                   f"{metrics[on + '_pad_err_1s_mm']:.1f} mm, off {metrics[off + '_pad_err_1s_mm']:.1f} mm | "
                   f"crashed: on {100 * metrics[on + '_crash_frac']:.0f}%, off {100 * metrics[off + '_crash_frac']:.0f}%")
 
-    # ---- error-growth figure ----
+    # ---- error-growth figure: one panel per start kind, thin lines = single starts ----
+    from visualize_drone_model import set_plot_style, figure_legend, save_figure, REPORT_WIDTH, MODEL_COLOR, OFF_COLOR
     os.makedirs(out_folder, exist_ok=True)
     kinds = [k for k in START_KINDS if (k, True) in curves]
-    fig, axes = plt.subplots(1, len(kinds), figsize=(4.2 * len(kinds), 3.8), squeeze=False, sharey=True)
-    for ax, kind in zip(axes[0], kinds):
-        for flag, col, lab in ((False, "#888780", "contact network off"), (True, "#185FA5", "model")):
+    cols = 2 if len(kinds) > 1 else 1
+    rows = -(-len(kinds) // cols)
+    set_plot_style()
+    fig, axes = plt.subplots(rows, cols, figsize=(REPORT_WIDTH, 1.7 * rows + 0.4), squeeze=False,
+                             sharex=True, sharey=True)
+    for ax, kind in zip(axes.flat, kinds):
+        for flag, col, lab in ((False, OFF_COLOR, "contact network off"), (True, MODEL_COLOR, "model")):
             cur = curves[(kind, flag)]
             for err in cur:
-                ax.plot(np.arange(len(err)) * dt, 1e3 * np.maximum(err, 1e-5), color=col, lw=0.5, alpha=0.25)
+                ax.plot(np.arange(len(err)) * dt, 1e3 * np.maximum(err, 1e-5), color=col, lw=0.3, alpha=0.15)
             M = np.full((len(cur), H + 1), np.nan)
             for j, err in enumerate(cur):
                 M[j, :len(err)] = err
                 if len(err) < H + 1 and len(err) > 0:          # crashed / cut: hold at the cutoff for the median
                     M[j, len(err):] = max(err[-1], max_pad_err_m)
             med = np.nanmedian(M, axis=0)
-            ax.plot(np.arange(H + 1) * dt, 1e3 * np.maximum(med, 1e-5), color=col, lw=2.0, label=f"{lab} (median)")
+            ax.plot(np.arange(H + 1) * dt, 1e3 * np.maximum(med, 1e-5), color=col, lw=1.2, label=f"{lab}, median")
         for thr in (10, 50):
-            ax.axhline(thr, color="k", ls=":", lw=0.8)
+            ax.axhline(thr, color="black", ls=":", lw=0.6)
         ax.set_yscale("log")
         ax.set_ylim(1e-2, 1e3 * max_pad_err_m * 1.2)
-        ax.set_title(f"start: {kind.replace('_', ' ')} ({len(curves[(kind, True)])})", fontsize=10)
-        ax.set_xlabel("time since start (s)")
-        ax.grid(True, which="both", alpha=0.2)
-    axes[0, 0].set_ylabel("pad position error vs MuJoCo (mm)")
-    axes[0, 0].legend(fontsize=8, loc="lower right")
-    fig.suptitle("Open loop: recorded rotor speeds, no controller (dotted: 1 cm, 5 cm)", fontsize=11)
-    fig.tight_layout()
+        ax.set_title(kind.replace("_", " "))
+        ax.grid(True, which="both", alpha=0.2, linewidth=0.4)
+    for ax in axes.flat[len(kinds):]:
+        ax.set_visible(False)
+    for ax in axes[:, 0]:
+        ax.set_ylabel("pad error (mm)")
+    for ax in axes[-1]:
+        ax.set_xlabel("time (s)")
+    figure_legend(fig, [axes[0, 0]], ncol=2)
     fig_path = os.path.join(out_folder, "open_loop_error.png")
-    fig.savefig(fig_path, dpi=120)
-    plt.close(fig)
+    save_figure(fig, fig_path)
     if verbose:
-        print(f"  saved {os.path.basename(fig_path)}")
+        print(f"  saved open_loop_error (.png, .svg); dotted lines: 1 cm, 5 cm")
 
     # ---- per start kind: a time-series PNG (like the closed-loop ones) and a GIF, ----
     # ---- for the first test trajectory that has that start (same ones every run) ----
@@ -270,7 +276,7 @@ def evaluate_open_loop(model, cfg, data, out_folder, horizon_s=2.0, n_gifs=4, gi
                  f"pad error at 0.5 / 1 s: {at(err, 0.5)} / {at(err, 1.0)} mm"
                  + ("  | MODEL RUN STOPPED: crash limit" if pred["crashed"] else ""))
         plot_closed_loop(dict(scenario=sc, true=tr_full, pred=pred, one_step=None, contact_off=off,
-                              mu_true=mu_true), cfg, stem + ".png", title=title, mode="open loop")
+                              mu_true=mu_true), cfg, stem + ".png", mode="open loop")
         gif = made < n_gifs
         if gif:
             tr = _truth_slice(d, r["start"], pred["n_frames"])
@@ -278,6 +284,7 @@ def evaluate_open_loop(model, cfg, data, out_folder, horizon_s=2.0, n_gifs=4, gi
                                 stride=gif_stride, mode="open loop")
             made += 1
         if verbose:
-            print(f"  saved {os.path.basename(stem)}.png" + (" and .gif" if gif else "")
+            print(f"  saved {os.path.basename(stem)} (.png, .svg" + (", .gif)" if gif else ")")
                   + ("  (crash limit reached)" if pred["crashed"] else ""))
+            print("    " + title.replace("\n", "\n    "))
     return metrics
