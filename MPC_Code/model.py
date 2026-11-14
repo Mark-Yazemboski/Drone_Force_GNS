@@ -70,17 +70,16 @@ class Drone_Dynamics:
         self.I_body_inv = torch.linalg.inv(self.I_body)
 
 
-    def calculate_hover_inputs(self):
-
-        #extracts the x and y coordinates of the rotor locations in the body frame.
+    def thrust_mixer(self):
+        #Rotor thrusts (4,) -> [total thrust, roll moment, pitch moment, yaw moment] about the COM, body frame
         rotor_xs = self.rotor_locations[:, 0].cpu().numpy()
         rotor_ys = self.rotor_locations[:, 1].cpu().numpy()
+        return np.vstack([np.ones(4), rotor_ys, -rotor_xs, -self.spin_dirs * self.motor_km / self.motor_kf])
 
-        #Builds the thrust to torque mapping matrix for the quadrotor.
-        A = np.vstack([np.ones(4), rotor_ys, -rotor_xs, -self.spin_dirs * self.motor_km / self.motor_kf])
+    def calculate_hover_inputs(self):
 
         #Solves for the individual rotor thrusts required to achieve hover.
-        T = np.linalg.solve(A, [self.mass * self.cfg.gravity, 0.0, 0.0, 0.0])
+        T = np.linalg.solve(self.thrust_mixer(), [self.mass * self.cfg.gravity, 0.0, 0.0, 0.0])
 
         #Converts the thrusts to rotor speeds using the motor's thrust coefficient.
         return torch.tensor(np.sqrt(T / self.motor_kf), dtype=torch.float32, device=self.device)

@@ -10,7 +10,7 @@ import json
 #The MPC itself, and its weights and limits (they live with the controller; imported here for settings.json)
 from MPC_controller import mpc_control, mpc_control_batched, STATE_SIZE, INPUT_SIZE, \
     MOTOR_MIN, MOTOR_MAX, MOTOR_CHANGE_LIM, INPUT_TRUST_REGION, CONTACT_MAX_DIST, ROTOR_MIN_DIST, ROLL_LIM, PITCH_LIM, \
-    POSITION_WEIGHT, VELOCITY_WEIGHT, ROD_ORIENTATION_WEIGHT, ANG_VEL_WEIGHT, NORMAL_FORCE_WEIGHT, INPUT_WEIGHT, \
+    POSITION_WEIGHT, VELOCITY_WEIGHT, ROD_ORIENTATION_WEIGHT, ANG_VEL_WEIGHT, NORMAL_FORCE_WEIGHT, \
     INPUT_CHANGE_WEIGHT, SLACK_WEIGHT_ROLL, SLACK_WEIGHT_PITCH, SLACK_WEIGHT_CONTACT_DISTANCE, SLACK_WEIGHT_ROTOR_DISTANCE
 import warnings
 from MPC_controller import open_event_log, set_log_step, log_event, motor_step, motor_map
@@ -146,7 +146,7 @@ hover_input = model.calculate_hover_inputs().cpu().numpy()
 
 #Generates the reference trajectory based on the wall and wind conditions set above, this needed to
 #happen after model because we needed the pad offset from the model
-scenario = "line_vertical"  # Example scenario, can be changed to "push", "line_horizontal", "line_vertical", or "circle"
+scenario = "line_horizontal"  # Example scenario, can be changed to "push", "line_horizontal", "line_vertical", or "circle"
 trajectory_time_length, reference_trajectory = trajectory_generator.generate_trajectory(scenario)
 # trajectory_time_length, reference_trajectory = trajectory_generator.generate_free_flight_trajectory(time_range = [0.5,0.5])
 
@@ -179,7 +179,9 @@ settings = dict(
     simulation_dt=simulation_dt, MPC_dt_multiple=MPC_dt_multiple, horizon_length=Horizon_length,
     weights=dict(position=POSITION_WEIGHT, velocity=VELOCITY_WEIGHT, rod_orientation=ROD_ORIENTATION_WEIGHT,
                  angular_velocity=ANG_VEL_WEIGHT, normal_force=NORMAL_FORCE_WEIGHT,
-                 input=INPUT_WEIGHT, input_change=INPUT_CHANGE_WEIGHT),
+                 input_tolerance=MPC_controller.INPUT_TOLERANCE, yaw_input_factor=MPC_controller.YAW_INPUT_FACTOR,
+                 input_change=INPUT_CHANGE_WEIGHT, push_margin=MPC_controller.PUSH_MARGIN,
+                 motor_tau=MPC_controller.MOTOR_TAU),
     slack_weights=dict(roll=SLACK_WEIGHT_ROLL, pitch=SLACK_WEIGHT_PITCH,
                        contact_distance=SLACK_WEIGHT_CONTACT_DISTANCE, rotor_distance=SLACK_WEIGHT_ROTOR_DISTANCE),
     limits=dict(motor_min=MOTOR_MIN, motor_max=MOTOR_MAX, motor_change=MOTOR_CHANGE_LIM,
@@ -233,7 +235,8 @@ planned_output_history = np.full((len(t) + 1, Horizon_length + 1, 17), np.nan, d
 
 #Model values for the push that breaks a stuck pad loose
 model_params = dict(k_f=model.motor_kf, mass=model.mass, gravity=float(model.cfg.gravity),
-                    mu=model.friction_mu, contact_radius=float(model.cfg.pad_contact_radius), dt=MPC_dt)
+                    mu=model.friction_mu, contact_radius=float(model.cfg.pad_contact_radius), dt=MPC_dt,
+                    mixer=model.thrust_mixer())
 
 #The motors' squared speeds right now (thrust / k_f), tracked through the lag from the commands sent.
 #The sim starts with the motors at hover.

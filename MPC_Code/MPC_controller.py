@@ -25,7 +25,12 @@ VELOCITY_WEIGHT        = 1 / 0.1**2    # 0.1 m/s
 ROD_ORIENTATION_WEIGHT = 1 / 0.1**2    # 0.1 rad (~6 deg) off the wall normal, pitch and yaw
 ANG_VEL_WEIGHT         = 1 / 0.5**2    # 0.5 rad/s
 NORMAL_FORCE_WEIGHT    = 1 / 0.3**2    # 0.3 N
-INPUT_WEIGHT           = 1 / 100**2    # 100 rad/s from hover
+#Input cost: the rotors' thrust and roll, pitch and yaw moments away from hover, each axis with its own tolerance.
+#Each axis's tolerance is set so it matches the old per-rotor cost (1/INPUT_TOLERANCE^2 per rotor): INPUT_TOLERANCE
+#on each rotor, in the pattern that moves one axis, costs about what it did before. YAW_INPUT_FACTOR scales the yaw tolerance:
+#yaw only gets the small k_m/k_f lever, so at 1 a useful yaw moment costs far more than a roll or pitch moment.
+INPUT_TOLERANCE        = 100.0         # rad/s per rotor from hover
+YAW_INPUT_FACTOR       = 1.0           # 3 makes a yaw moment 3x as large cost the same
 INPUT_CHANGE_WEIGHT    = 1 / 20**2     # 20 rad/s per step
 
 #Proximal term: penalizes du, the change from the nominal (shifted) plan, not the input itself. It adds curvature in
@@ -276,6 +281,21 @@ def solve_qp(mpc, A, label="A"):
         mpc.optimize()
         log_event("numeric_retry", f"homogeneous barrier: status {mpc.Status}")
 
+#Input cost rows, one 4-row block per step: (wrench(commands) - wrench(hover)) / tolerance, linearized about the
+#nominal commands. wrench = mixer @ thrusts, thrust = k_f * omega^2, so d(wrench) = mixer @ diag(2 k_f omega) d(omega).
+#mixer: (4, 4) rotor thrusts -> [thrust, roll, pitch, yaw moment] (model.thrust_mixer()).
+#Returns the matrices (one (4, 4) per step) and the nominal values (one (4,) per step).
+def input_wrench_rows(nominal_input, hover_input, params):
+    mixer, k_f = np.asarray(params["mixer"], dtype=float), params["k_f"]
+    #half the axis's wrench from INPUT_TOLERANCE on every rotor: that pattern then costs 4, like 4 rotors did before
+    tolerance = np.abs(mixer) @ (k_f * hover_input * INPUT_TOLERANCE)
+    tolerance[3] *= YAW_INPUT_FACTOR
+    scaled_mixer = mixer / tolerance[:, None]
+    matrices = [scaled_mixer * (2 * k_f * omega) for omega in nominal_input]
+    values = [scaled_mixer @ (k_f * (omega ** 2 - hover_input ** 2)) for omega in nominal_input]
+    return matrices, values
+
+
 #Makes an error variable equal to the expression and returns its square.
 #This keeps the objective's Q matrix diagonal, so Gurobi always sees a convex QP
 def squared_error(mpc, expression, size):
@@ -403,6 +423,9 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
         nominal_state, effective_input, nominal_output, reference_trajectory, sigma_all,
         np.asarray(wall_normal_vector, dtype=float), model_params, horizon_length)}
 
+    #Input cost: thrust and moments away from hover
+    wrench_matrices, wrench_values = input_wrench_rows(nominal_input[:horizon_length], hover_thrust_values, model_params)
+
     #Initializes the cost function to zero
     cost = 0
     for k in range(horizon_length + 1):
@@ -447,8 +470,8 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
 
            
 
-            #Input deviation cost
-            cost += INPUT_WEIGHT * squared_error(mpc, linearized_input - hover_thrust_values, 4)
+            #Input cost: thrust and moments away from hover, per axis
+            cost += squared_error(mpc, wrench_matrices[k] @ du[k] + wrench_values[k], 4)
             #Proximal cost: change from the nominal plan
             if PROXIMAL_WEIGHT > 0:
                 cost += PROXIMAL_WEIGHT * squared_error(mpc, du[k], 4)
@@ -576,8 +599,8 @@ def stacked_squared_error(mpc, weights, Mx, dx, Mu, du, c):
 def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output, input_vector_current,
                         reference_trajectory, hover_thrust_values, horizon_length, d0, tau, wall_normal_vector,
                         model_params, motor_speed_squared, return_plan=False):
-    #model_params: dict(k_f, mass, gravity, mu, contact_radius, dt) from the model, for the stuck push, the approach speed,
-    #and the motor lag (dt is the MPC step)
+    #model_params: dict(k_f, mass, gravity, mu, contact_radius, dt, mixer) from the model, for the stuck push, the approach
+    #speed, the motor lag (dt is the MPC step), and the input cost (mixer: rotor thrusts -> thrust and moments)
     #motor_speed_squared: (4,) the rotors' squared speeds right now (from motor_step in the run file)
     #nominal_input: the nominal COMMANDS; A, B, C, D are linearized at the effective (lagged) speeds they give
     #return_plan=True also returns the planned outputs (N+1, 17): what the QP predicts the outputs
@@ -708,10 +731,10 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
 
     # ---------------- Input costs and constraints (k = 0..N-1) ----------------
 
-    #Input deviation from hover (the weight goes into the rows, like every other cost, so the
-    #quadratic objective stays the identity and its range stays small)
-    cost = cost_rows(INPUT_WEIGHT * np.ones(N * nu), zeros_dx(N * nu), sp.eye(N * nu, format="csr"),
-                     nominal_input_flat - np.tile(hover_thrust_values, N))
+    #Input cost: thrust and moments away from hover, per axis (the tolerances are already in the rows)
+    wrench_matrices, wrench_values = input_wrench_rows(nominal_input[:N], hover_thrust_values, model_params)
+    cost = cost_rows(np.ones(N * nu), zeros_dx(N * nu), sp.block_diag(wrench_matrices, format="csr"),
+                     np.concatenate(wrench_values))
 
     #Proximal cost: change from the nominal plan (du itself)
     if PROXIMAL_WEIGHT > 0:
