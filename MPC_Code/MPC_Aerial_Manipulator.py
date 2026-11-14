@@ -10,7 +10,7 @@ import json
 #The MPC itself, and its weights and limits (they live with the controller; imported here for settings.json)
 from MPC_controller import mpc_control, mpc_control_batched, STATE_SIZE, INPUT_SIZE, \
     MOTOR_MIN, MOTOR_MAX, MOTOR_CHANGE_LIM, INPUT_TRUST_REGION, CONTACT_MAX_DIST, ROTOR_MIN_DIST, ROLL_LIM, PITCH_LIM, \
-    POSITION_WEIGHT, VELOCITY_WEIGHT, ROD_ORIENTATION_WEIGHT, ANG_VEL_WEIGHT, NORMAL_FORCE_WEIGHT, \
+    POSITION_WEIGHT, VELOCITY_WEIGHT, ANG_VEL_WEIGHT, NORMAL_FORCE_WEIGHT, \
     INPUT_CHANGE_WEIGHT, SLACK_WEIGHT_ROLL, SLACK_WEIGHT_PITCH, SLACK_WEIGHT_CONTACT_DISTANCE, SLACK_WEIGHT_ROTOR_DISTANCE
 import warnings
 from MPC_controller import open_event_log, set_log_step, log_event, motor_step, motor_map
@@ -177,7 +177,8 @@ settings = dict(
     name=Run_Name, seed=seed,
     model_path=str(Trained_model_path), contact_cutoff_gap=CONTACT_CUTOFF_GAP,
     simulation_dt=simulation_dt, MPC_dt_multiple=MPC_dt_multiple, horizon_length=Horizon_length,
-    weights=dict(position=POSITION_WEIGHT, velocity=VELOCITY_WEIGHT, rod_orientation=ROD_ORIENTATION_WEIGHT,
+    weights=dict(position=POSITION_WEIGHT, velocity=VELOCITY_WEIGHT, rod_yaw=MPC_controller.ROD_YAW_WEIGHT,
+                 rod_pitch=MPC_controller.ROD_PITCH_WEIGHT,
                  angular_velocity=ANG_VEL_WEIGHT, normal_force=NORMAL_FORCE_WEIGHT,
                  input_tolerance=MPC_controller.INPUT_TOLERANCE, yaw_input_factor=MPC_controller.YAW_INPUT_FACTOR,
                  input_change=INPUT_CHANGE_WEIGHT, push_margin=MPC_controller.PUSH_MARGIN,
