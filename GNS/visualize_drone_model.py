@@ -1,6 +1,6 @@
 """Figures and animations for closed-loop evaluation (see drone_closed_loop.py).
 
-plot_closed_loop()     time series for one scenario, phases shaded (also used for the
+plot_closed_loop()     time series for one scenario (also used for the
                        open-loop runs, mode="open loop"):
                          1. closest pad node to the wall (MuJoCo vs model)
                          2. contact normal force: MuJoCo label, one-step model, closed-loop model
@@ -38,7 +38,6 @@ from drone_config import build_drone_graph, build_contact_graph
 from drone_closed_loop import pad_center_positions
 
 PHASE_NAMES = {0: "free", 1: "approach", 2: "hold", 3: "slide", 4: "release", 5: "hover near"}
-CONTACT_PHASES = (2, 3)                                          # hold, slide: shaded gray as "contact"
 PHASE_COLORS = {0: "white", 1: "#dbe9f6", 2: "#f6dbdb", 3: "#f6eedb", 4: "#e2f6db", 5: "#ece0f6"}   # GIF only
 C_TRUE, C_ONE, C_CL = "#2C2C2A", "#378ADD", "#D85A30"         # GIF only: MuJoCo, one-step model, model run
 C_NORMAL, C_FRIC, C_AERO = "#2ca02c", "#ff7f0e", "#d62798"
@@ -46,13 +45,12 @@ C_DRONE_TRUE, C_DRONE_PRED = "#888780", "#185FA5"
 
 
 # ---------------------------------------------------------------- report style
-# Same as the MPC figures: MuJoCo / actual = blue, reference = orange (dashed),
-# model one step = green (dotted). The model flying on its own (closed or open
-# loop) is purple, and the model with its contact network off is gray (dashed).
-ACTUAL_COLOR = "#2a78d6"
-REFERENCE_COLOR = "#eb6834"
-MODEL_COLOR = "#2ca02c"
-MODEL_RUN_COLOR = "#8a4fbf"
+# Same text and layout as the MPC figures. MuJoCo = black, model one step = blue
+# (dotted), the model flying on its own (closed or open loop) = orange, and the
+# model with its contact network off = gray (dashed).
+MUJOCO_COLOR = "black"
+ONE_STEP_COLOR = "#2a78d6"
+RUN_COLOR = "#eb6834"
 OFF_COLOR = "#9a9890"
 
 #Figure width for one column of a two-column page (inches). Figures are made at the size
@@ -103,15 +101,6 @@ def save_figure(fig, path):
     fig.savefig(stem + ".png")
     fig.savefig(stem + ".svg")
     plt.close(fig)
-
-
-def shade_contact(axes, phase, dt):
-    #Shades the contact phases (hold, slide) gray and labels the time axis
-    t = np.arange(len(phase)) * dt
-    contact = np.isin(phase, CONTACT_PHASES)
-    for i, ax in enumerate(axes):
-        ax.fill_between(t, 0, 1, where=contact, transform=ax.get_xaxis_transform(), color="gray",
-                        alpha=0.15, linewidth=0, label="contact" if i == 0 else "_nolegend_")
 
 
 def _pad_nodes(cfg):
@@ -177,12 +166,12 @@ def plot_closed_loop(res, cfg, path, title=None, mode="closed loop"):
     fig, ax = plt.subplots(5, 1, figsize=(REPORT_WIDTH, 5.8), sharex=True)
 
     #Gap between the closest pad sphere and the wall (mm), zoomed in near the wall
-    ax[0].plot(tt, 1e3 * (_wall_dist(true, cfg, n, wp) - radius), color=ACTUAL_COLOR, label="MuJoCo")
-    ax[0].plot(tp, 1e3 * (_wall_dist(pred, cfg, n, wp) - radius), color=MODEL_RUN_COLOR, label=run_label)
+    ax[0].plot(tt, 1e3 * (_wall_dist(true, cfg, n, wp) - radius), color=MUJOCO_COLOR, label="MuJoCo")
+    ax[0].plot(tp, 1e3 * (_wall_dist(pred, cfg, n, wp) - radius), color=RUN_COLOR, label=run_label)
     if off is not None:
         ax[0].plot(np.arange(off["n_frames"]) * dt, 1e3 * (_wall_dist(off, cfg, n, wp) - radius),
                    color=OFF_COLOR, ls="--", label="model, contact off")
-    ax[0].axhline(0.0, color="black", linewidth=0.6)
+    ax[0].axhline(0.0, color="0.7", linewidth=0.6)                  # wall surface (gray: MuJoCo is black)
     ax[0].set_ylim(-2.0, 20.0)
     ax[0].set_ylabel("gap (mm)")
 
@@ -192,23 +181,19 @@ def plot_closed_loop(res, cfg, path, title=None, mode="closed loop"):
               (r"$\|F_\mathrm{aero}\|$ (N)", lambda r: np.linalg.norm(r["F_aero"], axis=1), None)]
     for a, (label, value, floor) in zip(ax[1:4], traces):
         drawn = [value(true), value(pred)]
-        a.plot(tt, drawn[0], color=ACTUAL_COLOR)
+        a.plot(tt, drawn[0], color=MUJOCO_COLOR)
         if one is not None:
             drawn.append(value(one))
-            a.plot(tt, drawn[-1], color=MODEL_COLOR, linestyle=":", linewidth=1.2, label="model, one step")
-        a.plot(tp, drawn[1], color=MODEL_RUN_COLOR)
+            a.plot(tt, drawn[-1], color=ONE_STEP_COLOR, linestyle=":", linewidth=1.2, label="model, one step")
+        a.plot(tp, drawn[1], color=RUN_COLOR)
         if floor is not None:
             _force_axis(a, _full_range(*drawn, floor=floor))
         a.set_ylabel(label)
-    mu = res.get("mu_true")
-    if mu:
-        ax[2].plot(tt, mu * np.maximum(true["F_contact"] @ n, 0), color="black", ls="--", lw=0.6,
-                   label=rf"$\mu F_n$, MuJoCo ($\mu$ = {mu:g})")
 
     #Pad position error of the model run vs MuJoCo
     pc_true = pad_center_positions(true, cfg)
     err = 1e3 * np.linalg.norm(pc_true[:T] - pad_center_positions(pred, cfg)[:T], axis=1)
-    ax[4].plot(tp[:T], np.maximum(err, 1e-3) if mode == "open loop" else err, color=MODEL_RUN_COLOR)
+    ax[4].plot(tp[:T], np.maximum(err, 1e-3) if mode == "open loop" else err, color=RUN_COLOR)
     if off is not None:
         To = min(Tt, off["n_frames"])
         e_off = 1e3 * np.linalg.norm(pc_true[:To] - pad_center_positions(off, cfg)[:To], axis=1)
@@ -222,7 +207,6 @@ def plot_closed_loop(res, cfg, path, title=None, mode="closed loop"):
     ax[4].set_xlabel("time since start (s)" if mode == "open loop" else "time (s)")
     ax[4].set_xlim(0, max(tt[-1], tp[-1]))
 
-    shade_contact(ax, true["phase"], dt)
     figure_legend(fig, ax, ncol=2)
     save_figure(fig, path)
     return path

@@ -215,7 +215,7 @@ def evaluate_open_loop(model, cfg, data, out_folder, horizon_s=2.0, n_gifs=4, gi
                   f"crashed: on {100 * metrics[on + '_crash_frac']:.0f}%, off {100 * metrics[off + '_crash_frac']:.0f}%")
 
     # ---- error-growth figure: one panel per start kind, thin lines = single starts ----
-    from visualize_drone_model import set_plot_style, figure_legend, save_figure, REPORT_WIDTH, MODEL_COLOR, OFF_COLOR
+    from visualize_drone_model import set_plot_style, figure_legend, save_figure, REPORT_WIDTH, RUN_COLOR, OFF_COLOR
     os.makedirs(out_folder, exist_ok=True)
     kinds = [k for k in START_KINDS if (k, True) in curves]
     cols = 2 if len(kinds) > 1 else 1
@@ -224,7 +224,7 @@ def evaluate_open_loop(model, cfg, data, out_folder, horizon_s=2.0, n_gifs=4, gi
     fig, axes = plt.subplots(rows, cols, figsize=(REPORT_WIDTH, 1.7 * rows + 0.4), squeeze=False,
                              sharex=True, sharey=True)
     for ax, kind in zip(axes.flat, kinds):
-        for flag, col, lab in ((False, OFF_COLOR, "contact network off"), (True, MODEL_COLOR, "model")):
+        for flag, col, lab in ((False, OFF_COLOR, "contact network off"), (True, RUN_COLOR, "model")):
             cur = curves[(kind, flag)]
             for err in cur:
                 ax.plot(np.arange(len(err)) * dt, 1e3 * np.maximum(err, 1e-5), color=col, lw=0.3, alpha=0.15)
