@@ -76,6 +76,12 @@ PUSH_WEIGHT     = 1 / 0.1**2    # 0.1 N, for both the push force and the swing (
 PUSH_MARGIN     = 2.0           # over the friction limit; the learned mu (~0.33) is below MuJoCo's 0.4, and the push is one
                                 # cost among several, so the drone delivers less than the target
 SLIDE_MIN_SPEED = 0.01          # m/s, wanted in-plane speed above this counts as a slide
+
+#Pulling the pad off: where the reference says no contact but the plan still has the pad touching, the force the
+#drone applies away from the wall is pushed toward PULL_OFF_FORCE (weighted like the push). Linearized about a touching
+#pad, the model can't predict leaving (easing off just lowers the contact force), so without this the pad can sit on
+#the wall pressing lightly after a release. It fades out with the contact gate once the plan has the pad off the wall.
+PULL_OFF_FORCE  = 0.2           # N, away from the wall
 CATCH_UP_TIME   = 0.5          # s, the wanted speed includes closing the in-plane position error over this time
 
 
@@ -356,13 +362,11 @@ def stuck_push_rows(nominal_state, nominal_input, nominal_output, reference_traj
         omega = nominal_input[k]
         thrusts = k_f * omega ** 2
         thrust_per_speed = 2 * k_f * omega
-        thrust = np.sum(thrusts)
         target = PUSH_MARGIN * params["mu"] * max(nominal_output[k][0], 0.0)
 
         #Force row: the applied force along the slide direction
-        force_theta = thrust * np.cross(b3, direction)
-        force_u = (direction @ b3) * thrust_per_speed
-        force_constant = direction @ (thrust * b3 + weight) - target
+        force_theta, force_u, force_value = applied_force_row(b3, omega, direction, params)
+        force_constant = force_value - target
 
         #Swing row: moment about the pad, about the axis the push would swing the body around, as a force at the pad
         axis = np.cross(n, direction)
@@ -384,6 +388,29 @@ def wall_axes(wall_normal_vector):
     along_wall = np.cross(n, [0.0, 0.0, 1.0])
     along_wall = along_wall / np.linalg.norm(along_wall)
     return along_wall, np.cross(along_wall, n)
+
+
+#The applied force (thrust + gravity, no contact or aero) along a direction, and its gradients:
+#   value = direction . (T b3 + m g),   d/d(omega) = (direction . b3) 2 k_f omega,   d/d(dtheta) = T (b3 x direction)
+def applied_force_row(b3, omega, direction, params):
+    thrust = params["k_f"] * np.sum(omega ** 2)
+    weight = np.array([0.0, 0.0, -params["mass"] * params["gravity"]])
+    return (thrust * np.cross(b3, direction), (direction @ b3) * 2 * params["k_f"] * omega,
+            direction @ (thrust * b3 + weight))
+
+
+#Pull-off rows at the steps where the reference says no contact but the plan has the pad touching (gate >= 0.5):
+#the applied force away from the wall, minus PULL_OFF_FORCE, scaled by the gate (so it fades as the pad leaves).
+#Returns (k, g_theta (3,), g_u (4,), constant, scale) per step.
+def pull_off_rows(nominal_state, nominal_input, contact_flag, contact_gate, n, params, N):
+    rows = []
+    for k in range(N):
+        if contact_flag[k] >= 0.5 or contact_gate[k] < 0.5:
+            continue
+        b3 = quat_to_rot_matrix_np(nominal_state[k][6:10])[:, 2]
+        g_theta, g_u, value = applied_force_row(b3, nominal_input[k], n, params)
+        rows.append((k, g_theta, g_u, value - PULL_OFF_FORCE, contact_gate[k]))
+    return rows
 
 
 #Builds the full 19-number linearized state from the nominal state and the 18-number correction
@@ -473,6 +500,12 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     #Input cost: thrust and moments away from hover
     wrench_matrices, wrench_values = input_wrench_rows(nominal_input[:horizon_length], hover_thrust_values, model_params)
 
+    #Steps where the pad should be off the wall but the plan has it touching, and the pull-off needed there
+    gate_all = [float(snap_gate(calculate_contact_gate(nominal_output[k][12], d0, tau))) for k in range(horizon_length)]
+    pull_rows = {k: (g_theta, g_u, constant, scale) for k, g_theta, g_u, constant, scale in pull_off_rows(
+        nominal_state, effective_input, contact_flag, gate_all, np.asarray(wall_normal_vector, dtype=float),
+        model_params, horizon_length)}
+
     #Initializes the cost function to zero
     cost = 0
     for k in range(horizon_length + 1):
@@ -532,6 +565,10 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
             if k in push_rows:
                 g_theta, g_u, constant, scale = push_rows[k]
                 cost += scale * PUSH_WEIGHT * squared_error(mpc, g_theta @ dx[k][6:9] + g_u @ effective_du[k] + constant, 2)
+            #Pull the pad off the wall (only where the reference says no contact but the plan has it touching)
+            if k in pull_rows:
+                g_theta, g_u, constant, scale = pull_rows[k]
+                cost += scale * PUSH_WEIGHT * squared_error(mpc, g_theta[None] @ dx[k][6:9] + g_u[None] @ effective_du[k] + constant, 1)
 
             #Adds the constraints related to motor change limits for each rotor
             mpc.addConstr(linearized_input - previous_lin_input <= MOTOR_CHANGE_LIM)
@@ -825,6 +862,22 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
         scales = np.repeat([row[4] for row in push_rows], 2)
         cost += cost_rows(PUSH_WEIGHT * scales, push_dx, push_du, np.concatenate([row[3] for row in push_rows]))
         print(f"  push active at {len(steps)} of {N} steps (mean scale {scales.mean():.2f})")
+
+    #Pull the pad off the wall, at the steps where the reference says no contact but the plan has the pad touching
+    pull_rows = pull_off_rows(nominal_state, effective_input, reference_trajectory["contact_flag"], contact_gate, n,
+                              model_params, N)
+    if pull_rows:
+        steps = [row[0] for row in pull_rows]
+        row_index = np.arange(len(steps))
+        pull_dx = sp.csr_matrix((np.concatenate([row[1] for row in pull_rows]),
+                                 (np.repeat(row_index, 3), [k * nx + 6 + j for k in steps for j in range(3)])),
+                                shape=(len(steps), (N + 1) * nx))
+        pull_du = sp.csr_matrix((np.concatenate([row[2] for row in pull_rows]),
+                                 (np.repeat(row_index, nu), [k * nu + j for k in steps for j in range(nu)])),
+                                shape=(len(steps), N * nu)) @ motor_matrix
+        scales = np.array([row[4] for row in pull_rows])
+        cost += cost_rows(PUSH_WEIGHT * scales, pull_dx, pull_du, np.array([row[3] for row in pull_rows]))
+        print(f"  pull-off active at {len(steps)} of {N} steps")
 
 
     # ---------------- State and output costs (k = 1..N) ----------------
