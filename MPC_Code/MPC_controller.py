@@ -25,7 +25,7 @@ VELOCITY_WEIGHT        = 1 / 0.1**2    # 0.1 m/s
 #Rod orientation, split along the wall's axes: yaw = the rod tilting sideways (along the wall), pitch = tilting
 #up or down the wall. They're separate because pitch has to stay free (the rod is mounted ~8 deg tip-up, and the
 #approach and the push both need body pitch), while yaw only swings the pad around on the wall.
-ROD_YAW_WEIGHT         = 1 / 0.1**2    # 0.1 rad (~6 deg) sideways off the wall normal
+ROD_YAW_WEIGHT         = 1 / 0.05**2    # 0.1 rad (~6 deg) sideways off the wall normal
 ROD_PITCH_WEIGHT       = 1 / 0.1**2    # 0.1 rad (~6 deg) up or down off the wall normal
 ANG_VEL_WEIGHT         = 1 / 0.5**2    # 0.5 rad/s
 NORMAL_FORCE_WEIGHT    = 1 / 0.3**2    # 0.3 N
@@ -34,7 +34,7 @@ NORMAL_FORCE_WEIGHT    = 1 / 0.3**2    # 0.3 N
 #on each rotor, in the pattern that moves one axis, costs about what it did before. YAW_INPUT_FACTOR scales the yaw tolerance:
 #yaw only gets the small k_m/k_f lever, so at 1 a useful yaw moment costs far more than a roll or pitch moment.
 INPUT_TOLERANCE        = 100.0         # rad/s per rotor from hover
-YAW_INPUT_FACTOR       = 1.0           # 3 makes a yaw moment 3x as large cost the same
+YAW_INPUT_FACTOR       = 3.0           # 3 makes a yaw moment 3x as large cost the same
 INPUT_CHANGE_WEIGHT    = 1 / 20**2     # 20 rad/s per step
 
 #Proximal term: penalizes du, the change from the nominal (shifted) plan, not the input itself. It adds curvature in
