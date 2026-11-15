@@ -147,7 +147,7 @@ hover_input = model.calculate_hover_inputs().cpu().numpy()
 #Generates the reference trajectory based on the wall and wind conditions set above, this needed to
 #happen after model because we needed the pad offset from the model
 scenario = "line_horizontal"  # Example scenario, can be changed to "push", "line_horizontal", "line_vertical", or "circle"
-trajectory_time_length, reference_trajectory = trajectory_generator.generate_trajectory(scenario,force_range=(1.8, 1.8))
+trajectory_time_length, reference_trajectory = trajectory_generator.generate_trajectory(scenario,force_range=(1, 1))
 # trajectory_time_length, reference_trajectory = trajectory_generator.generate_free_flight_trajectory(time_range = [0.5,0.5])
 
 
@@ -237,7 +237,7 @@ planned_output_history = np.full((len(t) + 1, Horizon_length + 1, 17), np.nan, d
 #Model values for the push that breaks a stuck pad loose
 model_params = dict(k_f=model.motor_kf, mass=model.mass, gravity=float(model.cfg.gravity),
                     mu=model.friction_mu, contact_radius=float(model.cfg.pad_contact_radius), dt=MPC_dt,
-                    mixer=model.thrust_mixer())
+                    mixer=model.thrust_mixer(), pad_offset=model.pad_offset.cpu().numpy())
 
 #The motors' squared speeds right now (thrust / k_f), tracked through the lag from the commands sent.
 #The sim starts with the motors at hover.

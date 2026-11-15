@@ -68,9 +68,11 @@ TOUCH_SPEED   = 0.02            # m/s, allowed speed into the wall at contact
 INPUT_TRUST_REGION = 100.0 # Rad/s per control step
 
 #Breaking the pad loose: in contact, where the pad should move in-plane faster than the plan has it moving,
-#the in-plane force the drone applies along that direction is pushed toward PUSH_MARGIN * mu * F_n
+#the force the drone delivers AT THE PAD along that direction is pushed toward PUSH_MARGIN * mu * F_n
 #(mu is the model's learned value). The push fades out as the planned speed reaches the wanted speed.
-PUSH_WEIGHT     = 1 / 0.1**2    # 0.1 N
+#"At the pad" means the sideways force comes with the torque that keeps the body from swinging around the pad,
+#so the push and the rod orientation cost ask for the same thing instead of fighting (see stuck_push_rows).
+PUSH_WEIGHT     = 1 / 0.1**2    # 0.1 N, for both the push force and the swing (as a force at the pad)
 PUSH_MARGIN     = 2.0           # over the friction limit; the learned mu (~0.33) is below MuJoCo's 0.4, and the push is one
                                 # cost among several, so the drone delivers less than the target
 SLIDE_MIN_SPEED = 0.01          # m/s, wanted in-plane speed above this counts as a slide
@@ -311,14 +313,31 @@ def squared_error(mpc, expression, size):
 #Wanted in-plane velocity = reference velocity + in-plane position error / CATCH_UP_TIME, so a pad left behind
 #(or stuck after the reference stops) still gets pushed. Each step's weight is scaled by how far the planned speed
 #along that direction falls short of the wanted speed: 1 when stuck, 0 at the wanted speed (no on/off switching).
-#The applied in-plane force is thrust + gravity (no contact or aero), so it's linear in the deviations without the model:
-#   push_k = direction . (T b3 + m g) - target,   d(push)/d(du_k) = 2 k_f (direction . b3) omega,
-#   d(push)/d(dtheta_k) = T (b3 x direction)   (the attitude error rotates b3 by dtheta x b3)
-#While stuck, friction cancels this force, so pushing it past mu * F_n is what makes the pad slip.
-#params: k_f, mass, gravity, mu from the model. Returns (k, g_theta (3,), g_u (4,), constant, scale) per push step.
+#
+#Two rows per push step, both from the applied wrench (rotor thrust and moments + gravity; no contact or aero), so
+#they're linear in the deviations without the model:
+#   force:  direction . F - target,          F = T b3 + m g,  target = PUSH_MARGIN * mu * F_n
+#   swing:  axis . M_pad / lever,             M_pad = R tau_rotors + (COM - pad) x F,  axis = n x direction
+#M_pad is the moment of the applied wrench about the pad. A sideways force at the body with M_pad != 0 mostly swings
+#the body around the stuck pad (the rod is long and the yaw/pitch inertia small) instead of loading the pad; with
+#M_pad = 0 about the axis the push would swing it around, the whole force goes into the pad. For a sideways push that
+#axis is vertical (yaw), for an up/down push it's along the wall (pitch). Dividing by the lever makes it a force at the pad.
+#Derivatives: thrusts T_i = k_f omega_i^2, so dT_i = 2 k_f omega_i domega_i; the attitude error rotates R by dtheta x,
+#so for any term a . (R v) the attitude gradient is (R v) x a.
+#params: k_f, mass, gravity, mu, mixer, pad_offset from the model.
+#Returns (k, g_theta (2, 3), g_u (2, 4), constant (2,), scale) per push step.
 def stuck_push_rows(nominal_state, nominal_input, nominal_output, reference_trajectory, contact_sigma, n, params, N):
     in_plane = np.eye(3) - np.outer(n, n)
     weight = np.array([0.0, 0.0, -params["mass"] * params["gravity"]])
+    k_f, mixer = params["k_f"], np.asarray(params["mixer"], dtype=float)
+    pad_offset = np.asarray(params["pad_offset"], dtype=float)            # COM -> pad center, body frame
+    lever = np.linalg.norm(pad_offset)
+    e3 = np.array([0.0, 0.0, 1.0])
+
+    #Body-frame moment about the pad per unit of each rotor's thrust: the rotor moments about the COM (mixer rows
+    #1-3), plus the thrust (along body z at the COM) taken about the pad: (COM - pad) x e3 = -pad_offset x e3
+    moment_per_thrust = mixer[1:4] - np.outer(np.cross(pad_offset, e3), np.ones(4))
+
     rows = []
     for k in range(N):
         position_error = reference_trajectory["pad_position"][k] - nominal_output[k][3:6]
@@ -332,15 +351,31 @@ def stuck_push_rows(nominal_state, nominal_input, nominal_output, reference_traj
         if scale == 0.0:
             continue
 
-        b3 = quat_to_rot_matrix_np(nominal_state[k][6:10])[:, 2]
+        R = quat_to_rot_matrix_np(nominal_state[k][6:10])
+        b3 = R[:, 2]
         omega = nominal_input[k]
-        thrust = params["k_f"] * np.sum(omega ** 2)
+        thrusts = k_f * omega ** 2
+        thrust_per_speed = 2 * k_f * omega
+        thrust = np.sum(thrusts)
         target = PUSH_MARGIN * params["mu"] * max(nominal_output[k][0], 0.0)
 
-        g_theta = thrust * np.cross(b3, direction)
-        g_u = 2 * params["k_f"] * (direction @ b3) * omega
-        constant = direction @ (thrust * b3 + weight) - target
-        rows.append((k, g_theta, g_u, constant, scale))
+        #Force row: the applied force along the slide direction
+        force_theta = thrust * np.cross(b3, direction)
+        force_u = (direction @ b3) * thrust_per_speed
+        force_constant = direction @ (thrust * b3 + weight) - target
+
+        #Swing row: moment about the pad, about the axis the push would swing the body around, as a force at the pad
+        axis = np.cross(n, direction)
+        body_moment = moment_per_thrust @ thrusts                  # rotor part + thrust part, body frame
+        com_from_pad = -R @ pad_offset                             # world frame
+        swing_constant = axis @ (R @ body_moment) + axis @ np.cross(com_from_pad, weight)
+        #attitude: the body-frame part rotates with R; gravity's part through com_from_pad = -R pad_offset
+        swing_theta = np.cross(R @ body_moment, axis) + np.cross(com_from_pad, np.cross(weight, axis))
+        swing_u = (axis @ R @ moment_per_thrust) * thrust_per_speed
+
+        rows.append((k, np.vstack([force_theta, swing_theta / lever]),
+                     np.vstack([force_u, swing_u / lever]),
+                     np.array([force_constant, swing_constant / lever]), scale))
     return rows
 
 #The wall's in-plane axes: horizontal along the wall, and up the wall (same as the scenario generator and plots)
@@ -496,7 +531,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
             #Push to break the pad loose (only at stuck steps of a slide)
             if k in push_rows:
                 g_theta, g_u, constant, scale = push_rows[k]
-                cost += scale * PUSH_WEIGHT * squared_error(mpc, g_theta[None] @ dx[k][6:9] + g_u[None] @ effective_du[k] + constant, 1)
+                cost += scale * PUSH_WEIGHT * squared_error(mpc, g_theta @ dx[k][6:9] + g_u @ effective_du[k] + constant, 2)
 
             #Adds the constraints related to motor change limits for each rotor
             mpc.addConstr(linearized_input - previous_lin_input <= MOTOR_CHANGE_LIM)
@@ -613,8 +648,9 @@ def stacked_squared_error(mpc, weights, Mx, dx, Mu, du, c):
 def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output, input_vector_current,
                         reference_trajectory, hover_thrust_values, horizon_length, d0, tau, wall_normal_vector,
                         model_params, motor_speed_squared, return_plan=False):
-    #model_params: dict(k_f, mass, gravity, mu, contact_radius, dt, mixer) from the model, for the stuck push, the approach
-    #speed, the motor lag (dt is the MPC step), and the input cost (mixer: rotor thrusts -> thrust and moments)
+    #model_params: dict(k_f, mass, gravity, mu, contact_radius, dt, mixer, pad_offset) from the model, for the stuck push,
+    #the approach speed, the motor lag (dt is the MPC step), and the input cost (mixer: rotor thrusts -> thrust and
+    #moments; pad_offset: COM -> pad center, body frame)
     #motor_speed_squared: (4,) the rotors' squared speeds right now (from motor_step in the run file)
     #nominal_input: the nominal COMMANDS; A, B, C, D are linearized at the effective (lagged) speeds they give
     #return_plan=True also returns the planned outputs (N+1, 17): what the QP predicts the outputs
@@ -777,16 +813,17 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     push_rows = stuck_push_rows(nominal_state, effective_input, nominal_output, reference_trajectory,
                                 contact_sigma, n, model_params, N)
     if push_rows:
+        #Two rows per push step (force, swing): row 2i and 2i+1 for the i-th push step
         steps = [row[0] for row in push_rows]
-        row_index = np.arange(len(steps))
-        push_dx = sp.csr_matrix((np.concatenate([row[1] for row in push_rows]),
-                                 (np.repeat(row_index, 3), [k * nx + 6 + j for k in steps for j in range(3)])),
-                                shape=(len(steps), (N + 1) * nx))
-        push_du = sp.csr_matrix((np.concatenate([row[2] for row in push_rows]),
-                                 (np.repeat(row_index, nu), [k * nu + j for k in steps for j in range(nu)])),
-                                shape=(len(steps), N * nu)) @ motor_matrix
-        scales = np.array([row[4] for row in push_rows])
-        cost += cost_rows(PUSH_WEIGHT * scales, push_dx, push_du, np.array([row[3] for row in push_rows]))
+        row_index = np.arange(2 * len(steps))
+        push_dx = sp.csr_matrix((np.concatenate([row[1].ravel() for row in push_rows]),
+                                 (np.repeat(row_index, 3), [k * nx + 6 + j for k in steps for _ in range(2) for j in range(3)])),
+                                shape=(2 * len(steps), (N + 1) * nx))
+        push_du = sp.csr_matrix((np.concatenate([row[2].ravel() for row in push_rows]),
+                                 (np.repeat(row_index, nu), [k * nu + j for k in steps for _ in range(2) for j in range(nu)])),
+                                shape=(2 * len(steps), N * nu)) @ motor_matrix
+        scales = np.repeat([row[4] for row in push_rows], 2)
+        cost += cost_rows(PUSH_WEIGHT * scales, push_dx, push_du, np.concatenate([row[3] for row in push_rows]))
         print(f"  push active at {len(steps)} of {N} steps (mean scale {scales.mean():.2f})")
 
 
