@@ -185,8 +185,10 @@ def animate_flight(drone_cfg, wall_normal, wall_point, state_history, dt,
     interval_ms = 1000 * dt * frame_stride / speed
     animation = FuncAnimation(fig, update, frames=len(frame_indices), interval=interval_ms, blit=False)
 
+    #dpi set here so the GIF ignores the report style's 300 dpi (set_plot_style is global, and the tracking plots
+    #usually run first): 100 dpi keeps frames at 800 x 700 px, small enough for slides
     if save_path is not None:
-        animation.save(save_path, writer=PillowWriter(fps=int(1000 / interval_ms)))
+        animation.save(save_path, writer=PillowWriter(fps=int(1000 / interval_ms)), dpi=100)
     plt.show()
     return animation
 
