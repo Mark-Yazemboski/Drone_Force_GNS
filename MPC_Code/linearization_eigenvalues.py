@@ -6,6 +6,8 @@ i.e. after the motor lag), and reports for each step:
     - max |eigenvalue| of A_k        (above 1: a mode that grows every 10 ms step on its own)
     - horizon gain                   (largest singular value of A_{k+N-1} ... A_k: how much the next N steps can
                                       amplify a deviation, the number that made the QP ill-conditioned)
+both for the raw model (open loop, A_k) and for the pre-stabilized prediction the MPC actually works with
+(A_k + B_k K_k, with the LQR gains from the controller's prestabilizing_gains over the N steps starting at k).
 Steps are split by whether MuJoCo had the pad in contact.
 
 Run:  python linearization_eigenvalues.py final_v1234
@@ -19,7 +21,7 @@ import torch
 import matplotlib.pyplot as plt
 
 from model import Drone_Dynamics
-from MPC_controller import motor_step
+from MPC_controller import motor_step, prestabilizing_gains
 from visualize import set_plot_style, REPORT_WIDTH
 
 SCRIPT_FOLDER = Path(__file__).resolve().parent
@@ -47,41 +49,54 @@ for k, command in enumerate(commands):
     effective[k], speed_squared = motor_step(speed_squared, command, dt)
 
 #Linearize at every recorded state, in chunks
-A = []
+A, B = [], []
 for start in range(0, len(commands), CHUNK):
     stop = min(start + CHUNK, len(commands))
-    A_chunk, *_ = model.linearize_horizon(torch.as_tensor(states[start:stop], dtype=torch.float32),
-                                          torch.as_tensor(effective[start:stop], dtype=torch.float32), 1)
+    A_chunk, B_chunk, *_ = model.linearize_horizon(torch.as_tensor(states[start:stop], dtype=torch.float32),
+                                                   torch.as_tensor(effective[start:stop], dtype=torch.float32), 1)
     A.extend(A_chunk.numpy().astype(float))
+    B.extend(B_chunk.numpy().astype(float))
     print(f"linearized {stop} / {len(commands)}")
-A = np.array(A)
+A, B = np.array(A), np.array(B)
 
-#Max |eigenvalue| per step, and the horizon gain of the N steps starting there
-eig_max = np.array([np.abs(np.linalg.eigvals(matrix)).max() for matrix in A])
-horizon_gain = np.full(len(A), np.nan)
-for k in range(len(A) - HORIZON_LENGTH + 1):
-    product = np.eye(A.shape[1])
-    for matrix in A[k:k + HORIZON_LENGTH]:
+def growth(matrices):
+    #Max |eigenvalue| of the first matrix, and the largest singular value of the product of all of them
+    product = np.eye(matrices[0].shape[0])
+    for matrix in matrices:
         product = matrix @ product
-    horizon_gain[k] = np.linalg.norm(product, 2)
+    return np.abs(np.linalg.eigvals(matrices[0])).max(), np.linalg.norm(product, 2)
+
+#Per step: open loop (A_k) and pre-stabilized (A_k + B_k K_k, gains from the N steps starting at k, like the MPC)
+eig_max, horizon_gain = np.full(len(A), np.nan), np.full(len(A), np.nan)
+eig_max_closed, horizon_gain_closed = np.full(len(A), np.nan), np.full(len(A), np.nan)
+for k in range(len(A) - HORIZON_LENGTH + 1):
+    window_A, window_B = A[k:k + HORIZON_LENGTH], B[k:k + HORIZON_LENGTH]
+    gains = prestabilizing_gains(window_A, window_B)
+    eig_max[k], horizon_gain[k] = growth(window_A)
+    eig_max_closed[k], horizon_gain_closed[k] = growth([a + b @ K for a, b, K in zip(window_A, window_B, gains)])
 
 #Split by contact (normal_force[k + 1] is the force over step k)
 in_contact = data["normal_force"][1:len(A) + 1] > CONTACT_FORCE
-for name, mask in [("free flight", ~in_contact), ("contact", in_contact)]:
-    if mask.any():
-        gains = horizon_gain[mask][np.isfinite(horizon_gain[mask])]
-        print(f"{name:12s} ({mask.sum():4d} steps): max|eig| median {np.median(eig_max[mask]):.3f}, "
-              f"95th pct {np.percentile(eig_max[mask], 95):.3f}, max {eig_max[mask].max():.3f} | "
-              f"horizon gain median {np.median(gains):.1e}, max {gains.max():.1e}")
+has_window = np.isfinite(eig_max)
+for label, eigs, gains in [("open loop  A", eig_max, horizon_gain), ("closed loop A+BK", eig_max_closed, horizon_gain_closed)]:
+    print(label)
+    for name, mask in [("free flight", ~in_contact & has_window), ("contact", in_contact & has_window)]:
+        if mask.any():
+            print(f"  {name:12s} ({mask.sum():4d} steps): max|eig| median {np.median(eigs[mask]):.3f}, "
+                  f"95th pct {np.percentile(eigs[mask], 95):.3f}, max {eigs[mask].max():.3f} | "
+                  f"horizon gain median {np.median(gains[mask]):.1e}, max {gains[mask].max():.1e}")
 
 #Plot: max |eigenvalue| and horizon gain over the run, contact shaded
 set_plot_style()
 fig, axes = plt.subplots(2, 1, figsize=(REPORT_WIDTH, 3.0), sharex=True)
 step_times = times[:len(A)]
-axes[0].plot(step_times, eig_max, color="#2a78d6")
+axes[0].plot(step_times, eig_max, color="#2a78d6", label="open loop $A_k$")
+axes[0].plot(step_times, eig_max_closed, color="#2ca02c", label="pre-stabilized $A_k + B_k K_k$")
 axes[0].axhline(1.0, color="black", linewidth=0.6, linestyle="--")
-axes[0].set_ylabel(r"max $|\lambda(A_k)|$")
+axes[0].set_ylabel(r"max $|\lambda|$")
+axes[0].legend(loc="upper left", frameon=False)
 axes[1].semilogy(step_times, horizon_gain, color="#2a78d6")
+axes[1].semilogy(step_times, horizon_gain_closed, color="#2ca02c")
 axes[1].set_ylabel(f"{HORIZON_LENGTH}-step gain")
 for ax in axes:
     ax.fill_between(step_times, 0, 1, where=in_contact, transform=ax.get_xaxis_transform(),
