@@ -77,8 +77,9 @@ PUSH_MARGIN     = 2.0           # over the friction limit; the learned mu (~0.33
                                 # cost among several, so the drone delivers less than the target
 SLIDE_MIN_SPEED = 0.01          # m/s, wanted in-plane speed above this counts as a slide
 
-#Pulling the pad off: where the reference says no contact but the plan still has the pad touching, the force the
-#drone applies away from the wall is pushed toward PULL_OFF_FORCE (weighted like the push). Linearized about a touching
+#Pulling the pad off: where the reference releases (no contact, moving away from the wall) but the plan still has
+#the pad touching, the force the drone applies away from the wall is pushed toward PULL_OFF_FORCE (weighted like the
+#push). Only during a release: pulling off during the approach would delay the first touch. Linearized about a touching
 #pad, the model can't predict leaving (easing off just lowers the contact force), so without this the pad can sit on
 #the wall pressing lightly after a release. It fades out with the contact gate once the plan has the pad off the wall.
 PULL_OFF_FORCE  = 0.2           # N, away from the wall
@@ -399,13 +400,17 @@ def applied_force_row(b3, omega, direction, params):
             direction @ (thrust * b3 + weight))
 
 
-#Pull-off rows at the steps where the reference says no contact but the plan has the pad touching (gate >= 0.5):
+#Pull-off rows at the steps where the reference says no contact, the reference pad is moving away from the wall
+#(a release, not an approach: during the approach the reference moves toward the wall or holds at the standoff, and
+#pulling off there would delay the first touch), and the plan has the pad touching (gate >= 0.5):
 #the applied force away from the wall, minus PULL_OFF_FORCE, scaled by the gate (so it fades as the pad leaves).
 #Returns (k, g_theta (3,), g_u (4,), constant, scale) per step.
-def pull_off_rows(nominal_state, nominal_input, contact_flag, contact_gate, n, params, N):
+def pull_off_rows(nominal_state, nominal_input, reference_trajectory, contact_gate, n, params, N):
     rows = []
     for k in range(N):
-        if contact_flag[k] >= 0.5 or contact_gate[k] < 0.5:
+        releasing = (reference_trajectory["contact_flag"][k] < 0.5
+                     and n @ reference_trajectory["pad_velocity"][k] > 0.0)
+        if not releasing or contact_gate[k] < 0.5:
             continue
         b3 = quat_to_rot_matrix_np(nominal_state[k][6:10])[:, 2]
         g_theta, g_u, value = applied_force_row(b3, nominal_input[k], n, params)
@@ -503,7 +508,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     #Steps where the pad should be off the wall but the plan has it touching, and the pull-off needed there
     gate_all = [float(snap_gate(calculate_contact_gate(nominal_output[k][12], d0, tau))) for k in range(horizon_length)]
     pull_rows = {k: (g_theta, g_u, constant, scale) for k, g_theta, g_u, constant, scale in pull_off_rows(
-        nominal_state, effective_input, contact_flag, gate_all, np.asarray(wall_normal_vector, dtype=float),
+        nominal_state, effective_input, reference_trajectory, gate_all, np.asarray(wall_normal_vector, dtype=float),
         model_params, horizon_length)}
 
     #Initializes the cost function to zero
@@ -863,9 +868,9 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
         cost += cost_rows(PUSH_WEIGHT * scales, push_dx, push_du, np.concatenate([row[3] for row in push_rows]))
         print(f"  push active at {len(steps)} of {N} steps (mean scale {scales.mean():.2f})")
 
-    #Pull the pad off the wall, at the steps where the reference says no contact but the plan has the pad touching
-    pull_rows = pull_off_rows(nominal_state, effective_input, reference_trajectory["contact_flag"], contact_gate, n,
-                              model_params, N)
+    #Pull the pad off the wall, at the steps where the reference releases (no contact, moving away) but the plan has
+    #the pad touching
+    pull_rows = pull_off_rows(nominal_state, effective_input, reference_trajectory, contact_gate, n, model_params, N)
     if pull_rows:
         steps = [row[0] for row in pull_rows]
         row_index = np.arange(len(steps))
