@@ -52,10 +52,8 @@ PRESTABILIZE = True
 #it can, so these only need to be "big enough": 100 / tolerance makes one tolerance of violation cost as much as
 #100 steps of being one tolerance off in a tracking cost. Contact distance is kept weak on purpose: enforced
 #exactly, it makes the MPC tilt the pad so the closest node satisfies it (it limits the closest node, not the center).
-SLACK_WEIGHT_ROLL = 100 / 0.01               # per rad over the limit
-SLACK_WEIGHT_PITCH = 100 / 0.01              # per rad over the limit
+#The rotor distance and the roll and pitch limits are hard constraints (no slack).
 SLACK_WEIGHT_CONTACT_DISTANCE = 1 / 0.1      # per m too far off the wall (weak on purpose)
-SLACK_WEIGHT_ROTOR_DISTANCE = 100 / 0.002    # per m too close to the wall
 SLACK_WEIGHT_APPROACH = 100 / 0.02           # per m/s over the approach speed limit
 
 #Approach speed limit: the pad's speed into the wall must stay under gap / APPROACH_TIME + TOUCH_SPEED,
@@ -148,9 +146,8 @@ def coefficient_ranges(mpc):
 def log_solution(slack_maxes, first_input, first_du):
     #Logs the slacks in use, rotors at their limits, and a first step that hits the trust region
     over = [f"{name} {scale * value:.2f} {unit}" for name, value, limit, scale, unit in [
-        ("roll", slack_maxes[0], 0.01, 1, "rad"), ("pitch", slack_maxes[1], 0.01, 1, "rad"),
-        ("contact", slack_maxes[2], 0.001, 1000, "mm"), ("rotor", slack_maxes[3], 0.001, 1000, "mm"),
-        ("approach", slack_maxes[4], 0.01, 100, "cm/s")] if value > limit]
+        ("contact", slack_maxes[0], 0.001, 1000, "mm"),
+        ("approach", slack_maxes[1], 0.01, 100, "cm/s")] if value > limit]
     if over:
         log_event("slack", "; ".join(over))
     saturated = np.flatnonzero((first_input <= MOTOR_MIN + 1.0) | (first_input >= MOTOR_MAX - 1.0))
@@ -278,21 +275,12 @@ def prestabilizing_gains(A, B):
     return gains
 
 
-#Solves the QP. On numerical trouble (status 12), logs the model's coefficient ranges, which show what makes it
-#badly scaled, and retries once with barrier in its more robust settings: the homogeneous algorithm, extra numerical
-#care, and no crossover (the MPC only needs the interior solution, and crossover is a common source of trouble).
-#Dual simplex was tried here and ran into the time limit (status 9) almost every time.
+#Solves the QP once, with no retry. On numerical trouble (status 12), logs the model's coefficient ranges, which show
+#what makes it badly scaled; the caller then falls back to the shifted previous plan.
 def solve_qp(mpc, A, label="A"):
     mpc.optimize()
     if mpc.Status == GRB.NUMERIC:
         log_event("numeric_trouble", coefficient_ranges(mpc) + " | " + horizon_growth(A, label))
-        mpc.Params.Method = 2
-        mpc.Params.BarHomogeneous = 1
-        mpc.Params.Crossover = 0
-        mpc.Params.NumericFocus = 2
-        mpc.reset()
-        mpc.optimize()
-        log_event("numeric_retry", f"homogeneous barrier: status {mpc.Status}")
 
 #Input cost rows, one 4-row block per step: (wrench(commands) - wrench(hover)) / tolerance, linearized about the
 #nominal commands. wrench = mixer @ thrusts, thrust = k_f * omega^2, so d(wrench) = mixer @ diag(2 k_f omega) d(omega).
@@ -472,10 +460,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
     effective_input, motor_matrix = motor_map(nominal_input[:horizon_length], motor_speed_squared, model_params["dt"])
     du_all = du.reshape(-1)
     effective_du = [motor_matrix[k * INPUT_SIZE:(k + 1) * INPUT_SIZE] @ du_all for k in range(horizon_length)]
-    slack_roll = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_roll")
-    slack_pitch = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_pitch")
     slack_contact_distance = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_contact_distance")
-    slack_rotor_distance = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_rotor_distance")
     slack_approach = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_approach")
 
     #adds trust region constraints for the input deviations
@@ -599,10 +584,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
             tangent_projection = np.eye(3) - contact_sigma * np.outer(wall_normal_vector, wall_normal_vector)
 
              #Slack variable cost
-            cost += slack_roll[k] * SLACK_WEIGHT_ROLL
-            cost += slack_pitch[k] * SLACK_WEIGHT_PITCH
             cost += slack_contact_distance[k] * SLACK_WEIGHT_CONTACT_DISTANCE
-            cost += slack_rotor_distance[k] * SLACK_WEIGHT_ROTOR_DISTANCE
             cost += slack_approach[k] * SLACK_WEIGHT_APPROACH
             
             #Position error cost
@@ -621,7 +603,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
                 mpc.addConstr(lin_pad_dist <= CONTACT_MAX_DIST + slack_contact_distance[k])
 
             #Adds the constraint related to the minimum distance of the rotors from the wall
-            mpc.addConstr(lin_rotor_dist >= ROTOR_MIN_DIST - slack_rotor_distance[k])
+            mpc.addConstr(lin_rotor_dist >= ROTOR_MIN_DIST)
 
             #Approach speed limit: speed into the wall under gap / APPROACH_TIME + TOUCH_SPEED, while not touching
             if contact_gate < 0.5:
@@ -630,10 +612,10 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
                 mpc.addConstr(speed_into_wall - gap / APPROACH_TIME <= TOUCH_SPEED + slack_approach[k])
 
             #Adds the constraints related to roll and pitch limits
-            mpc.addConstr(lin_roll <= ROLL_LIM + slack_roll[k])
-            mpc.addConstr(lin_roll >= -ROLL_LIM - slack_roll[k])
-            mpc.addConstr(lin_pitch <= PITCH_LIM + slack_pitch[k])
-            mpc.addConstr(lin_pitch >= -PITCH_LIM - slack_pitch[k])
+            mpc.addConstr(lin_roll <= ROLL_LIM)
+            mpc.addConstr(lin_roll >= -ROLL_LIM)
+            mpc.addConstr(lin_pitch <= PITCH_LIM)
+            mpc.addConstr(lin_pitch >= -PITCH_LIM)
 
 
 
@@ -657,9 +639,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
 
     #Takes the optimized du input sequence and adds it to the nominal input to get the actual input sequence
     input_sequence = du.X + nominal_input
-    log_solution([slack.X.max() for slack in (slack_roll, slack_pitch, slack_contact_distance,
-                                              slack_rotor_distance, slack_approach)],
-                 input_sequence[0], du.X[0])
+    log_solution([slack_contact_distance.X.max(), slack_approach.X.max()], input_sequence[0], du.X[0])
 
     return input_sequence
 
@@ -797,10 +777,7 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
         v = mpc.addMVar(N * nu, lb=du_lower, ub=du_upper, name="du")
 
     #Slacks for the softened constraints, one per step k = 1..N
-    slack_roll = mpc.addMVar(N, lb=0, name="slack_roll")
-    slack_pitch = mpc.addMVar(N, lb=0, name="slack_pitch")
     slack_contact_distance = mpc.addMVar(N, lb=0, name="slack_contact_distance")
-    slack_rotor_distance = mpc.addMVar(N, lb=0, name="slack_rotor_distance")
     slack_approach = mpc.addMVar(N, lb=0, name="slack_approach")
 
     zeros_du = lambda rows: sp.csr_matrix((rows, N * nu))
@@ -913,10 +890,7 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
                       np.concatenate([nominal_state[k][10:13] for k in later_steps]))
 
     #Slack costs: linear (L1), so the quadratic objective stays the identity
-    cost += SLACK_WEIGHT_ROLL * slack_roll.sum()
-    cost += SLACK_WEIGHT_PITCH * slack_pitch.sum()
     cost += SLACK_WEIGHT_CONTACT_DISTANCE * slack_contact_distance.sum()
-    cost += SLACK_WEIGHT_ROTOR_DISTANCE * slack_rotor_distance.sum()
     cost += SLACK_WEIGHT_APPROACH * slack_approach.sum()
 
 
@@ -931,11 +905,9 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
         mpc.addConstr(linear(C_big[rows], D_big[rows]) - select_slack @ slack_contact_distance
                       <= CONTACT_MAX_DIST - y_nominal[rows])
 
-    #Rotors at least ROTOR_MIN_DIST from the wall (one slack per step, shared by the 4 rotors)
+    #Rotors at least ROTOR_MIN_DIST from the wall (hard)
     rows = output_rows([13, 14, 15, 16], later_steps)
-    each_rotor = sp.kron(sp.eye(N), np.ones((4, 1)), format="csr")
-    mpc.addConstr(linear(C_big[rows], D_big[rows]) + each_rotor @ slack_rotor_distance
-                  >= ROTOR_MIN_DIST - y_nominal[rows])
+    mpc.addConstr(linear(C_big[rows], D_big[rows]) >= ROTOR_MIN_DIST - y_nominal[rows])
 
     #Approach speed limit: speed into the wall - gap / APPROACH_TIME <= TOUCH_SPEED, where
     #speed into the wall = -n . pad velocity (outputs 6:9) and gap = pad distance (output 12) - contact sphere radius
@@ -954,11 +926,11 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
         mpc.addConstr(linear(approach_dx, approach_du) - select_slack @ slack_approach
                       <= TOUCH_SPEED - approach_nominal)
 
-    #Roll and pitch limits
-    for output_index, limit, slack in [(1, ROLL_LIM, slack_roll), (2, PITCH_LIM, slack_pitch)]:
+    #Roll and pitch limits (hard)
+    for output_index, limit in [(1, ROLL_LIM), (2, PITCH_LIM)]:
         rows = output_rows([output_index], later_steps)
-        mpc.addConstr(linear(C_big[rows], D_big[rows]) - slack <= limit - y_nominal[rows])
-        mpc.addConstr(linear(C_big[rows], D_big[rows]) + slack >= -limit - y_nominal[rows])
+        mpc.addConstr(linear(C_big[rows], D_big[rows]) <= limit - y_nominal[rows])
+        mpc.addConstr(linear(C_big[rows], D_big[rows]) >= -limit - y_nominal[rows])
 
 
     # ---------------- Solve ----------------
@@ -983,15 +955,12 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     #Input deviations the QP chose: du = K dx + v
     du_value = K_big @ dx.X + v.X
 
-    print(f"  max slack: roll {slack_roll.X.max():.4f} rad, pitch {slack_pitch.X.max():.4f} rad, "
-             f"contact {1000 * slack_contact_distance.X.max():.2f} mm, rotor {1000 * slack_rotor_distance.X.max():.2f} mm, "
-             f"approach {100 * slack_approach.X.max():.1f} cm/s")
+    print(f"  max slack: contact {1000 * slack_contact_distance.X.max():.2f} mm, "
+          f"approach {100 * slack_approach.X.max():.1f} cm/s")
 
     #Optimized input sequence = nominal + deviation
     input_sequence = du_value.reshape(N, nu) + nominal_input[:N]
-    log_solution([slack.X.max() for slack in (slack_roll, slack_pitch, slack_contact_distance,
-                                              slack_rotor_distance, slack_approach)],
-                 input_sequence[0], du_value[:nu])
+    log_solution([slack_contact_distance.X.max(), slack_approach.X.max()], input_sequence[0], du_value[:nu])
     if not return_plan:
         return input_sequence
 

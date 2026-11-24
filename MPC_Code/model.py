@@ -379,15 +379,23 @@ class Drone_Dynamics:
                           x[:, 10:13] - x_nom[:, 10:13], x[:, 13:16] - x_nom[:, 13:16], x[:, 16:19] - x_nom[:, 16:19]], dim=-1)
 
 
-    def rollout(self, state_vector, input_sequence, MPC_dt_multiple):
+    def rollout(self, state_vector, input_sequence, MPC_dt_multiple, with_outputs=False):
         #Nominal trajectory over the horizon (no gradients). This part is sequential, since each
         #state depends on the one before it, but it's cheap (one forward pass per step).
         #state_vector (19,), input_sequence (N, 4) -> nominal states (N + 1, 19), starting with state_vector
+        #with_outputs=True also returns the nominal outputs (N, 17) at the first N states, using each step's
+        #normal force, so every horizon step has fresh outputs even when its Jacobians are reused.
+        nominal_outputs = []
         with torch.no_grad():
             nominal_states = [state_vector]
             for rotor_speeds in input_sequence:
-                next_state, _, _ = self.propagate_multi(nominal_states[-1].unsqueeze(0), rotor_speeds.unsqueeze(0), MPC_dt_multiple)
+                state = nominal_states[-1].unsqueeze(0)
+                next_state, _, info = self.propagate_multi(state, rotor_speeds.unsqueeze(0), MPC_dt_multiple)
+                if with_outputs:
+                    nominal_outputs.append(self.outputs(state, info["F_n"])[0])
                 nominal_states.append(next_state[0])
+        if with_outputs:
+            return torch.stack(nominal_states), torch.stack(nominal_outputs)
         return torch.stack(nominal_states)
 
 

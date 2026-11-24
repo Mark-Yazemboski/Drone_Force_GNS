@@ -11,7 +11,7 @@ import json
 from MPC_controller import mpc_control, mpc_control_batched, STATE_SIZE, INPUT_SIZE, \
     MOTOR_MIN, MOTOR_MAX, MOTOR_CHANGE_LIM, INPUT_TRUST_REGION, CONTACT_MAX_DIST, ROTOR_MIN_DIST, ROLL_LIM, PITCH_LIM, \
     POSITION_WEIGHT, VELOCITY_WEIGHT, ANG_VEL_WEIGHT, NORMAL_FORCE_WEIGHT, \
-    INPUT_CHANGE_WEIGHT, SLACK_WEIGHT_ROLL, SLACK_WEIGHT_PITCH, SLACK_WEIGHT_CONTACT_DISTANCE, SLACK_WEIGHT_ROTOR_DISTANCE
+    INPUT_CHANGE_WEIGHT, SLACK_WEIGHT_CONTACT_DISTANCE, SLACK_WEIGHT_APPROACH
 import warnings
 from MPC_controller import open_event_log, set_log_step, log_event, motor_step, motor_map
 import MPC_controller
@@ -46,6 +46,24 @@ Trained_model_path = SCRIPT_FOLDER / "MPC_Model" / "Trained_Model.pt"
 #Contact force cutoff (m): the model's contact force is cut off for pad nodes farther than this from the wall,
 #which removes the small phantom force the model predicts while hovering just off the wall. None = the model as trained.
 CONTACT_CUTOFF_GAP = 0.001
+
+#Adaptive re-linearization along the horizon. Jacobians are computed fresh at every horizon step where the contact
+#is changing, and every RELINEARIZE_EVERY steps elsewhere; the steps in between reuse the latest fresh Jacobians.
+#The nominal states and outputs are still fresh at every step (from the rollout). RELINEARIZE_EVERY = 1 linearizes
+#every step, the original behavior.
+RELINEARIZE_EVERY = 5
+GATE_TRANSITION = (0.05, 0.95)  #MPC contact gate values that count as the contact changing
+GATE_JUMP = 0.1                 #also re-linearize when the gate has moved this much since the last fresh step
+
+#Horizon steps that get fresh Jacobians, from the MPC contact gate at each nominal step
+def relinearization_steps(gates):
+    fresh_steps = [0]
+    for k in range(1, len(gates)):
+        changing = GATE_TRANSITION[0] < gates[k] < GATE_TRANSITION[1]
+        jumped = abs(gates[k] - gates[fresh_steps[-1]]) > GATE_JUMP
+        if changing or jumped or k - fresh_steps[-1] >= RELINEARIZE_EVERY:
+            fresh_steps.append(k)
+    return fresh_steps
 
 #Number of CPU cores to use: what Slurm gave this job on Roar, or every core on a normal PC
 NUM_CORES = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count()))
@@ -183,8 +201,8 @@ settings = dict(
                  input_tolerance=MPC_controller.INPUT_TOLERANCE, yaw_input_factor=MPC_controller.YAW_INPUT_FACTOR,
                  input_change=INPUT_CHANGE_WEIGHT, push_margin=MPC_controller.PUSH_MARGIN,
                  motor_tau=MPC_controller.MOTOR_TAU),
-    slack_weights=dict(roll=SLACK_WEIGHT_ROLL, pitch=SLACK_WEIGHT_PITCH,
-                       contact_distance=SLACK_WEIGHT_CONTACT_DISTANCE, rotor_distance=SLACK_WEIGHT_ROTOR_DISTANCE),
+    slack_weights=dict(contact_distance=SLACK_WEIGHT_CONTACT_DISTANCE, approach=SLACK_WEIGHT_APPROACH),
+    relinearization=dict(every=RELINEARIZE_EVERY, gate_transition=GATE_TRANSITION, gate_jump=GATE_JUMP),
     limits=dict(motor_min=MOTOR_MIN, motor_max=MOTOR_MAX, motor_change=MOTOR_CHANGE_LIM,
                 trust_region=INPUT_TRUST_REGION, contact_max_dist=CONTACT_MAX_DIST,
                 rotor_min_dist=ROTOR_MIN_DIST, roll_lim=ROLL_LIM, pitch_lim=PITCH_LIM),
@@ -303,18 +321,28 @@ for time_step in t:
         #The rotor speeds the model sees for those commands, after the motor lag
         effective_input_sequence, _ = motor_map(rollout_input_sequence, motor_speed_squared, MPC_dt)
 
-        #Nominal trajectory over the horizon from the shifted plan (on the CPU: sequential, batch of 1, no gradients)
+        #Nominal trajectory and outputs over the horizon from the shifted plan (on the CPU: sequential, batch of 1, no gradients)
         section_start = timer(device)
         torch_state = torch.as_tensor(state_vector_current, dtype=torch.float32)
         torch_inputs = torch.as_tensor(effective_input_sequence, dtype=torch.float32)
-        nominal_states = model_cpu.rollout(torch_state, torch_inputs, MPC_dt_multiple)          # (N+1, 19)
+        nominal_states, nominal_outputs = model_cpu.rollout(torch_state, torch_inputs, MPC_dt_multiple,
+                                                            with_outputs=True)    # (N+1, 19), (N, 17)
         rollout_time = timer(device) - section_start
 
-        #Linearizes every step of the horizon at once (on the GPU: one big batched Jacobian)
+        #Picks the horizon steps that get fresh Jacobians, from the MPC contact gate along the nominal trajectory
+        gates = to_np(torch.sigmoid((MPC_GATE_D0 - nominal_outputs[:, 12]) / MPC_GATE_TAU))
+        fresh_steps = relinearization_steps(gates)
+
+        #Linearizes only those steps at once (on the GPU: one batched Jacobian)
         section_start = timer(device)
-        A_all, B_all, C_all, D_all, _, nominal_outputs = model.linearize_horizon(
-            nominal_states[:-1].to(device), torch_inputs.to(device), MPC_dt_multiple)
+        A_fresh, B_fresh, C_fresh, D_fresh, _, _ = model.linearize_horizon(
+            nominal_states[fresh_steps].to(device), torch_inputs[fresh_steps].to(device), MPC_dt_multiple)
         linearize_time = timer(device) - section_start
+
+        #Every horizon step uses the Jacobians of the latest fresh step at or before it
+        hold = np.searchsorted(fresh_steps, np.arange(Horizon_length), side="right") - 1
+        A_all, B_all = to_np(A_fresh)[hold], to_np(B_fresh)[hold]
+        C_all, D_all = to_np(C_fresh)[hold], to_np(D_fresh)[hold]
 
         #Output rows for the final state of the horizon (on the CPU, no GNN involved)
         section_start = timer(device)
@@ -327,7 +355,7 @@ for time_step in t:
         D_list = list(to_np(D_all))
         nom_states = list(to_np(nominal_states))
         nom_outputs = list(to_np(nominal_outputs)) + [to_np(output_last)]
-        print(f"  rollout: {rollout_time:.3f} s | linearize: {linearize_time:.3f} s | "
+        print(f"  rollout: {rollout_time:.3f} s | linearize ({len(fresh_steps)}/{Horizon_length} steps): {linearize_time:.3f} s | "
               f"last-step outputs + copy to numpy: {timer(device) - section_start:.3f} s")
 
         #Find where the nominal rollout first goes non-finite (if it does)
